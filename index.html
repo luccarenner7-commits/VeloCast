@@ -133,6 +133,9 @@
     padding:14px; border-radius:10px; margin-bottom:8px; border:1px solid var(--line);
   }
   .segment:hover{ border-color:var(--route); }
+  .segment.static{ cursor:default; }
+  .segment.static:hover{ border-color:var(--line); }
+  .segment.static.selected:hover{ border-color:var(--tail); }
   .segment.selected{ border-color:var(--tail); background:var(--tail-bg); }
   .segment .top{ display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap; }
   .segment .left{ display:flex; align-items:flex-start; gap:12px; min-width:0; flex:1; }
@@ -728,31 +731,15 @@ function renderRouteCard(){
   if(state.selectedSegmentId){
     const seg = state.segments.find(s => s.id === state.selectedSegmentId);
     card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
-      el("h2", {style:"margin:0;"}, ["Segment: " + (seg ? seg.name : "")]),
+      el("h2", {style:"margin:0;"}, ["Segment"]),
       el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{ state.selectedSegmentId = null; render(); }}, ["Zur Strecke"])
     ]));
 
     if(seg){
-      card.appendChild(el("div", {class:"muted", style:"margin-bottom:10px; font-size:13px;"}, [`${(seg.distance/1000).toFixed(1)} km · ${seg.average_grade}% Ø-Steigung`]));
-
-      const w = state.segmentWeather[seg.id];
-      if(w && seg.start_latlng && seg.end_latlng){
-        const bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
-        const rel = windRelative(bearing, w.windDir);
-        const tagClass = rel.type === "tail" ? "tail" : rel.type === "head" ? "head" : "cross";
-        const tagText = (rel.type === "tail" ? "Rückenwind" : rel.type === "head" ? "Gegenwind" : "Seitenwind") + " · " + Math.round(w.windSpeed) + " km/h";
-        card.appendChild(el("div", {class:"tag " + tagClass, style:"display:inline-block; margin-bottom:10px;"}, [tagText]));
-      }
-
-      const stats = computeSegmentStatChips(seg);
-      if(stats.length){
-        const chips = el("div", {class:"stat-chips", style:"margin-bottom:14px;"});
-        stats.forEach(s => chips.appendChild(el("span", {class:"stat-chip"}, [s])));
-        card.appendChild(chips);
-      }
+      card.appendChild(renderSegmentRow(seg, {clickable:false}));
     }
 
-    card.appendChild(el("div", {id:"route-map", style:"margin-top:0;"}));
+    card.appendChild(el("div", {id:"route-map", style:"margin-top:14px;"}));
     return card;
   }
 
@@ -762,7 +749,7 @@ function renderRouteCard(){
     el("div", {}, [
       el("label", {}, ["Startzeit"]),
       el("div", {style:"display:flex; justify-content:center;"}, [
-        el("input", {type:"datetime-local", style:"width:auto;", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
+        el("input", {type:"datetime-local", style:"width:100%;", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
       ])
     ]),
     el("div", {}, [
@@ -1051,6 +1038,49 @@ function sortedVisibleSegments(){
   }
 }
 
+// Renders a single segment "card" (icon, name, distance/grade, wind tag,
+// stat chips) — shared between the segments list and the segment map view,
+// so both look identical.
+function renderSegmentRow(seg, opts){
+  opts = opts || {};
+  const w = state.segmentWeather[seg.id];
+  let bearing = null;
+  if(seg.start_latlng && seg.end_latlng){
+    bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
+  }
+  const isSelected = state.selectedSegmentId === seg.id;
+  const clickable = opts.clickable !== false;
+  const rowClass = "segment" + (isSelected ? " selected" : "") + (clickable ? "" : " static");
+  const row = el("div", clickable ? {class:rowClass, onclick:()=>selectSegment(seg)} : {class:rowClass});
+
+  let badgeColor = "var(--chalk-dim)", tagClass = "", tagText = "k.A.", arrowHtml = "";
+  if(w && bearing !== null){
+    const rel = windRelative(bearing, w.windDir);
+    badgeColor = rel.type === "tail" ? "var(--tail)" : rel.type==="head" ? "var(--head)" : "var(--cross)";
+    tagClass = rel.type === "tail" ? "tail" : rel.type==="head" ? "head" : "cross";
+    tagText = (rel.type === "tail" ? "Rückenwind" : rel.type==="head" ? "Gegenwind" : "Seitenwind") + " · " + Math.round(w.windSpeed) + " km/h";
+    arrowHtml = arrowSvg(bearing, w.windDir, "#0d1712");
+  }
+  const badge = el("div", {class:"arrow-badge", style:`background:${badgeColor}`, html: arrowHtml});
+
+  const info = el("div", {}, [
+    el("div", {class:"name"}, [seg.name]),
+    el("div", {class:"meta"}, [`${(seg.distance/1000).toFixed(1)} km · ${seg.average_grade}% Ø-Steigung`])
+  ]);
+  const left = el("div", {class:"left"}, [badge, info]);
+  const top = el("div", {class:"top"}, [left, el("div", {class:"tag " + tagClass}, [tagText])]);
+  row.appendChild(top);
+
+  const stats = computeSegmentStatChips(seg);
+  if(stats.length){
+    const chips = el("div", {class:"stat-chips"});
+    stats.forEach(s => chips.appendChild(el("span", {class:"stat-chip"}, [s])));
+    row.appendChild(chips);
+  }
+
+  return row;
+}
+
 function selectSegment(seg){
   state.selectedSegmentId = state.selectedSegmentId === seg.id ? null : seg.id;
   render();
@@ -1090,39 +1120,7 @@ function renderSegmentsCard(){
   ]));
 
   sortedVisibleSegments().forEach(seg=>{
-    const w = state.segmentWeather[seg.id];
-    let bearing = null;
-    if(seg.start_latlng && seg.end_latlng){
-      bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
-    }
-    const isSelected = state.selectedSegmentId === seg.id;
-    const row = el("div", {class:"segment" + (isSelected ? " selected" : ""), onclick: ()=>selectSegment(seg)});
-    let badgeColor = "var(--chalk-dim)", tagClass = "", tagText = "k.A.", arrowHtml = "";
-    if(w && bearing !== null){
-      const rel = windRelative(bearing, w.windDir);
-      badgeColor = rel.type === "tail" ? "var(--tail)" : rel.type==="head" ? "var(--head)" : "var(--cross)";
-      tagClass = rel.type === "tail" ? "tail" : rel.type==="head" ? "head" : "cross";
-      tagText = (rel.type === "tail" ? "Rückenwind" : rel.type==="head" ? "Gegenwind" : "Seitenwind") + " · " + Math.round(w.windSpeed) + " km/h";
-      arrowHtml = arrowSvg(bearing, w.windDir, "#0d1712");
-    }
-    const badge = el("div", {class:"arrow-badge", style:`background:${badgeColor}`, html: arrowHtml});
-
-    const info = el("div", {}, [
-      el("div", {class:"name"}, [seg.name]),
-      el("div", {class:"meta"}, [`${(seg.distance/1000).toFixed(1)} km · ${seg.average_grade}% Ø-Steigung`])
-    ]);
-    const left = el("div", {class:"left"}, [badge, info]);
-    const top = el("div", {class:"top"}, [left, el("div", {class:"tag " + tagClass}, [tagText])]);
-    row.appendChild(top);
-
-    const stats = computeSegmentStatChips(seg);
-    if(stats.length){
-      const chips = el("div", {class:"stat-chips"});
-      stats.forEach(s => chips.appendChild(el("span", {class:"stat-chip"}, [s])));
-      row.appendChild(chips);
-    }
-
-    card.appendChild(row);
+    card.appendChild(renderSegmentRow(seg));
   });
 
   return card;
