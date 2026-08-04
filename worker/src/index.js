@@ -19,6 +19,17 @@ function jsonResponse(body, status, env) {
   });
 }
 
+// CORS headers alone only stop browser JS from reading the response — they
+// don't stop a direct (non-browser) request from a stolen refresh_token
+// being redeemed here. Checking Origin server-side isn't foolproof (a
+// scripted attacker can still set an arbitrary Origin header), but it closes
+// off casual/browser-based abuse and costs nothing for legitimate callers.
+function hasAllowedOrigin(request, env) {
+  const allowed = env.ALLOWED_ORIGIN;
+  if (!allowed || allowed === "*") return true;
+  return request.headers.get("Origin") === allowed;
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
@@ -26,6 +37,9 @@ export default {
     }
     if (request.method !== "POST") {
       return jsonResponse({ error: "method_not_allowed" }, 405, env);
+    }
+    if (!hasAllowedOrigin(request, env)) {
+      return jsonResponse({ error: "forbidden" }, 403, env);
     }
 
     let body;

@@ -240,6 +240,18 @@ function el(tag, attrs, children){
   return e;
 }
 
+// Strava segment/activity names come from arbitrary Strava users (anyone can
+// create a public segment), so they're untrusted text — must be escaped
+// before ever landing in a raw HTML string (e.g. Leaflet popup content).
+function escapeHtml(str){
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 // ---------- polyline decode (Strava / Google encoded polyline) ----------
 function decodePolyline(str){
   let index = 0, lat = 0, lng = 0, coords = [];
@@ -866,14 +878,14 @@ function mountSegmentView(container, segId){
     subdomains: 'abcd'
   }).addTo(map);
 
-  let color = "#6b8fc2", label = seg.name;
+  let color = "#6b8fc2", label = escapeHtml(seg.name);
   const w = state.segmentWeather[segId];
   if(w && seg.start_latlng && seg.end_latlng){
     const bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
     const rel = windRelative(bearing, w.windDir);
     color = rel.type === "tail" ? "#4fb08c" : rel.type === "head" ? "#e2574c" : "#e2b23e";
     const typeLabel = rel.type === "tail" ? "Rückenwind" : rel.type === "head" ? "Gegenwind" : "Seitenwind";
-    label = `<b>${seg.name}</b><br>${typeLabel} · ${Math.round(w.windSpeed)} km/h`;
+    label = `<b>${escapeHtml(seg.name)}</b><br>${typeLabel} · ${Math.round(w.windSpeed)} km/h`;
   }
 
   const line = L.polyline(latlngs, { color, weight:5, opacity:0.95, lineCap:"round", lineJoin:"round" }).addTo(map);
