@@ -818,7 +818,7 @@ function renderRouteCard(){
     el("div", {}, [
       el("label", {}, ["Startzeit"]),
       el("div", {style:"display:flex; justify-content:center;"}, [
-        el("input", {type:"datetime-local", style:"width:auto;", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
+        el("input", {type:"datetime-local", style:"width:100%;", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
       ])
     ]),
     el("div", {}, [
@@ -849,6 +849,8 @@ function renderRouteCard(){
   card.appendChild(settingsRow);
   card.appendChild(el("div", {class:"muted", style:"margin-bottom:12px; font-size:12px;"}, ["Wetterwerte werden jeweils für den erwarteten Ankunftszeitpunkt an diesem Punkt berechnet."]));
 
+  card.appendChild(renderGpxUploadRow());
+
   if(state.connected){
     if(state.loading.activities){
       card.appendChild(el("div", {class:"loading"}, ["Lade letzte Aktivitäten…"]));
@@ -874,8 +876,6 @@ function renderRouteCard(){
       card.appendChild(el("div", {class:"muted"}, ["Keine Aktivitäten gefunden."]));
     }
   }
-
-  card.appendChild(renderGpxUploadRow());
 
   if(state.loading.weather){
     card.appendChild(el("div", {class:"loading", style:"margin-top:14px;"}, ["Berechne Wind entlang der Strecke…"]));
