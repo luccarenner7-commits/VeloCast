@@ -76,6 +76,10 @@
 
   .row{ display:flex; gap:10px; flex-wrap:wrap; }
 
+  .settings-row{ display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:16px; margin-bottom:16px; }
+  .settings-row > div{ min-width:0; }
+  @media (max-width:520px){ .settings-row{ grid-template-columns: 1fr; } }
+
   /* Activity picker */
   .activity{
     display:flex; justify-content:space-between; align-items:center;
@@ -125,18 +129,26 @@
 
   /* Segments */
   .segment{
-    display:flex; align-items:center; justify-content:space-between;
+    display:flex; flex-direction:column; gap:10px;
     padding:14px; border-radius:10px; margin-bottom:8px; border:1px solid var(--line);
   }
-  .segment .left{ display:flex; align-items:center; gap:12px; }
+  .segment .top{ display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+  .segment .left{ display:flex; align-items:flex-start; gap:12px; min-width:0; flex:1; }
   .segment .arrow-badge{
     width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center;
     flex-shrink:0;
   }
   .segment .name{ font-weight:600; font-size:14px; }
   .segment .meta{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); margin-top:3px; }
-  .segment .meta.stats{ color:var(--route); }
+  .segment .stat-chips{ display:flex; flex-wrap:wrap; gap:6px; }
+  .segment .stat-chip{
+    display:inline-flex; align-items:center; white-space:nowrap;
+    font-family:'IBM Plex Mono', monospace; font-size:10.5px; font-weight:600;
+    color:var(--route); background:rgba(107,143,194,0.14);
+    border-radius:6px; padding:4px 8px;
+  }
   .segment .tag{
+    flex-shrink:0;
     font-family:'IBM Plex Mono', monospace; font-size:11px; font-weight:600;
     padding:4px 9px; border-radius:6px; white-space:nowrap;
   }
@@ -560,16 +572,16 @@ function renderRouteCard(){
   const card = el("div", {class:"card"});
   card.appendChild(el("h2", {}, ["Strecke"]));
 
-  const settingsRow = el("div", {class:"row", style:"margin-top:0; gap:16px; margin-bottom:16px;"}, [
-    el("div", {style:"flex:1; min-width:150px;"}, [
+  const settingsRow = el("div", {class:"settings-row"}, [
+    el("div", {}, [
       el("label", {}, ["Startzeit"]),
-      el("input", {type:"datetime-local", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
+      el("input", {type:"datetime-local", style:"width:100%;", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
     ]),
-    el("div", {style:"flex:1; min-width:140px;"}, [
+    el("div", {}, [
       el("label", {}, ["Ø Geschwindigkeit (km/h)"]),
-      el("input", {type:"number", min:"5", max:"60", step:"1", value: state.avgSpeedKmh, onchange:(e)=>{ state.avgSpeedKmh = parseFloat(e.target.value) || 25; loadRouteWeather(); }})
+      el("input", {type:"number", style:"width:100%;", min:"5", max:"60", step:"1", value: state.avgSpeedKmh, onchange:(e)=>{ state.avgSpeedKmh = parseFloat(e.target.value) || 25; loadRouteWeather(); }})
     ]),
-    el("div", {style:"flex:1; min-width:160px;"}, [
+    el("div", {}, [
       el("label", {}, ["Punktabstand"]),
       el("select", {
         style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:8px; padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
@@ -664,10 +676,10 @@ function mountRouteMap(){
   const latlngs = coords.map(c=>[c[0], c[1]]);
 
   // faint base line — carries the route where no wind data covers it
-  const baseLine = L.polyline(latlngs, { color:"#333a47", weight:2.5, opacity:0.55, lineCap:"round", lineJoin:"round" }).addTo(map);
+  const baseLine = L.polyline(latlngs, { color:"#333a47", weight:3, opacity:0.55, lineCap:"round", lineJoin:"round" }).addTo(map);
   map.fitBounds(baseLine.getBounds(), { padding:[26,26] });
 
-  // continuous colored line: one thin segment per stretch between two
+  // continuous colored line: one segment per stretch between two
   // consecutive wind-sampled points, colored by that stretch's wind relation
   const pts = state.routePoints;
   for(let i=0;i<pts.length-1;i++){
@@ -678,11 +690,19 @@ function mountRouteMap(){
     const from = pts[i].idx, to = pts[i+1].idx;
     if(to <= from) continue;
     const segCoords = coords.slice(from, to + 1).map(c=>[c[0], c[1]]);
-    L.polyline(segCoords, { color, weight:2.5, opacity:0.95, lineCap:"round", lineJoin:"round" }).addTo(map);
+    L.polyline(segCoords, { color, weight:5, opacity:0.95, lineCap:"round", lineJoin:"round" }).addTo(map);
   }
 
-  // slim directional glyphs at each sampled point
+  // slim directional glyphs at each sampled point — skip points that sit too
+  // close to an already-placed marker (e.g. where the route crosses itself)
+  // so arrows don't stack on top of each other
+  const markerDedupeRadiusKm = 0.5;
+  const shownMarkerPositions = [];
   pts.forEach((p,i)=>{
+    const tooClose = shownMarkerPositions.some(m => haversineKm([m.lat, m.lon], [p.lat, p.lon]) < markerDedupeRadiusKm);
+    if(tooClose) return;
+    shownMarkerPositions.push({ lat:p.lat, lon:p.lon });
+
     const w = state.weatherAtRoute[i];
     let color = "#98a1ae", label = "Keine Winddaten";
     let rotateDeg = 0;
@@ -738,10 +758,13 @@ function renderSegmentsCard(){
     }
     const badge = el("div", {class:"arrow-badge", style:`background:${badgeColor}`, html: arrowHtml});
 
-    const infoChildren = [
+    const info = el("div", {}, [
       el("div", {class:"name"}, [seg.name]),
       el("div", {class:"meta"}, [`${(seg.distance/1000).toFixed(1)} km · ${seg.average_grade}% Ø-Steigung`])
-    ];
+    ]);
+    const left = el("div", {class:"left"}, [badge, info]);
+    const top = el("div", {class:"top"}, [left, el("div", {class:"tag " + tagClass}, [tagText])]);
+    row.appendChild(top);
 
     const detail = state.segmentDetails[seg.id];
     const stats = [];
@@ -757,12 +780,11 @@ function renderSegmentsCard(){
       if(effortCount) stats.push(`${effortCount}× gefahren`);
     }
     if(stats.length){
-      infoChildren.push(el("div", {class:"meta stats"}, [stats.join(" · ")]));
+      const chips = el("div", {class:"stat-chips"});
+      stats.forEach(s => chips.appendChild(el("span", {class:"stat-chip"}, [s])));
+      row.appendChild(chips);
     }
 
-    const left = el("div", {class:"left"}, [badge, el("div", {}, infoChildren)]);
-    row.appendChild(left);
-    row.appendChild(el("div", {class:"tag " + tagClass}, [tagText]));
     card.appendChild(row);
   });
 
