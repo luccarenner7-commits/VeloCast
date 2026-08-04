@@ -420,6 +420,7 @@ function findBestStartTimes(){
 }
 
 function renderBestStartCard(){
+  if(state.selectedSegmentId) return null;
   if(!state.routePoints.length || !state.weatherAtRoute.length) return null;
   const best = findBestStartTimes();
   if(!best.length) return null;
@@ -578,7 +579,7 @@ function render(){
 
 function renderBrand(){
   return el("div", {class:"brand"}, [
-    el("h1", {}, ["Rücken", el("span",{},["wind"])]),
+    el("h1", {}, ["Velo", el("span",{},["Cast"])]),
     el("div", {class:"status"}, [
       el("span", {class:"dot" + (state.connected?" on":"")}, []),
       state.connected ? "verbunden" : "nicht verbunden"
@@ -730,6 +731,27 @@ function renderRouteCard(){
       el("h2", {style:"margin:0;"}, ["Segment: " + (seg ? seg.name : "")]),
       el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{ state.selectedSegmentId = null; render(); }}, ["Zur Strecke"])
     ]));
+
+    if(seg){
+      card.appendChild(el("div", {class:"muted", style:"margin-bottom:10px; font-size:13px;"}, [`${(seg.distance/1000).toFixed(1)} km · ${seg.average_grade}% Ø-Steigung`]));
+
+      const w = state.segmentWeather[seg.id];
+      if(w && seg.start_latlng && seg.end_latlng){
+        const bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
+        const rel = windRelative(bearing, w.windDir);
+        const tagClass = rel.type === "tail" ? "tail" : rel.type === "head" ? "head" : "cross";
+        const tagText = (rel.type === "tail" ? "Rückenwind" : rel.type === "head" ? "Gegenwind" : "Seitenwind") + " · " + Math.round(w.windSpeed) + " km/h";
+        card.appendChild(el("div", {class:"tag " + tagClass, style:"display:inline-block; margin-bottom:10px;"}, [tagText]));
+      }
+
+      const stats = computeSegmentStatChips(seg);
+      if(stats.length){
+        const chips = el("div", {class:"stat-chips", style:"margin-bottom:14px;"});
+        stats.forEach(s => chips.appendChild(el("span", {class:"stat-chip"}, [s])));
+        card.appendChild(chips);
+      }
+    }
+
     card.appendChild(el("div", {id:"route-map", style:"margin-top:0;"}));
     return card;
   }
@@ -739,7 +761,9 @@ function renderRouteCard(){
   const settingsRow = el("div", {class:"settings-row"}, [
     el("div", {}, [
       el("label", {}, ["Startzeit"]),
-      el("input", {type:"datetime-local", style:"width:100%;", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
+      el("div", {style:"display:flex; justify-content:center;"}, [
+        el("input", {type:"datetime-local", style:"width:auto;", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
+      ])
     ]),
     el("div", {}, [
       el("label", {}, ["Ø Geschwindigkeit (km/h)"]),
@@ -987,6 +1011,25 @@ function mountFullRouteView(container){
   leafletMapInstance = map;
 }
 
+// PR time, PR watts, KOM/QOM, elevation gain, effort count — as short
+// display strings, used both in the segment list and the segment map view.
+function computeSegmentStatChips(seg){
+  const detail = state.segmentDetails[seg.id];
+  const stats = [];
+  if(detail){
+    const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
+    if(pr != null) stats.push(`PR ${fmtDuration(pr)}`);
+    const prWatts = state.segmentPrWatts[seg.id];
+    if(prWatts) stats.push(`${prWatts.measured ? "" : "~"}${prWatts.watts} W`);
+    if(detail.xoms && detail.xoms.kom) stats.push(`KOM ${detail.xoms.kom}`);
+    if(detail.xoms && detail.xoms.qom) stats.push(`QOM ${detail.xoms.qom}`);
+    if(detail.total_elevation_gain != null) stats.push(`${Math.round(detail.total_elevation_gain)} Hm`);
+    const effortCount = detail.athlete_segment_stats && detail.athlete_segment_stats.effort_count;
+    if(effortCount) stats.push(`${effortCount}× gefahren`);
+  }
+  return stats;
+}
+
 // diff = 0 means pure tailwind, 180 means pure headwind (see windRelative)
 function segmentTailwindDiff(seg){
   const w = state.segmentWeather[seg.id];
@@ -1072,19 +1115,7 @@ function renderSegmentsCard(){
     const top = el("div", {class:"top"}, [left, el("div", {class:"tag " + tagClass}, [tagText])]);
     row.appendChild(top);
 
-    const detail = state.segmentDetails[seg.id];
-    const stats = [];
-    if(detail){
-      const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
-      if(pr != null) stats.push(`PR ${fmtDuration(pr)}`);
-      const prWatts = state.segmentPrWatts[seg.id];
-      if(prWatts) stats.push(`${prWatts.measured ? "" : "~"}${prWatts.watts} W`);
-      if(detail.xoms && detail.xoms.kom) stats.push(`KOM ${detail.xoms.kom}`);
-      if(detail.xoms && detail.xoms.qom) stats.push(`QOM ${detail.xoms.qom}`);
-      if(detail.total_elevation_gain != null) stats.push(`${Math.round(detail.total_elevation_gain)} Hm`);
-      const effortCount = detail.athlete_segment_stats && detail.athlete_segment_stats.effort_count;
-      if(effortCount) stats.push(`${effortCount}× gefahren`);
-    }
+    const stats = computeSegmentStatChips(seg);
     if(stats.length){
       const chips = el("div", {class:"stat-chips"});
       stats.forEach(s => chips.appendChild(el("span", {class:"stat-chip"}, [s])));
