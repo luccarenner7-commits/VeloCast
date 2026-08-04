@@ -217,6 +217,8 @@ let state = {
   segments: [],
   segmentWeather: {}, // id -> weather
   segmentDetails: {}, // id -> detailed segment (PR, KOM/QOM, elevation, effort count)
+  segmentPrWatts: {}, // id -> {watts, measured} for the PR effort, or null
+  segmentSortBy: "default",
   loading: {},
   error: null,
   authCodeInput: ""
@@ -391,13 +393,23 @@ async function fetchStarredSegments(token){
 }
 
 // Detailed segment: adds PR time, KOM/QOM and elevation/effort stats that
-// aren't in the starred-segments summary. Strava no longer exposes full
-// leaderboard placement via the public API, only pr_rank (top 10 or null).
+// aren't in the starred-segments summary.
 async function fetchSegmentDetail(id, token){
   const res = await fetch(`https://www.strava.com/api/v3/segments/${id}`, {
     headers:{ Authorization: "Bearer " + token }
   });
   if(!res.ok) throw new Error("Segmentdetails nicht verfügbar (" + res.status + ")");
+  return res.json();
+}
+
+// Full activity detail — used to pull the average watts of the PR effort,
+// since the segment endpoint only gives back the PR's activity id, not the
+// effort's power data itself.
+async function fetchActivityDetail(activityId, token){
+  const res = await fetch(`https://www.strava.com/api/v3/activities/${activityId}`, {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok) throw new Error("Aktivität nicht verfügbar (" + res.status + ")");
   return res.json();
 }
 
@@ -559,10 +571,25 @@ async function loadSegmentExtras(){
         state.segmentWeather[seg.id] = null;
       }
     }
+    let detail = null;
     try{
-      state.segmentDetails[seg.id] = await fetchSegmentDetail(seg.id, state.accessToken);
+      detail = await fetchSegmentDetail(seg.id, state.accessToken);
+      state.segmentDetails[seg.id] = detail;
     }catch(e){
       state.segmentDetails[seg.id] = null;
+    }
+
+    const prActivityId = detail && detail.athlete_segment_stats && detail.athlete_segment_stats.pr_activity_id;
+    if(prActivityId){
+      try{
+        const activity = await fetchActivityDetail(prActivityId, state.accessToken);
+        const effort = (activity.segment_efforts || []).find(e => e.segment && e.segment.id === seg.id);
+        if(effort && effort.average_watts != null){
+          state.segmentPrWatts[seg.id] = { watts: Math.round(effort.average_watts), measured: !!effort.device_watts };
+        }
+      }catch(e){
+        // no power data for this PR effort — leave unset
+      }
     }
     render();
   }
@@ -667,9 +694,13 @@ function mountRouteMap(){
   if(!container || !state.fullRouteCoords.length) return;
 
   const map = L.map(container, { scrollWheelZoom:true });
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '&copy; OpenStreetMap Mitwirkende',
-    maxZoom: 18
+  // Light, low-detail grayscale basemap instead of the colorful default OSM
+  // tiles — much higher contrast for the colored wind line, and easier to
+  // read on a phone in direct sunlight.
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; OpenStreetMap Mitwirkende &copy; CARTO',
+    maxZoom: 20,
+    subdomains: 'abcd'
   }).addTo(map);
 
   const coords = state.fullRouteCoords;
@@ -728,6 +759,27 @@ function mountRouteMap(){
   leafletMapInstance = map;
 }
 
+// diff = 0 means pure tailwind, 180 means pure headwind (see windRelative)
+function segmentTailwindDiff(seg){
+  const w = state.segmentWeather[seg.id];
+  if(!w || !seg.start_latlng || !seg.end_latlng) return Infinity;
+  const bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
+  return windRelative(bearing, w.windDir).diff;
+}
+
+function sortedVisibleSegments(){
+  const list = state.segments.slice(0, 12);
+  const effortCount = seg => (state.segmentDetails[seg.id] && state.segmentDetails[seg.id].athlete_segment_stats && state.segmentDetails[seg.id].athlete_segment_stats.effort_count) || 0;
+  switch(state.segmentSortBy){
+    case "effort": return list.slice().sort((a,b) => effortCount(b) - effortCount(a));
+    case "shortest": return list.slice().sort((a,b) => a.distance - b.distance);
+    case "longest": return list.slice().sort((a,b) => b.distance - a.distance);
+    case "steepest": return list.slice().sort((a,b) => b.average_grade - a.average_grade);
+    case "tailwind": return list.slice().sort((a,b) => segmentTailwindDiff(a) - segmentTailwindDiff(b));
+    default: return list;
+  }
+}
+
 function renderSegmentsCard(){
   const card = el("div", {class:"card"});
   card.appendChild(el("h2", {}, ["Markierte Segmente"]));
@@ -741,7 +793,22 @@ function renderSegmentsCard(){
     return card;
   }
 
-  state.segments.slice(0,12).forEach(seg=>{
+  card.appendChild(el("div", {style:"margin-bottom:14px;"}, [
+    el("label", {}, ["Sortierung"]),
+    el("select", {
+      style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:8px; padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
+      onchange:(e)=>{ state.segmentSortBy = e.target.value; render(); }
+    }, [
+      el("option", {value:"default", selected: state.segmentSortBy==="default" ? "selected" : null}, ["Standard"]),
+      el("option", {value:"tailwind", selected: state.segmentSortBy==="tailwind" ? "selected" : null}, ["Bester Rückenwind zuerst"]),
+      el("option", {value:"effort", selected: state.segmentSortBy==="effort" ? "selected" : null}, ["Am häufigsten gefahren"]),
+      el("option", {value:"shortest", selected: state.segmentSortBy==="shortest" ? "selected" : null}, ["Länge: kurz → lang"]),
+      el("option", {value:"longest", selected: state.segmentSortBy==="longest" ? "selected" : null}, ["Länge: lang → kurz"]),
+      el("option", {value:"steepest", selected: state.segmentSortBy==="steepest" ? "selected" : null}, ["Steilste zuerst"])
+    ])
+  ]));
+
+  sortedVisibleSegments().forEach(seg=>{
     const w = state.segmentWeather[seg.id];
     let bearing = null;
     if(seg.start_latlng && seg.end_latlng){
@@ -771,8 +838,8 @@ function renderSegmentsCard(){
     if(detail){
       const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
       if(pr != null) stats.push(`PR ${fmtDuration(pr)}`);
-      const prRank = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_rank;
-      if(prRank) stats.push(`Platz ${prRank}`);
+      const prWatts = state.segmentPrWatts[seg.id];
+      if(prWatts) stats.push(`${prWatts.measured ? "" : "~"}${prWatts.watts} W`);
       if(detail.xoms && detail.xoms.kom) stats.push(`KOM ${detail.xoms.kom}`);
       if(detail.xoms && detail.xoms.qom) stats.push(`QOM ${detail.xoms.qom}`);
       if(detail.total_elevation_gain != null) stats.push(`${Math.round(detail.total_elevation_gain)} Hm`);
