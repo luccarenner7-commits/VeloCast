@@ -335,6 +335,108 @@ function windRelative(routeBearing, windFromDeg){
   return { type:"cross", diff };
 }
 
+// Distance-weighted breakdown of the whole route by wind relation, so a
+// short but very headwind-y stretch doesn't count the same as a long one.
+function computeWindMix(){
+  const pts = state.routePoints;
+  let tailDist = 0, crossDist = 0, totalDist = 0;
+  for(let i=0;i<pts.length-1;i++){
+    const w = state.weatherAtRoute[i];
+    if(!w) continue;
+    const dist = pts[i+1].distanceKm - pts[i].distanceKm;
+    if(dist <= 0) continue;
+    const rel = windRelative(pts[i].bearing, w.windDir);
+    if(rel.type === "tail") tailDist += dist;
+    else if(rel.type === "cross") crossDist += dist;
+    totalDist += dist;
+  }
+  if(totalDist <= 0) return null;
+  const tailPct = Math.round(tailDist / totalDist * 100);
+  const crossPct = Math.round(crossDist / totalDist * 100);
+  const headPct = Math.max(0, 100 - tailPct - crossPct);
+  return { tailPct, crossPct, headPct };
+}
+
+// Finds the best departure times for the current route within the next 48h,
+// reusing the hourly forecast we already fetched per route point (Open-Meteo
+// returns 7 days of hourly data in a single call) — no extra API requests.
+function findBestStartTimes(){
+  const pts = state.routePoints;
+  if(!pts.length || !state.weatherAtRoute.some(w => w && w.hourly)) return [];
+
+  const now = new Date();
+  now.setMinutes(0, 0, 0);
+  now.setHours(now.getHours() + 1);
+  const candidates = [];
+  for(let h=0; h<48; h++){
+    candidates.push(new Date(now.getTime() + h*3600*1000));
+  }
+
+  const scored = candidates.map(startDate=>{
+    let totalDist = 0, tailDist = 0, headDist = 0, sumDiff = 0;
+    for(let i=0;i<pts.length-1;i++){
+      const w = state.weatherAtRoute[i];
+      if(!w || !w.hourly) continue;
+      const dist = pts[i+1].distanceKm - pts[i].distanceKm;
+      if(dist <= 0) continue;
+
+      const arrival = estimateArrival(startDate, pts[i].distanceKm, state.avgSpeedKmh);
+      const hours = w.hourly.time;
+      let idx = 0, best = Infinity;
+      hours.forEach((t,hi)=>{
+        const diff = Math.abs(new Date(t) - arrival);
+        if(diff < best){ best = diff; idx = hi; }
+      });
+      const windDir = w.hourly.wind_direction_10m[idx];
+      const rel = windRelative(pts[i].bearing, windDir);
+      sumDiff += rel.diff * dist;
+      totalDist += dist;
+      if(rel.type === "tail") tailDist += dist;
+      if(rel.type === "head") headDist += dist;
+    }
+    if(totalDist <= 0) return null;
+    return {
+      startDate,
+      avgDiff: sumDiff / totalDist,
+      tailPct: Math.round(tailDist / totalDist * 100),
+      headPct: Math.round(headDist / totalDist * 100)
+    };
+  }).filter(Boolean);
+
+  scored.sort((a,b) => a.avgDiff - b.avgDiff);
+  return scored.slice(0, 3);
+}
+
+function renderBestStartCard(){
+  if(!state.routePoints.length || !state.weatherAtRoute.length) return null;
+  const best = findBestStartTimes();
+  if(!best.length) return null;
+
+  const card = el("div", {class:"card"});
+  card.appendChild(el("h2", {}, ["Beste Startzeit"]));
+  card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px; font-size:12px;"}, ["Basierend auf der 7-Tage-Vorhersage für diese Strecke, bei deiner eingestellten Geschwindigkeit."]));
+
+  best.forEach((b,i)=>{
+    const dateLabel = b.startDate.toLocaleDateString("de-DE", {weekday:"short", day:"2-digit", month:"2-digit"});
+    const row = el("div", {
+      class:"activity" + (i===0 ? " selected" : ""),
+      onclick:()=>{
+        state.startTime = toLocalInputValue(b.startDate);
+        render();
+        loadRouteWeather();
+      }
+    }, [
+      el("div", {}, [
+        el("div", {class:"name"}, [`${dateLabel}, ${fmtTime(b.startDate)} Uhr`]),
+        el("div", {class:"meta"}, [`${b.tailPct}% Rückenwind · ${b.headPct}% Gegenwind`])
+      ])
+    ]);
+    card.appendChild(row);
+  });
+
+  return card;
+}
+
 function arrowSvg(routeBearing, windFromDeg, color){
   // arrow points in the direction wind blows TOWARD, rotated relative to route bearing (route = "up")
   const windToward = (windFromDeg + 180) % 360;
@@ -455,6 +557,8 @@ function render(){
   }
 
   app.appendChild(renderRouteCard());
+  const bestStartCard = renderBestStartCard();
+  if(bestStartCard) app.appendChild(bestStartCard);
   app.appendChild(renderSegmentsCard());
   app.appendChild(renderFootnote());
   requestAnimationFrame(mountRouteMap);
@@ -679,6 +783,21 @@ function renderRouteCard(){
   if(state.loading.weather){
     card.appendChild(el("div", {class:"loading", style:"margin-top:14px;"}, ["Berechne Wind entlang der Strecke…"]));
   } else if(state.routePoints.length && state.weatherAtRoute.length){
+    const mix = computeWindMix();
+    if(mix){
+      card.appendChild(el("div", {style:"margin-top:14px;"}, [
+        el("div", {style:"display:flex; height:8px; border-radius:4px; overflow:hidden;"}, [
+          el("div", {style:`flex:${mix.tailPct}; background:var(--tail);`}),
+          el("div", {style:`flex:${mix.crossPct}; background:var(--cross);`}),
+          el("div", {style:`flex:${mix.headPct}; background:var(--head);`})
+        ]),
+        el("div", {style:"display:flex; justify-content:space-between; margin-top:6px; font-size:11px; font-family:'IBM Plex Mono', monospace;"}, [
+          el("span", {style:"color:var(--tail);"}, [`${mix.tailPct}% Rückenwind`]),
+          el("span", {style:"color:var(--cross);"}, [`${mix.crossPct}% Seitenwind`]),
+          el("span", {style:"color:var(--head);"}, [`${mix.headPct}% Gegenwind`])
+        ])
+      ]));
+    }
     card.appendChild(el("div", {id:"route-map", style:"margin-top:14px;"}));
     const legend = el("div", {class:"legend", style:"margin-top:10px;"}, [
       el("span",{},[el("span",{class:"swatch", style:"background:var(--tail)"}), "Rückenwind"]),
