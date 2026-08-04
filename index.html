@@ -238,6 +238,7 @@ let state = {
   selectedSegmentId: null, // when set, the map shows this segment instead of the full route
   routeSourceTab: "activities", // "routes" | "activities" | "gpx"
   stravaRoutes: [], // saved/planned Strava routes, fetched lazily when that tab opens
+  bestStartCollapsed: loadBestStartCollapsed(),
   loading: {},
   error: null,
   authCodeInput: ""
@@ -441,8 +442,21 @@ function renderBestStartCard(){
   if(!best.length) return null;
 
   const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Beste Startzeit"]));
-  card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px; font-size:12px;"}, ["Basierend auf der 7-Tage-Vorhersage für diese Strecke, bei deiner eingestellten Geschwindigkeit."]));
+  card.appendChild(el("div", {
+    style:"display:flex; align-items:center; justify-content:space-between; cursor:pointer;",
+    onclick:()=>{
+      state.bestStartCollapsed = !state.bestStartCollapsed;
+      saveBestStartCollapsed(state.bestStartCollapsed);
+      render();
+    }
+  }, [
+    el("h2", {style:"margin:0;"}, ["Beste Startzeit"]),
+    el("span", {class:"muted", style:"font-size:14px;"}, [state.bestStartCollapsed ? "▾" : "▴"])
+  ]));
+
+  if(state.bestStartCollapsed) return card;
+
+  card.appendChild(el("div", {class:"muted", style:"margin:10px 0 14px; font-size:12px;"}, ["Basierend auf der 7-Tage-Vorhersage für diese Strecke, bei deiner eingestellten Geschwindigkeit."]));
 
   best.forEach((b,i)=>{
     const dateLabel = b.startDate.toLocaleDateString("de-DE", {weekday:"short", day:"2-digit", month:"2-digit"});
@@ -472,6 +486,13 @@ function arrowSvg(routeBearing, windFromDeg, color){
   return `<svg viewBox="0 0 24 24" style="transform:rotate(${relAngle}deg)">
     <path d="M12 3 L18 15 L12 11.5 L6 15 Z" fill="${color}"/>
   </svg>`;
+}
+
+function loadBestStartCollapsed(){
+  try{ return localStorage.getItem("best_start_collapsed") === "1"; }catch(e){ return false; }
+}
+function saveBestStartCollapsed(collapsed){
+  try{ localStorage.setItem("best_start_collapsed", collapsed ? "1" : "0"); }catch(e){}
 }
 
 // ---------- storage ----------
