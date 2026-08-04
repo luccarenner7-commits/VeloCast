@@ -1486,27 +1486,28 @@ function mountFullRouteView(container){
     }
   }
 
-  // small dots at each sampled point (no more rotated arrow glyphs — the
-  // colored line segments + the Windfeld overlay already convey wind
-  // direction/type, this is now just an anchor for the weather-strip chips
-  // below the map to pan to / open a popup on) — skip points that sit too
-  // close to an already-placed marker (e.g. where the route crosses itself)
+  // invisible anchors at each sampled point — no visual marker on the map
+  // (the colored line segments + Windfeld overlay already convey wind
+  // direction/type), these just let the weather-strip chips below the map
+  // pan to / open a popup on the right spot when clicked — skip points that
+  // sit too close to an already-placed anchor (e.g. where the route crosses
+  // itself)
   const markerDedupeRadiusKm = 0.5;
   const shownMarkerPositions = [];
+  const invisibleIcon = L.divIcon({ className:"", html:"", iconSize:[0,0] });
   routeMarkerByIndex = {};
   pts.forEach((p,i)=>{
     const near = shownMarkerPositions.find(m => haversineKm([m.lat, m.lon], [p.lat, p.lon]) < markerDedupeRadiusKm);
     if(near){ routeMarkerByIndex[i] = near.marker; return; }
 
     const w = state.weatherAtRoute[i];
-    let color = "#98a1ae", label = "Keine Winddaten";
+    let label = "Keine Winddaten";
     if(w){
       const rel = windRelative(p.bearing, w.windDir);
-      color = rel.type === "tail" ? "#4fb08c" : rel.type === "head" ? "#e2574c" : "#e2b23e";
       const typeLabel = rel.type === "tail" ? "Rückenwind" : rel.type === "head" ? "Gegenwind" : "Seitenwind";
       label = `<b>Ankunft ${fmtTime(p.arrivalTime)} Uhr</b> · ${p.distanceKm.toFixed(0)} km<br><b>${typeLabel}</b><br>${Math.round(w.windSpeed)} km/h · ${Math.round(w.temp)}° · ${w.precip}% Regen`;
     }
-    const marker = L.circleMarker([p.lat, p.lon], { radius:5, weight:2, color:"#14171d", fillColor:color, fillOpacity:0.95 })
+    const marker = L.marker([p.lat, p.lon], { icon: invisibleIcon })
       .addTo(map).bindPopup(label);
     shownMarkerPositions.push({ lat:p.lat, lon:p.lon, marker });
     routeMarkerByIndex[i] = marker;
