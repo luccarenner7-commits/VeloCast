@@ -566,7 +566,9 @@ function render(){
   app.innerHTML = "";
   app.appendChild(renderBrand());
 
-  if(!state.connected){
+  // Without a Strava login there's no activity list or segments — but a
+  // loaded GPX route still needs the route card + map.
+  if(!state.connected && !state.fullRouteCoords.length){
     app.appendChild(renderConnectCard());
     app.appendChild(renderFootnote());
     return;
@@ -575,7 +577,9 @@ function render(){
   app.appendChild(renderRouteCard());
   const bestStartCard = renderBestStartCard();
   if(bestStartCard) app.appendChild(bestStartCard);
-  app.appendChild(renderSegmentsCard());
+  if(state.connected){
+    app.appendChild(renderSegmentsCard());
+  }
   app.appendChild(renderFootnote());
   requestAnimationFrame(mountRouteMap);
 }
@@ -597,6 +601,27 @@ function buildAuthUrl(){
   return `https://www.strava.com/oauth/authorize?client_id=${STRAVA_CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(redirectUri)}&approval_prompt=auto&scope=read,activity:read_all,profile:read_all`;
 }
 
+// File-picker button for GPX import, shared by the connect screen and the
+// route card. Native file input keeps this a single tap on mobile.
+function renderGpxUploadRow(){
+  const fileInput = el("input", {
+    type:"file", accept:".gpx", style:"display:none;",
+    onchange:(e)=>{
+      const file = e.target.files[0];
+      if(file) loadGpxFile(file);
+    }
+  });
+  const label = (state.selectedActivity && state.selectedActivity.isGpx)
+    ? `GPX: ${state.selectedActivity.name}`
+    : "GPX-Datei hochladen";
+  const wrap = el("div", {style:"margin-bottom:14px;"}, [
+    fileInput,
+    el("button", {class:"btn secondary", style:"font-size:12px; padding:8px 14px;", onclick:()=>fileInput.click()}, [label])
+  ]);
+  if(state.error) wrap.appendChild(el("div", {class:"error", style:"margin-top:8px;"}, [state.error]));
+  return wrap;
+}
+
 function renderConnectCard(){
   const card = el("div", {class:"card"});
   card.appendChild(el("h2", {}, ["Mit Strava verbinden"]));
@@ -608,7 +633,9 @@ function renderConnectCard(){
   if(state.loading.connect) loginBtn.disabled = true;
   card.appendChild(loginBtn);
 
-  if(state.error) card.appendChild(el("div", {class:"error", style:"margin-top:10px;"}, [state.error]));
+  card.appendChild(el("div", {class:"muted", style:"margin:16px 0 8px; font-size:12px;"}, ["oder, ganz ohne Account:"]));
+  card.appendChild(renderGpxUploadRow());
+
   return card;
 }
 
@@ -663,6 +690,48 @@ async function selectActivity(activity){
   state.routePoints = pickRoutePoints(coords, cumDist, state.routePointDistanceKm);
   render();
   await loadRouteWeather();
+}
+
+// Re-samples routePoints from the already-loaded fullRouteCoords — used
+// when Punktabstand changes for a GPX route, since (unlike a Strava
+// activity) there's nothing to re-fetch, just re-slice what's in memory.
+function recomputeRoutePoints(){
+  if(!state.fullRouteCoords.length) return;
+  const cumDist = buildCumulativeDistances(state.fullRouteCoords);
+  state.routePoints = pickRoutePoints(state.fullRouteCoords, cumDist, state.routePointDistanceKm);
+  render();
+  loadRouteWeather();
+}
+
+// ---------- GPX import ----------
+// Lets the wind/map pipeline run on any route, not just past Strava
+// activities — works without being connected to Strava at all.
+function parseGpxCoords(xmlText){
+  const doc = new DOMParser().parseFromString(xmlText, "application/xml");
+  if(doc.querySelector("parsererror")) return null;
+  const points = [...doc.querySelectorAll("trkpt, rtept")];
+  const coords = points
+    .map(p => [parseFloat(p.getAttribute("lat")), parseFloat(p.getAttribute("lon"))])
+    .filter(c => Number.isFinite(c[0]) && Number.isFinite(c[1]));
+  return coords.length >= 2 ? coords : null;
+}
+
+async function loadGpxFile(file){
+  state.error = null;
+  let coords = null;
+  try{
+    coords = parseGpxCoords(await file.text());
+  }catch(e){
+    coords = null;
+  }
+  if(!coords){
+    state.error = "GPX-Datei konnte nicht gelesen werden.";
+    render();
+    return;
+  }
+  state.selectedActivity = { name: file.name.replace(/\.gpx$/i, ""), isGpx: true };
+  state.fullRouteCoords = coords;
+  recomputeRoutePoints();
 }
 
 async function loadRouteWeather(){
@@ -749,7 +818,7 @@ function renderRouteCard(){
     el("div", {}, [
       el("label", {}, ["Startzeit"]),
       el("div", {style:"display:flex; justify-content:center;"}, [
-        el("input", {type:"datetime-local", style:"width:100%;", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
+        el("input", {type:"datetime-local", style:"width:auto;", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
       ])
     ]),
     el("div", {}, [
@@ -762,7 +831,9 @@ function renderRouteCard(){
         style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:8px; padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
         onchange:(e)=>{
           state.routePointDistanceKm = parseInt(e.target.value, 10) || 10;
-          if(state.selectedActivity){
+          if(state.selectedActivity && state.selectedActivity.isGpx){
+            recomputeRoutePoints();
+          } else if(state.selectedActivity){
             selectActivity(state.selectedActivity);
           }
         }
@@ -778,30 +849,33 @@ function renderRouteCard(){
   card.appendChild(settingsRow);
   card.appendChild(el("div", {class:"muted", style:"margin-bottom:12px; font-size:12px;"}, ["Wetterwerte werden jeweils für den erwarteten Ankunftszeitpunkt an diesem Punkt berechnet."]));
 
-  if(state.loading.activities){
-    card.appendChild(el("div", {class:"loading"}, ["Lade letzte Aktivitäten…"]));
-    return card;
+  if(state.connected){
+    if(state.loading.activities){
+      card.appendChild(el("div", {class:"loading"}, ["Lade letzte Aktivitäten…"]));
+      return card;
+    }
+
+    if(state.activities.length){
+      const list = el("div", {});
+      state.activities.filter(a => a.type === "Ride" || a.type === "VirtualRide" || a.type === "GravelRide" || a.type === "MountainBikeRide" || !a.type).slice(0,5).forEach(a=>{
+        const isSel = state.selectedActivity && state.selectedActivity.id === a.id;
+        const km = (a.distance/1000).toFixed(1);
+        const date = new Date(a.start_date_local).toLocaleDateString("de-DE", {day:"2-digit", month:"2-digit", year:"numeric"});
+        const item = el("div", {class:"activity" + (isSel?" selected":""), onclick: ()=>selectActivity(a)}, [
+          el("div", {}, [
+            el("div", {class:"name"}, [a.name]),
+            el("div", {class:"meta"}, [`${date} · ${km} km`])
+          ])
+        ]);
+        list.appendChild(item);
+      });
+      card.appendChild(list);
+    } else if(!state.fullRouteCoords.length){
+      card.appendChild(el("div", {class:"muted"}, ["Keine Aktivitäten gefunden."]));
+    }
   }
 
-  if(!state.activities.length){
-    card.appendChild(el("div", {class:"muted"}, ["Keine Aktivitäten gefunden."]));
-    return card;
-  }
-
-  const list = el("div", {});
-  state.activities.filter(a => a.type === "Ride" || a.type === "VirtualRide" || a.type === "GravelRide" || a.type === "MountainBikeRide" || !a.type).slice(0,5).forEach(a=>{
-    const isSel = state.selectedActivity && state.selectedActivity.id === a.id;
-    const km = (a.distance/1000).toFixed(1);
-    const date = new Date(a.start_date_local).toLocaleDateString("de-DE", {day:"2-digit", month:"2-digit", year:"numeric"});
-    const item = el("div", {class:"activity" + (isSel?" selected":""), onclick: ()=>selectActivity(a)}, [
-      el("div", {}, [
-        el("div", {class:"name"}, [a.name]),
-        el("div", {class:"meta"}, [`${date} · ${km} km`])
-      ])
-    ]);
-    list.appendChild(item);
-  });
-  card.appendChild(list);
+  card.appendChild(renderGpxUploadRow());
 
   if(state.loading.weather){
     card.appendChild(el("div", {class:"loading", style:"margin-top:14px;"}, ["Berechne Wind entlang der Strecke…"]));
@@ -851,7 +925,7 @@ function renderRouteCard(){
       });
       card.appendChild(strip);
     }
-  } else if(state.selectedActivity && !state.selectedActivity.map){
+  } else if(state.selectedActivity && !state.fullRouteCoords.length){
     card.appendChild(el("div", {class:"muted", style:"margin-top:12px;"}, ["Für diese Aktivität liegt keine Streckenkarte vor."]));
   }
 
