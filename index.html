@@ -420,7 +420,7 @@ function computeStrongWindWarning(){
 // Windy.com-style field but without animation. Open-Meteo accepts
 // comma-separated lists of coordinates in a single request, so the whole
 // grid costs exactly one extra API call, regardless of grid size.
-const WIND_FIELD_GRID_SIZE = 5; // 5x5 = 25 points per fetch
+const WIND_FIELD_GRID_SIZE = 8; // 8x8 = 64 points per fetch
 
 function computeWindFieldGridPoints(bounds){
   const south = bounds.getSouth(), north = bounds.getNorth();
@@ -540,8 +540,10 @@ async function ensureElevationProfile(){
       raw = await fetchActivityStreams(state.selectedActivity.id, state.accessToken);
     }
     const streams = normalizeStreams(raw);
+    // Strava's distance stream is in meters; elevationProfile.distances is
+    // documented (and consumed by renderElevationChart) as km.
     state.elevationProfile = (streams.distance && streams.altitude)
-      ? { distances: streams.distance, elevations: streams.altitude }
+      ? { distances: streams.distance.map(d => d / 1000), elevations: streams.altitude }
       : { distances: [], elevations: [] };
   }catch(e){
     state.elevationProfile = { distances: [], elevations: [] };
@@ -1433,11 +1435,11 @@ function mountFullRouteView(container){
         const rotateDeg = (p.windDir + 180) % 360;
         const icon = L.divIcon({
           className: "",
-          html: `<svg width="18" height="18" viewBox="0 0 16 16" style="transform:rotate(${rotateDeg}deg); opacity:0.6;">
+          html: `<svg width="13" height="13" viewBox="0 0 16 16" style="transform:rotate(${rotateDeg}deg); opacity:0.6;">
                    <line x1="8" y1="13" x2="8" y2="4" stroke="${color}" stroke-width="1.6" stroke-linecap="round"/>
                    <path d="M4.8 6.6 L8 3 L11.2 6.6" fill="none" stroke="${color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
                  </svg>`,
-          iconSize: [18,18], iconAnchor: [9,9]
+          iconSize: [13,13], iconAnchor: [6.5,6.5]
         });
         L.marker([p.lat, p.lon], { icon }).addTo(map).bindTooltip(`${Math.round(p.windSpeed)} km/h`);
       });
@@ -1456,6 +1458,32 @@ function mountFullRouteView(container){
     if(to <= from) continue;
     const segCoords = coords.slice(from, to + 1).map(c=>[c[0], c[1]]);
     L.polyline(segCoords, { color, weight:5, opacity:0.95, lineCap:"round", lineJoin:"round" }).addTo(map);
+  }
+
+  // small chevrons along the line showing which way the ride goes — placed
+  // at even distance intervals independent of the (much sparser)
+  // wind-sample points, so direction stays legible on loops/out-and-backs
+  // regardless of the chosen Punktabstand.
+  const cumDist = buildCumulativeDistances(coords);
+  const totalKm = cumDist[cumDist.length - 1] || 0;
+  if(totalKm > 0){
+    const chevronCount = Math.min(20, Math.max(4, Math.round(totalKm / 2)));
+    const spacingKm = totalKm / chevronCount;
+    for(let c=1;c<chevronCount;c++){
+      const targetKm = c * spacingKm;
+      let idx = cumDist.findIndex(d => d >= targetKm);
+      if(idx <= 0) idx = 1;
+      if(idx >= coords.length) idx = coords.length - 1;
+      const bearing = bearingBetween(coords[idx-1], coords[idx]);
+      const icon = L.divIcon({
+        className: "",
+        html: `<svg width="14" height="14" viewBox="0 0 16 16" style="transform:rotate(${bearing}deg); filter: drop-shadow(0 0 1.5px rgba(20,23,29,0.9));">
+                 <path d="M8 2.5 L12.5 11 L8 8.8 L3.5 11 Z" fill="#f2efe9" opacity="0.95"/>
+               </svg>`,
+        iconSize: [14,14], iconAnchor: [7,7]
+      });
+      L.marker(coords[idx], { icon, interactive:false }).addTo(map);
+    }
   }
 
   // slim directional glyphs at each sampled point — skip points that sit too
