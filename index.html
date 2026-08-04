@@ -170,6 +170,8 @@
   .tag.tail{ background:var(--tail-bg); color:var(--tail); }
   .tag.head{ background:var(--head-bg); color:var(--head); }
   .tag.cross{ background:var(--cross-bg); color:var(--cross); }
+  .tag.mini{ padding:3px 6px; font-size:10px; }
+  .wind-mix-mini{ display:flex; gap:4px; flex-shrink:0; }
 
   .weather-strip{ display:flex; gap:14px; overflow-x:auto; padding-bottom:4px; }
   .weather-chip{
@@ -218,6 +220,8 @@ function fmtDuration(sec){
   return h > 0 ? `${h}:${pad2(m)}:${pad2(s)}` : `${m}:${pad2(s)}`;
 }
 
+const savedSettings = loadSettings();
+
 let state = {
   connected: false,
   athlete: null,
@@ -228,8 +232,8 @@ let state = {
   fullRouteCoords: [], // [[lat,lon], ...] full-resolution line for the map
   weatherAtRoute: [], // aligned with routePoints
   startTime: defaultStartTime(),
-  avgSpeedKmh: 25,
-  routePointDistanceKm: 10,
+  avgSpeedKmh: savedSettings.avgSpeedKmh || 25,
+  routePointDistanceKm: savedSettings.routePointDistanceKm || 10,
   segments: [],
   segmentWeather: {}, // id -> weather
   segmentDetails: {}, // id -> detailed segment (PR, KOM/QOM, elevation, effort count)
@@ -387,6 +391,27 @@ function computeWindMix(){
   return { tailPct, crossPct, headPct };
 }
 
+// Thresholds for the strong-wind banner. Sustained wind and gusts are judged
+// separately since gusts spike well above the sustained speed even on an
+// otherwise rideable day.
+const STRONG_WIND_KMH = 35;
+const STRONG_GUST_KMH = 50;
+
+// Scans the already-fetched weather at each route point (no extra API calls)
+// for the worst sustained wind / gust expected anywhere along the route at
+// the currently chosen start time, so a gusty stretch in the middle of an
+// otherwise calm route still surfaces a warning.
+function computeStrongWindWarning(){
+  let maxWind = 0, maxGust = 0;
+  state.weatherAtRoute.forEach(w=>{
+    if(!w) return;
+    if(w.windSpeed > maxWind) maxWind = w.windSpeed;
+    if(w.windGust > maxGust) maxGust = w.windGust;
+  });
+  if(maxWind < STRONG_WIND_KMH && maxGust < STRONG_GUST_KMH) return null;
+  return { maxWind, maxGust };
+}
+
 // Finds the best departure times for the current route within the next 48h,
 // reusing the hourly forecast we already fetched per route point (Open-Meteo
 // returns 7 days of hourly data in a single call) — no extra API requests.
@@ -435,13 +460,6 @@ function findBestStartTimes(){
 
   scored.sort((a,b) => a.avgDiff - b.avgDiff);
   return scored.slice(0, 3);
-}
-
-function windTypeLabel(type){
-  return type === "tail" ? "Rückenwind" : type === "head" ? "Gegenwind" : "Seitenwind";
-}
-function windTypeClass(type){
-  return type === "tail" ? "tail" : type === "head" ? "head" : "cross";
 }
 
 async function ensureElevationProfile(){
@@ -579,6 +597,25 @@ async function saveToken(refreshToken){
   try{ localStorage.setItem("strava_refresh_token", refreshToken); }catch(e){}
 }
 
+// Persisted across sessions: avg speed and point spacing, since those are
+// per-rider preferences. Startzeit is intentionally NOT persisted — it
+// defaults to "now + 60min" each visit, a saved absolute timestamp would
+// just be stale/in the past on the next visit.
+function loadSettings(){
+  try{
+    const raw = localStorage.getItem("velocast_settings");
+    return raw ? JSON.parse(raw) : {};
+  }catch(e){ return {}; }
+}
+function saveSettings(){
+  try{
+    localStorage.setItem("velocast_settings", JSON.stringify({
+      avgSpeedKmh: state.avgSpeedKmh,
+      routePointDistanceKm: state.routePointDistanceKm
+    }));
+  }catch(e){}
+}
+
 // ---------- Strava API ----------
 // The actual client_id/client_secret exchange happens in the Cloudflare
 // Worker (see worker/), which is the only place that knows the secret.
@@ -680,7 +717,7 @@ async function fetchActivityDetail(activityId, token){
 // ---------- Open-Meteo ----------
 async function fetchWeather(lat, lon, targetDate){
   targetDate = targetDate || new Date();
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,precipitation_probability&forecast_days=7&timezone=auto`;
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,precipitation_probability&forecast_days=7&timezone=auto`;
   const res = await fetch(url);
   if(!res.ok) throw new Error("Wetterdaten nicht verfügbar");
   const data = await res.json();
@@ -695,6 +732,7 @@ async function fetchWeather(lat, lon, targetDate){
     temp: data.hourly.temperature_2m[idx],
     windSpeed: data.hourly.wind_speed_10m[idx],
     windDir: data.hourly.wind_direction_10m[idx],
+    windGust: data.hourly.wind_gusts_10m[idx],
     precip: data.hourly.precipitation_probability[idx],
     forecastTime: new Date(hours[idx]),
     hourly: data.hourly,
@@ -981,22 +1019,34 @@ async function ensureSegmentPrWatts(seg){
   render();
 }
 
-// Quick single-point wind rating for a route/activity list chip: overall
-// start->end bearing vs. current wind at the start point. Cheap (one
-// Open-Meteo call, no Strava calls) compared to the full per-point wind-mix
-// used once a route is actually selected, so it's fine to do for every
-// visible list item.
+// Distance-weighted tail/cross/head wind-mix for a route/activity list chip.
+// The polyline is decoded and split into bearings entirely client-side
+// (free); only a single Open-Meteo call is made (wind at the start point) to
+// classify all of those segments against, so this stays cheap enough to run
+// for every visible list item.
 async function ensureListItemWindTag(key, polyline){
   if(state.routeWindCache[key] !== undefined) return;
   state.routeWindCache[key] = null;
   if(!polyline) return;
   const coords = decodePolyline(polyline);
   if(coords.length < 2) return;
-  const bearing = bearingBetween(coords[0], coords[coords.length - 1]);
   try{
     const w = await fetchWeather(coords[0][0].toFixed(4), coords[0][1].toFixed(4));
-    const rel = windRelative(bearing, w.windDir);
-    state.routeWindCache[key] = { type: rel.type, windSpeed: w.windSpeed };
+    let tailDist = 0, crossDist = 0, totalDist = 0;
+    for(let i=0;i<coords.length-1;i++){
+      const dist = haversineKm(coords[i], coords[i+1]);
+      if(dist <= 0) continue;
+      const bearing = bearingBetween(coords[i], coords[i+1]);
+      const rel = windRelative(bearing, w.windDir);
+      if(rel.type === "tail") tailDist += dist;
+      else if(rel.type === "cross") crossDist += dist;
+      totalDist += dist;
+    }
+    if(totalDist <= 0) return;
+    const tailPct = Math.round(tailDist / totalDist * 100);
+    const crossPct = Math.round(crossDist / totalDist * 100);
+    const headPct = Math.max(0, 100 - tailPct - crossPct);
+    state.routeWindCache[key] = { tailPct, crossPct, headPct };
     render();
   }catch(e){
     // leave cached as null (no rating shown)
@@ -1004,9 +1054,13 @@ async function ensureListItemWindTag(key, polyline){
 }
 
 function renderListItemWindTag(key){
-  const info = state.routeWindCache[key];
-  if(!info) return null;
-  return el("div", {class:"tag " + windTypeClass(info.type)}, [`${windTypeLabel(info.type)} · ${Math.round(info.windSpeed)} km/h`]);
+  const mix = state.routeWindCache[key];
+  if(!mix) return null;
+  return el("div", {class:"wind-mix-mini"}, [
+    el("div", {class:"tag mini tail", title:"Rückenwind"}, [`${mix.tailPct}%`]),
+    el("div", {class:"tag mini cross", title:"Seitenwind"}, [`${mix.crossPct}%`]),
+    el("div", {class:"tag mini head", title:"Gegenwind"}, [`${mix.headPct}%`])
+  ]);
 }
 
 function renderRouteCard(){
@@ -1038,7 +1092,7 @@ function renderRouteCard(){
     ]),
     el("div", {}, [
       el("label", {}, ["Ø Geschwindigkeit (km/h)"]),
-      el("input", {type:"number", style:"width:100%;", min:"5", max:"60", step:"1", value: state.avgSpeedKmh, onchange:(e)=>{ state.avgSpeedKmh = parseFloat(e.target.value) || 25; loadRouteWeather(); }})
+      el("input", {type:"number", style:"width:100%;", min:"5", max:"60", step:"1", value: state.avgSpeedKmh, onchange:(e)=>{ state.avgSpeedKmh = parseFloat(e.target.value) || 25; saveSettings(); loadRouteWeather(); }})
     ]),
     el("div", {}, [
       el("label", {}, ["Punktabstand"]),
@@ -1046,14 +1100,15 @@ function renderRouteCard(){
         style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:8px; padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
         onchange:(e)=>{
           state.routePointDistanceKm = parseInt(e.target.value, 10) || 10;
+          saveSettings();
           if(state.fullRouteCoords.length) recomputeRoutePoints();
         }
       }, [
-        el("option", {value:"5"}, ["alle 5 km"]),
+        el("option", {value:"5", selected: state.routePointDistanceKm === 5 ? "selected" : null}, ["alle 5 km"]),
         el("option", {value:"10", selected: state.routePointDistanceKm === 10 ? "selected" : null}, ["alle 10 km"]),
-        el("option", {value:"15"}, ["alle 15 km"]),
-        el("option", {value:"20"}, ["alle 20 km"]),
-        el("option", {value:"25"}, ["alle 25 km"])
+        el("option", {value:"15", selected: state.routePointDistanceKm === 15 ? "selected" : null}, ["alle 15 km"]),
+        el("option", {value:"20", selected: state.routePointDistanceKm === 20 ? "selected" : null}, ["alle 20 km"]),
+        el("option", {value:"25", selected: state.routePointDistanceKm === 25 ? "selected" : null}, ["alle 25 km"])
       ])
     ])
   ]);
@@ -1143,6 +1198,18 @@ function renderRouteCard(){
           el("span", {style:"color:var(--tail);"}, [`${mix.tailPct}% Rückenwind`]),
           el("span", {style:"color:var(--cross);"}, [`${mix.crossPct}% Seitenwind`]),
           el("span", {style:"color:var(--head);"}, [`${mix.headPct}% Gegenwind`])
+        ])
+      ]));
+    }
+    const strongWind = computeStrongWindWarning();
+    if(strongWind){
+      const parts = [];
+      if(strongWind.maxWind >= STRONG_WIND_KMH) parts.push(`${Math.round(strongWind.maxWind)} km/h Wind`);
+      if(strongWind.maxGust >= STRONG_GUST_KMH) parts.push(`${Math.round(strongWind.maxGust)} km/h Böen`);
+      card.appendChild(el("div", {style:"margin-top:14px; padding:10px 12px; border-radius:8px; background:var(--head-bg); border:1px solid var(--head); display:flex; align-items:center; gap:8px;"}, [
+        el("span", {style:"font-size:15px;"}, ["⚠"]),
+        el("span", {style:"font-size:12.5px; color:var(--head); font-family:'IBM Plex Mono', monospace;"}, [
+          `Starker Wind entlang der Strecke: bis zu ${parts.join(" · ")}`
         ])
       ]));
     }
