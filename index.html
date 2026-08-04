@@ -749,7 +749,7 @@ async function loadRouteWeather(){
       weatherResults.push(null);
     }
   }
-  state.weatherAtRoute = weatherResults;
+  state.weatherAtRoute = weatherResults;das 
   state.loading.weather = false;
   render();
 }
@@ -817,9 +817,7 @@ function renderRouteCard(){
   const settingsRow = el("div", {class:"settings-row"}, [
     el("div", {}, [
       el("label", {}, ["Startzeit"]),
-      el("div", {style:"display:flex; justify-content:center;"}, [
-        el("input", {type:"datetime-local", style:"width:auto;", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
-      ])
+      el("input", {type:"datetime-local", style:"width:100%;", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
     ]),
     el("div", {}, [
       el("label", {}, ["Ø Geschwindigkeit (km/h)"]),
