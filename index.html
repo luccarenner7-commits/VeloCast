@@ -76,9 +76,9 @@
 
   .row{ display:flex; gap:10px; flex-wrap:wrap; }
 
-  .settings-row{ display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:16px; margin-bottom:16px; }
+  .settings-row{ display:grid; grid-template-columns: repeat(3, minmax(190px,1fr)); gap:16px; margin-bottom:16px; }
   .settings-row > div{ min-width:0; }
-  @media (max-width:520px){ .settings-row{ grid-template-columns: 1fr; } }
+  @media (max-width:620px){ .settings-row{ grid-template-columns: 1fr; } }
 
   /* Activity picker */
   .activity{
@@ -129,9 +129,11 @@
 
   /* Segments */
   .segment{
-    display:flex; flex-direction:column; gap:10px;
+    display:flex; flex-direction:column; gap:10px; cursor:pointer;
     padding:14px; border-radius:10px; margin-bottom:8px; border:1px solid var(--line);
   }
+  .segment:hover{ border-color:var(--route); }
+  .segment.selected{ border-color:var(--tail); background:var(--tail-bg); }
   .segment .top{ display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap; }
   .segment .left{ display:flex; align-items:flex-start; gap:12px; min-width:0; flex:1; }
   .segment .arrow-badge{
@@ -159,8 +161,9 @@
   .weather-strip{ display:flex; gap:14px; overflow-x:auto; padding-bottom:4px; }
   .weather-chip{
     flex: 0 0 auto; min-width:76px; text-align:center; background:var(--asphalt);
-    border:1px solid var(--line); border-radius:10px; padding:10px 8px;
+    border:1px solid var(--line); border-radius:10px; padding:10px 8px; cursor:pointer;
   }
+  .weather-chip:hover{ border-color:var(--route); }
   .weather-chip .t{ font-family:'IBM Plex Mono', monospace; font-size:13px; font-weight:600; }
   .weather-chip .hr{ font-size:10px; color:var(--chalk-dim); font-family:'IBM Plex Mono', monospace; }
   .weather-chip .w{ font-size:11px; color:var(--route); margin-top:4px; font-family:'IBM Plex Mono', monospace; }
@@ -217,8 +220,9 @@ let state = {
   segments: [],
   segmentWeather: {}, // id -> weather
   segmentDetails: {}, // id -> detailed segment (PR, KOM/QOM, elevation, effort count)
-  segmentPrWatts: {}, // id -> {watts, measured} for the PR effort, or null
+  segmentPrWatts: {}, // id -> {watts, measured} for the PR effort, fetched lazily on click
   segmentSortBy: "default",
+  selectedSegmentId: null, // when set, the map shows this segment instead of the full route
   loading: {},
   error: null,
   authCodeInput: ""
@@ -571,32 +575,49 @@ async function loadSegmentExtras(){
         state.segmentWeather[seg.id] = null;
       }
     }
-    let detail = null;
     try{
-      detail = await fetchSegmentDetail(seg.id, state.accessToken);
-      state.segmentDetails[seg.id] = detail;
+      state.segmentDetails[seg.id] = await fetchSegmentDetail(seg.id, state.accessToken);
     }catch(e){
       state.segmentDetails[seg.id] = null;
-    }
-
-    const prActivityId = detail && detail.athlete_segment_stats && detail.athlete_segment_stats.pr_activity_id;
-    if(prActivityId){
-      try{
-        const activity = await fetchActivityDetail(prActivityId, state.accessToken);
-        const effort = (activity.segment_efforts || []).find(e => e.segment && e.segment.id === seg.id);
-        if(effort && effort.average_watts != null){
-          state.segmentPrWatts[seg.id] = { watts: Math.round(effort.average_watts), measured: !!effort.device_watts };
-        }
-      }catch(e){
-        // no power data for this PR effort — leave unset
-      }
     }
     render();
   }
 }
 
+// PR power isn't in the segment summary — it takes a whole extra activity
+// fetch per segment to find it, so we only do this on demand (when a
+// segment is clicked) instead of eagerly for all visible segments, to keep
+// Strava API usage down.
+async function ensureSegmentPrWatts(seg){
+  if(state.segmentPrWatts[seg.id] !== undefined) return;
+  const detail = state.segmentDetails[seg.id];
+  const prActivityId = detail && detail.athlete_segment_stats && detail.athlete_segment_stats.pr_activity_id;
+  if(!prActivityId){ state.segmentPrWatts[seg.id] = null; return; }
+  try{
+    const activity = await fetchActivityDetail(prActivityId, state.accessToken);
+    const effort = (activity.segment_efforts || []).find(e => e.segment && e.segment.id === seg.id);
+    state.segmentPrWatts[seg.id] = (effort && effort.average_watts != null)
+      ? { watts: Math.round(effort.average_watts), measured: !!effort.device_watts }
+      : null;
+  }catch(e){
+    state.segmentPrWatts[seg.id] = null;
+  }
+  render();
+}
+
 function renderRouteCard(){
   const card = el("div", {class:"card"});
+
+  if(state.selectedSegmentId){
+    const seg = state.segments.find(s => s.id === state.selectedSegmentId);
+    card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
+      el("h2", {style:"margin:0;"}, ["Segment: " + (seg ? seg.name : "")]),
+      el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{ state.selectedSegmentId = null; render(); }}, ["Zur Strecke"])
+    ]));
+    card.appendChild(el("div", {id:"route-map", style:"margin-top:0;"}));
+    return card;
+  }
+
   card.appendChild(el("h2", {}, ["Strecke"]));
 
   const settingsRow = el("div", {class:"settings-row"}, [
@@ -672,7 +693,15 @@ function renderRouteCard(){
       state.routePoints.forEach((p,i)=>{
         const w = state.weatherAtRoute[i];
         if(!w) return;
-        strip.appendChild(el("div", {class:"weather-chip"}, [
+        strip.appendChild(el("div", {class:"weather-chip", onclick:()=>{
+          const marker = routeMarkerByIndex[i];
+          if(marker){
+            if(leafletMapInstance) leafletMapInstance.panTo(marker.getLatLng());
+            marker.openPopup();
+          }
+          const mapEl = document.getElementById("route-map");
+          if(mapEl) mapEl.scrollIntoView({behavior:"smooth", block:"center"});
+        }}, [
           el("div", {class:"t"}, [Math.round(w.temp) + "°"]),
           el("div", {class:"hr"}, ["Ankunft " + fmtTime(p.arrivalTime) + " · " + p.distanceKm.toFixed(0) + " km"]),
           el("div", {class:"w"}, [w.precip + "% Regen"])
@@ -688,11 +717,59 @@ function renderRouteCard(){
 }
 
 let leafletMapInstance = null;
+let routeMarkerByIndex = {}; // routePoints index -> Leaflet marker (for weather-chip clicks)
+
 function mountRouteMap(){
   const container = document.getElementById("route-map");
   if(leafletMapInstance){ leafletMapInstance.remove(); leafletMapInstance = null; }
-  if(!container || !state.fullRouteCoords.length) return;
+  if(!container) return;
 
+  if(state.selectedSegmentId){
+    mountSegmentView(container, state.selectedSegmentId);
+  } else if(state.fullRouteCoords.length){
+    mountFullRouteView(container);
+  }
+}
+
+function mountSegmentView(container, segId){
+  const seg = state.segments.find(s => s.id === segId);
+  const detail = state.segmentDetails[segId];
+  const poly = detail && detail.map && (detail.map.polyline || detail.map.summary_polyline);
+  if(!seg || !poly) return;
+
+  const coords = decodePolyline(poly);
+  const latlngs = coords.map(c => [c[0], c[1]]);
+
+  const map = L.map(container, { scrollWheelZoom:true });
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; OpenStreetMap Mitwirkende &copy; CARTO',
+    maxZoom: 20,
+    subdomains: 'abcd'
+  }).addTo(map);
+
+  let color = "#6b8fc2", label = seg.name;
+  const w = state.segmentWeather[segId];
+  if(w && seg.start_latlng && seg.end_latlng){
+    const bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
+    const rel = windRelative(bearing, w.windDir);
+    color = rel.type === "tail" ? "#4fb08c" : rel.type === "head" ? "#e2574c" : "#e2b23e";
+    const typeLabel = rel.type === "tail" ? "Rückenwind" : rel.type === "head" ? "Gegenwind" : "Seitenwind";
+    label = `<b>${seg.name}</b><br>${typeLabel} · ${Math.round(w.windSpeed)} km/h`;
+  }
+
+  const line = L.polyline(latlngs, { color, weight:5, opacity:0.95, lineCap:"round", lineJoin:"round" }).addTo(map);
+  map.fitBounds(line.getBounds(), { padding:[30,30] });
+  line.bindPopup(label).openPopup();
+
+  L.circleMarker(latlngs[0], { radius:6, weight:2, color:"#14171d", fillColor:"#4fb08c", fillOpacity:1 })
+    .addTo(map).bindTooltip("Start");
+  L.circleMarker(latlngs[latlngs.length - 1], { radius:6, weight:2, color:"#14171d", fillColor:"#e2574c", fillOpacity:1 })
+    .addTo(map).bindTooltip("Ziel");
+
+  leafletMapInstance = map;
+}
+
+function mountFullRouteView(container){
   const map = L.map(container, { scrollWheelZoom:true });
   // Light, low-detail grayscale basemap instead of the colorful default OSM
   // tiles — much higher contrast for the colored wind line, and easier to
@@ -729,10 +806,10 @@ function mountRouteMap(){
   // so arrows don't stack on top of each other
   const markerDedupeRadiusKm = 0.5;
   const shownMarkerPositions = [];
+  routeMarkerByIndex = {};
   pts.forEach((p,i)=>{
-    const tooClose = shownMarkerPositions.some(m => haversineKm([m.lat, m.lon], [p.lat, p.lon]) < markerDedupeRadiusKm);
-    if(tooClose) return;
-    shownMarkerPositions.push({ lat:p.lat, lon:p.lon });
+    const near = shownMarkerPositions.find(m => haversineKm([m.lat, m.lon], [p.lat, p.lon]) < markerDedupeRadiusKm);
+    if(near){ routeMarkerByIndex[i] = near.marker; return; }
 
     const w = state.weatherAtRoute[i];
     let color = "#98a1ae", label = "Keine Winddaten";
@@ -753,7 +830,9 @@ function mountRouteMap(){
              </svg>`,
       iconSize: [16,16], iconAnchor: [8,8]
     });
-    L.marker([p.lat, p.lon], { icon }).addTo(map).bindPopup(label);
+    const marker = L.marker([p.lat, p.lon], { icon }).addTo(map).bindPopup(label);
+    shownMarkerPositions.push({ lat:p.lat, lon:p.lon, marker });
+    routeMarkerByIndex[i] = marker;
   });
 
   leafletMapInstance = map;
@@ -778,6 +857,16 @@ function sortedVisibleSegments(){
     case "tailwind": return list.slice().sort((a,b) => segmentTailwindDiff(a) - segmentTailwindDiff(b));
     default: return list;
   }
+}
+
+function selectSegment(seg){
+  state.selectedSegmentId = state.selectedSegmentId === seg.id ? null : seg.id;
+  render();
+  if(state.selectedSegmentId) ensureSegmentPrWatts(seg);
+  requestAnimationFrame(()=>{
+    const mapEl = document.getElementById("route-map");
+    if(mapEl) mapEl.scrollIntoView({behavior:"smooth", block:"center"});
+  });
 }
 
 function renderSegmentsCard(){
@@ -814,7 +903,8 @@ function renderSegmentsCard(){
     if(seg.start_latlng && seg.end_latlng){
       bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
     }
-    const row = el("div", {class:"segment"});
+    const isSelected = state.selectedSegmentId === seg.id;
+    const row = el("div", {class:"segment" + (isSelected ? " selected" : ""), onclick: ()=>selectSegment(seg)});
     let badgeColor = "var(--chalk-dim)", tagClass = "", tagText = "k.A.", arrowHtml = "";
     if(w && bearing !== null){
       const rel = windRelative(bearing, w.windDir);
