@@ -76,9 +76,19 @@
 
   .row{ display:flex; gap:10px; flex-wrap:wrap; }
 
-  .settings-row{ display:grid; grid-template-columns: repeat(3, minmax(190px,1fr)); gap:16px; margin-bottom:16px; }
+  .settings-row{ display:grid; grid-template-columns: repeat(3, minmax(190px,1fr)); gap:10px; margin-bottom:16px; }
   .settings-row > div{ min-width:0; }
   @media (max-width:620px){ .settings-row{ grid-template-columns: 1fr; } }
+
+  /* Route source tabs */
+  .source-tabs{ display:flex; gap:6px; margin-bottom:14px; }
+  .source-tab{
+    flex:1; text-align:center; padding:9px 8px; border-radius:8px; border:1px solid var(--line);
+    background:var(--asphalt); color:var(--chalk-dim); font-family:'IBM Plex Mono', monospace;
+    font-size:12px; font-weight:600; cursor:pointer;
+  }
+  .source-tab:hover{ border-color:var(--route); }
+  .source-tab.active{ background:var(--tail-bg); border-color:var(--tail); color:var(--tail); }
 
   /* Activity picker */
   .activity{
@@ -226,6 +236,8 @@ let state = {
   segmentPrWatts: {}, // id -> {watts, measured} for the PR effort, fetched lazily on click
   segmentSortBy: "default",
   selectedSegmentId: null, // when set, the map shows this segment instead of the full route
+  routeSourceTab: "activities", // "routes" | "activities" | "gpx"
+  stravaRoutes: [], // saved/planned Strava routes, fetched lazily when that tab opens
   loading: {},
   error: null,
   authCodeInput: ""
@@ -506,6 +518,16 @@ async function fetchActivities(token){
   return res.json();
 }
 
+// Saved/planned Strava routes — separate from past activities, lets you
+// check wind for a route you haven't ridden yet.
+async function fetchStravaRoutes(token){
+  const res = await fetch("https://www.strava.com/api/v3/athlete/routes?per_page=30", {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok) throw new Error("Routen konnten nicht geladen werden (" + res.status + ")");
+  return res.json();
+}
+
 async function fetchStarredSegments(token){
   const res = await fetch("https://www.strava.com/api/v3/segments/starred?per_page=30", {
     headers:{ Authorization: "Bearer " + token }
@@ -693,14 +715,47 @@ async function selectActivity(activity){
 }
 
 // Re-samples routePoints from the already-loaded fullRouteCoords — used
-// when Punktabstand changes for a GPX route, since (unlike a Strava
-// activity) there's nothing to re-fetch, just re-slice what's in memory.
+// whenever Punktabstand changes, and after loading a GPX file or a saved
+// Strava route, since the full coordinate list doesn't need to change,
+// just how it's sliced into wind-sample points.
 function recomputeRoutePoints(){
   if(!state.fullRouteCoords.length) return;
   const cumDist = buildCumulativeDistances(state.fullRouteCoords);
   state.routePoints = pickRoutePoints(state.fullRouteCoords, cumDist, state.routePointDistanceKm);
   render();
   loadRouteWeather();
+}
+
+function selectRouteSourceTab(tab){
+  state.routeSourceTab = tab;
+  render();
+  if(tab === "routes") ensureStravaRoutesLoaded();
+}
+
+async function ensureStravaRoutesLoaded(){
+  if(state.stravaRoutes.length || state.loading.routes) return;
+  state.loading.routes = true; render();
+  try{
+    state.stravaRoutes = await fetchStravaRoutes(state.accessToken);
+  }catch(e){
+    state.error = e.message;
+  }
+  state.loading.routes = false;
+  render();
+}
+
+async function selectStravaRoute(route){
+  state.selectedActivity = { id: "route-" + route.id, name: route.name, isRoute: true };
+  render();
+  const poly = route.map && (route.map.polyline || route.map.summary_polyline);
+  if(!poly){
+    state.routePoints = [];
+    state.fullRouteCoords = [];
+    state.weatherAtRoute = [];
+    return;
+  }
+  state.fullRouteCoords = decodePolyline(poly);
+  recomputeRoutePoints();
 }
 
 // ---------- GPX import ----------
@@ -831,11 +886,7 @@ function renderRouteCard(){
         style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:8px; padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
         onchange:(e)=>{
           state.routePointDistanceKm = parseInt(e.target.value, 10) || 10;
-          if(state.selectedActivity && state.selectedActivity.isGpx){
-            recomputeRoutePoints();
-          } else if(state.selectedActivity){
-            selectActivity(state.selectedActivity);
-          }
+          if(state.fullRouteCoords.length) recomputeRoutePoints();
         }
       }, [
         el("option", {value:"5"}, ["alle 5 km"]),
@@ -849,31 +900,64 @@ function renderRouteCard(){
   card.appendChild(settingsRow);
   card.appendChild(el("div", {class:"muted", style:"margin-bottom:12px; font-size:12px;"}, ["Wetterwerte werden jeweils für den erwarteten Ankunftszeitpunkt an diesem Punkt berechnet."]));
 
-  card.appendChild(renderGpxUploadRow());
+  if(!state.connected){
+    card.appendChild(renderGpxUploadRow());
+  } else {
+    const tabs = [
+      {id:"routes", label:"Routen"},
+      {id:"activities", label:"Fahrten"},
+      {id:"gpx", label:"GPX"}
+    ];
+    card.appendChild(el("div", {class:"source-tabs"}, tabs.map(t =>
+      el("div", {
+        class:"source-tab" + (state.routeSourceTab === t.id ? " active" : ""),
+        onclick: ()=>selectRouteSourceTab(t.id)
+      }, [t.label])
+    )));
 
-  if(state.connected){
-    if(state.loading.activities){
-      card.appendChild(el("div", {class:"loading"}, ["Lade letzte Aktivitäten…"]));
-      return card;
-    }
-
-    if(state.activities.length){
-      const list = el("div", {});
-      state.activities.filter(a => a.type === "Ride" || a.type === "VirtualRide" || a.type === "GravelRide" || a.type === "MountainBikeRide" || !a.type).slice(0,5).forEach(a=>{
-        const isSel = state.selectedActivity && state.selectedActivity.id === a.id;
-        const km = (a.distance/1000).toFixed(1);
-        const date = new Date(a.start_date_local).toLocaleDateString("de-DE", {day:"2-digit", month:"2-digit", year:"numeric"});
-        const item = el("div", {class:"activity" + (isSel?" selected":""), onclick: ()=>selectActivity(a)}, [
-          el("div", {}, [
-            el("div", {class:"name"}, [a.name]),
-            el("div", {class:"meta"}, [`${date} · ${km} km`])
-          ])
-        ]);
-        list.appendChild(item);
-      });
-      card.appendChild(list);
-    } else if(!state.fullRouteCoords.length){
-      card.appendChild(el("div", {class:"muted"}, ["Keine Aktivitäten gefunden."]));
+    if(state.routeSourceTab === "routes"){
+      if(state.loading.routes){
+        card.appendChild(el("div", {class:"loading"}, ["Lade Routen…"]));
+      } else if(state.stravaRoutes.length){
+        const list = el("div", {});
+        state.stravaRoutes.slice(0,10).forEach(route=>{
+          const isSel = state.selectedActivity && state.selectedActivity.id === "route-" + route.id;
+          const km = (route.distance/1000).toFixed(1);
+          const item = el("div", {class:"activity" + (isSel?" selected":""), onclick: ()=>selectStravaRoute(route)}, [
+            el("div", {}, [
+              el("div", {class:"name"}, [route.name]),
+              el("div", {class:"meta"}, [`${km} km · ${Math.round(route.elevation_gain || 0)} Hm`])
+            ])
+          ]);
+          list.appendChild(item);
+        });
+        card.appendChild(list);
+      } else {
+        card.appendChild(el("div", {class:"muted"}, ["Keine gespeicherten Routen gefunden."]));
+      }
+    } else if(state.routeSourceTab === "activities"){
+      if(state.loading.activities){
+        card.appendChild(el("div", {class:"loading"}, ["Lade letzte Aktivitäten…"]));
+      } else if(state.activities.length){
+        const list = el("div", {});
+        state.activities.filter(a => a.type === "Ride" || a.type === "VirtualRide" || a.type === "GravelRide" || a.type === "MountainBikeRide" || !a.type).slice(0,5).forEach(a=>{
+          const isSel = state.selectedActivity && state.selectedActivity.id === a.id;
+          const km = (a.distance/1000).toFixed(1);
+          const date = new Date(a.start_date_local).toLocaleDateString("de-DE", {day:"2-digit", month:"2-digit", year:"numeric"});
+          const item = el("div", {class:"activity" + (isSel?" selected":""), onclick: ()=>selectActivity(a)}, [
+            el("div", {}, [
+              el("div", {class:"name"}, [a.name]),
+              el("div", {class:"meta"}, [`${date} · ${km} km`])
+            ])
+          ]);
+          list.appendChild(item);
+        });
+        card.appendChild(list);
+      } else if(!state.fullRouteCoords.length){
+        card.appendChild(el("div", {class:"muted"}, ["Keine Aktivitäten gefunden."]));
+      }
+    } else if(state.routeSourceTab === "gpx"){
+      card.appendChild(renderGpxUploadRow());
     }
   }
 
