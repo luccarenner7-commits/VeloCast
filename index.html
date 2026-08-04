@@ -162,7 +162,7 @@
     color:var(--route); background:rgba(107,143,194,0.14);
     border-radius:6px; padding:4px 8px;
   }
-  .segment .tag{
+  .tag{
     flex-shrink:0;
     font-family:'IBM Plex Mono', monospace; font-size:11px; font-weight:600;
     padding:4px 9px; border-radius:6px; white-space:nowrap;
@@ -238,7 +238,9 @@ let state = {
   selectedSegmentId: null, // when set, the map shows this segment instead of the full route
   routeSourceTab: "activities", // "routes" | "activities" | "gpx"
   stravaRoutes: [], // saved/planned Strava routes, fetched lazily when that tab opens
-  bestStartCollapsed: loadBestStartCollapsed(),
+  routeInfoTab: "elevation", // "elevation" | "beststart"
+  elevationProfile: null, // {distances:[km,...], elevations:[m,...]} for the current route, or null if not (yet) loaded
+  routeWindCache: {}, // "activity-123" / "route-45" -> {type, windSpeed} quick wind rating for list chips
   loading: {},
   error: null,
   authCodeInput: ""
@@ -435,29 +437,78 @@ function findBestStartTimes(){
   return scored.slice(0, 3);
 }
 
-function renderBestStartCard(){
-  if(state.selectedSegmentId) return null;
-  if(!state.routePoints.length || !state.weatherAtRoute.length) return null;
-  const best = findBestStartTimes();
-  if(!best.length) return null;
+function windTypeLabel(type){
+  return type === "tail" ? "Rückenwind" : type === "head" ? "Gegenwind" : "Seitenwind";
+}
+function windTypeClass(type){
+  return type === "tail" ? "tail" : type === "head" ? "head" : "cross";
+}
 
-  const card = el("div", {class:"card"});
-  card.appendChild(el("div", {
-    style:"display:flex; align-items:center; justify-content:space-between; cursor:pointer;",
-    onclick:()=>{
-      state.bestStartCollapsed = !state.bestStartCollapsed;
-      saveBestStartCollapsed(state.bestStartCollapsed);
-      render();
+async function ensureElevationProfile(){
+  if(state.elevationProfile !== null || state.loading.elevation) return;
+  if(!state.selectedActivity || state.selectedActivity.isGpx) return;
+  state.loading.elevation = true; render();
+  try{
+    let raw;
+    if(state.selectedActivity.isRoute){
+      raw = await fetchRouteStreams(state.selectedActivity.id.replace(/^route-/, ""), state.accessToken);
+    } else {
+      raw = await fetchActivityStreams(state.selectedActivity.id, state.accessToken);
     }
-  }, [
-    el("h2", {style:"margin:0;"}, ["Beste Startzeit"]),
-    el("span", {class:"muted", style:"font-size:14px;"}, [state.bestStartCollapsed ? "▾" : "▴"])
-  ]));
+    const streams = normalizeStreams(raw);
+    state.elevationProfile = (streams.distance && streams.altitude)
+      ? { distances: streams.distance, elevations: streams.altitude }
+      : { distances: [], elevations: [] };
+  }catch(e){
+    state.elevationProfile = { distances: [], elevations: [] };
+  }
+  state.loading.elevation = false;
+  render();
+}
 
-  if(state.bestStartCollapsed) return card;
+function renderElevationChart(){
+  if(state.loading.elevation){
+    return el("div", {class:"loading"}, ["Lade Höhenprofil…"]);
+  }
+  const profile = state.elevationProfile;
+  if(!profile || profile.distances.length < 2){
+    return el("div", {class:"muted", style:"font-size:12px;"}, ["Für diese Strecke sind keine Höhendaten verfügbar."]);
+  }
+  const { distances, elevations } = profile;
+  const width = 600, height = 140, pad = 6;
+  const minE = Math.min(...elevations), maxE = Math.max(...elevations);
+  const rangeE = Math.max(1, maxE - minE);
+  const totalD = distances[distances.length - 1] || 1;
+  const x = d => pad + (d / totalD) * (width - pad*2);
+  const y = e => (height - pad) - ((e - minE) / rangeE) * (height - pad*2);
 
-  card.appendChild(el("div", {class:"muted", style:"margin:10px 0 14px; font-size:12px;"}, ["Basierend auf der 7-Tage-Vorhersage für diese Strecke, bei deiner eingestellten Geschwindigkeit."]));
+  let linePath = `M ${x(distances[0]).toFixed(1)} ${y(elevations[0]).toFixed(1)}`;
+  for(let i=1;i<distances.length;i++){
+    linePath += ` L ${x(distances[i]).toFixed(1)} ${y(elevations[i]).toFixed(1)}`;
+  }
+  const areaPath = `${linePath} L ${x(totalD).toFixed(1)} ${height-pad} L ${x(distances[0]).toFixed(1)} ${height-pad} Z`;
 
+  const svg = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="width:100%; height:140px; display:block;">
+    <path d="${areaPath}" fill="rgba(107,143,194,0.18)" stroke="none"/>
+    <path d="${linePath}" fill="none" stroke="#6b8fc2" stroke-width="2"/>
+  </svg>`;
+
+  return el("div", {}, [
+    el("div", {html: svg}),
+    el("div", {class:"muted", style:"display:flex; justify-content:space-between; margin-top:8px; font-size:11px; font-family:'IBM Plex Mono', monospace;"}, [
+      el("span", {}, [`${Math.round(minE)} – ${Math.round(maxE)} m`]),
+      el("span", {}, [`${totalD.toFixed(1)} km`])
+    ])
+  ]);
+}
+
+function renderBestStartContent(card){
+  const best = findBestStartTimes();
+  if(!best.length){
+    card.appendChild(el("div", {class:"muted", style:"font-size:12px;"}, ["Keine Vorhersagedaten verfügbar."]));
+    return;
+  }
+  card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px; font-size:12px;"}, ["Basierend auf der 7-Tage-Vorhersage für diese Strecke, bei deiner eingestellten Geschwindigkeit."]));
   best.forEach((b,i)=>{
     const dateLabel = b.startDate.toLocaleDateString("de-DE", {weekday:"short", day:"2-digit", month:"2-digit"});
     const row = el("div", {
@@ -475,6 +526,33 @@ function renderBestStartCard(){
     ]);
     card.appendChild(row);
   });
+}
+
+function renderRouteInfoTabsCard(){
+  if(state.selectedSegmentId) return null;
+  if(!state.routePoints.length || !state.weatherAtRoute.length) return null;
+
+  const card = el("div", {class:"card"});
+  const tabs = [
+    {id:"elevation", label:"Höhenprofil"},
+    {id:"beststart", label:"Beste Startzeit"}
+  ];
+  card.appendChild(el("div", {class:"source-tabs"}, tabs.map(t =>
+    el("div", {
+      class:"source-tab" + (state.routeInfoTab === t.id ? " active" : ""),
+      onclick: ()=>{
+        state.routeInfoTab = t.id;
+        render();
+      }
+    }, [t.label])
+  )));
+
+  if(state.routeInfoTab === "elevation"){
+    ensureElevationProfile();
+    card.appendChild(renderElevationChart());
+  } else {
+    renderBestStartContent(card);
+  }
 
   return card;
 }
@@ -486,13 +564,6 @@ function arrowSvg(routeBearing, windFromDeg, color){
   return `<svg viewBox="0 0 24 24" style="transform:rotate(${relAngle}deg)">
     <path d="M12 3 L18 15 L12 11.5 L6 15 Z" fill="${color}"/>
   </svg>`;
-}
-
-function loadBestStartCollapsed(){
-  try{ return localStorage.getItem("best_start_collapsed") === "1"; }catch(e){ return false; }
-}
-function saveBestStartCollapsed(collapsed){
-  try{ localStorage.setItem("best_start_collapsed", collapsed ? "1" : "0"); }catch(e){}
 }
 
 // ---------- storage ----------
@@ -537,6 +608,34 @@ async function fetchActivities(token){
   });
   if(!res.ok) throw new Error("Aktivitäten konnten nicht geladen werden (" + res.status + ")");
   return res.json();
+}
+
+async function fetchActivityStreams(id, token){
+  const res = await fetch(`https://www.strava.com/api/v3/activities/${id}/streams?keys=altitude,distance&key_by_type=true`, {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok) throw new Error("Höhendaten nicht verfügbar (" + res.status + ")");
+  return res.json();
+}
+
+async function fetchRouteStreams(id, token){
+  const res = await fetch(`https://www.strava.com/api/v3/routes/${id}/streams`, {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok) throw new Error("Höhendaten nicht verfügbar (" + res.status + ")");
+  return res.json();
+}
+
+// Strava's activity streams come back key_by_type (an object), route streams
+// come back as an array of {type, data} — normalize both to {distance, altitude}.
+function normalizeStreams(raw){
+  const byType = {};
+  if(Array.isArray(raw)){
+    raw.forEach(s => { if(s && s.type) byType[s.type] = s.data; });
+  } else if(raw){
+    Object.keys(raw).forEach(k => { byType[k] = raw[k] && raw[k].data; });
+  }
+  return byType;
 }
 
 // Saved/planned Strava routes — separate from past activities, lets you
@@ -618,8 +717,8 @@ function render(){
   }
 
   app.appendChild(renderRouteCard());
-  const bestStartCard = renderBestStartCard();
-  if(bestStartCard) app.appendChild(bestStartCard);
+  const infoTabsCard = renderRouteInfoTabsCard();
+  if(infoTabsCard) app.appendChild(infoTabsCard);
   if(state.connected){
     app.appendChild(renderSegmentsCard());
   }
@@ -720,6 +819,7 @@ async function loadActivitiesAndSegments(){
 
 async function selectActivity(activity){
   state.selectedActivity = activity;
+  state.elevationProfile = null;
   render();
   if(!activity.map || !activity.map.summary_polyline){
     state.routePoints = [];
@@ -767,6 +867,7 @@ async function ensureStravaRoutesLoaded(){
 
 async function selectStravaRoute(route){
   state.selectedActivity = { id: "route-" + route.id, name: route.name, isRoute: true };
+  state.elevationProfile = null;
   render();
   const poly = route.map && (route.map.polyline || route.map.summary_polyline);
   if(!poly){
@@ -782,31 +883,41 @@ async function selectStravaRoute(route){
 // ---------- GPX import ----------
 // Lets the wind/map pipeline run on any route, not just past Strava
 // activities — works without being connected to Strava at all.
-function parseGpxCoords(xmlText){
+function parseGpxTrack(xmlText){
   const doc = new DOMParser().parseFromString(xmlText, "application/xml");
   if(doc.querySelector("parsererror")) return null;
   const points = [...doc.querySelectorAll("trkpt, rtept")];
-  const coords = points
-    .map(p => [parseFloat(p.getAttribute("lat")), parseFloat(p.getAttribute("lon"))])
-    .filter(c => Number.isFinite(c[0]) && Number.isFinite(c[1]));
-  return coords.length >= 2 ? coords : null;
+  const coords = [], eles = [];
+  points.forEach(p=>{
+    const lat = parseFloat(p.getAttribute("lat"));
+    const lon = parseFloat(p.getAttribute("lon"));
+    if(!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    coords.push([lat, lon]);
+    const eleEl = p.querySelector("ele");
+    const ele = eleEl ? parseFloat(eleEl.textContent) : NaN;
+    eles.push(Number.isFinite(ele) ? ele : null);
+  });
+  return coords.length >= 2 ? { coords, eles } : null;
 }
 
 async function loadGpxFile(file){
   state.error = null;
-  let coords = null;
+  let track = null;
   try{
-    coords = parseGpxCoords(await file.text());
+    track = parseGpxTrack(await file.text());
   }catch(e){
-    coords = null;
+    track = null;
   }
-  if(!coords){
+  if(!track){
     state.error = "GPX-Datei konnte nicht gelesen werden.";
     render();
     return;
   }
   state.selectedActivity = { name: file.name.replace(/\.gpx$/i, ""), isGpx: true };
-  state.fullRouteCoords = coords;
+  state.fullRouteCoords = track.coords;
+  state.elevationProfile = track.eles.every(e => e != null)
+    ? { distances: buildCumulativeDistances(track.coords), elevations: track.eles }
+    : { distances: [], elevations: [] };
   recomputeRoutePoints();
 }
 
@@ -868,6 +979,34 @@ async function ensureSegmentPrWatts(seg){
     state.segmentPrWatts[seg.id] = null;
   }
   render();
+}
+
+// Quick single-point wind rating for a route/activity list chip: overall
+// start->end bearing vs. current wind at the start point. Cheap (one
+// Open-Meteo call, no Strava calls) compared to the full per-point wind-mix
+// used once a route is actually selected, so it's fine to do for every
+// visible list item.
+async function ensureListItemWindTag(key, polyline){
+  if(state.routeWindCache[key] !== undefined) return;
+  state.routeWindCache[key] = null;
+  if(!polyline) return;
+  const coords = decodePolyline(polyline);
+  if(coords.length < 2) return;
+  const bearing = bearingBetween(coords[0], coords[coords.length - 1]);
+  try{
+    const w = await fetchWeather(coords[0][0].toFixed(4), coords[0][1].toFixed(4));
+    const rel = windRelative(bearing, w.windDir);
+    state.routeWindCache[key] = { type: rel.type, windSpeed: w.windSpeed };
+    render();
+  }catch(e){
+    // leave cached as null (no rating shown)
+  }
+}
+
+function renderListItemWindTag(key){
+  const info = state.routeWindCache[key];
+  if(!info) return null;
+  return el("div", {class:"tag " + windTypeClass(info.type)}, [`${windTypeLabel(info.type)} · ${Math.round(info.windSpeed)} km/h`]);
 }
 
 function renderRouteCard(){
@@ -942,13 +1081,17 @@ function renderRouteCard(){
       } else if(state.stravaRoutes.length){
         const list = el("div", {});
         state.stravaRoutes.slice(0,10).forEach(route=>{
-          const isSel = state.selectedActivity && state.selectedActivity.id === "route-" + route.id;
+          const key = "route-" + route.id;
+          const isSel = state.selectedActivity && state.selectedActivity.id === key;
           const km = (route.distance/1000).toFixed(1);
+          const poly = route.map && (route.map.polyline || route.map.summary_polyline);
+          ensureListItemWindTag(key, poly);
           const item = el("div", {class:"activity" + (isSel?" selected":""), onclick: ()=>selectStravaRoute(route)}, [
             el("div", {}, [
               el("div", {class:"name"}, [route.name]),
               el("div", {class:"meta"}, [`${km} km · ${Math.round(route.elevation_gain || 0)} Hm`])
-            ])
+            ]),
+            renderListItemWindTag(key)
           ]);
           list.appendChild(item);
         });
@@ -962,14 +1105,17 @@ function renderRouteCard(){
       } else if(state.activities.length){
         const list = el("div", {});
         state.activities.filter(a => a.type === "Ride" || a.type === "VirtualRide" || a.type === "GravelRide" || a.type === "MountainBikeRide" || !a.type).slice(0,5).forEach(a=>{
+          const key = "activity-" + a.id;
           const isSel = state.selectedActivity && state.selectedActivity.id === a.id;
           const km = (a.distance/1000).toFixed(1);
           const date = new Date(a.start_date_local).toLocaleDateString("de-DE", {day:"2-digit", month:"2-digit", year:"numeric"});
+          ensureListItemWindTag(key, a.map && a.map.summary_polyline);
           const item = el("div", {class:"activity" + (isSel?" selected":""), onclick: ()=>selectActivity(a)}, [
             el("div", {}, [
               el("div", {class:"name"}, [a.name]),
               el("div", {class:"meta"}, [`${date} · ${km} km`])
-            ])
+            ]),
+            renderListItemWindTag(key)
           ]);
           list.appendChild(item);
         });
