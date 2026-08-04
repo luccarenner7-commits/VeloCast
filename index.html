@@ -135,6 +135,7 @@
   }
   .segment .name{ font-weight:600; font-size:14px; }
   .segment .meta{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); margin-top:3px; }
+  .segment .meta.stats{ color:var(--route); }
   .segment .tag{
     font-family:'IBM Plex Mono', monospace; font-size:11px; font-weight:600;
     padding:4px 9px; border-radius:6px; white-space:nowrap;
@@ -183,6 +184,11 @@ function fmtTime(date){
   if(!date) return "--:--";
   return pad2(date.getHours())+":"+pad2(date.getMinutes());
 }
+function fmtDuration(sec){
+  if(sec == null) return null;
+  const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = Math.floor(sec%60);
+  return h > 0 ? `${h}:${pad2(m)}:${pad2(s)}` : `${m}:${pad2(s)}`;
+}
 
 let state = {
   connected: false,
@@ -198,6 +204,7 @@ let state = {
   routePointDistanceKm: 10,
   segments: [],
   segmentWeather: {}, // id -> weather
+  segmentDetails: {}, // id -> detailed segment (PR, KOM/QOM, elevation, effort count)
   loading: {},
   error: null,
   authCodeInput: ""
@@ -278,7 +285,7 @@ function pickRoutePoints(coords, cumDist, stepKm){
     const nextIdx = idx + 1 < coords.length ? idx + 1 : idx;
     const prevIdx = idx > 0 ? idx - 1 : idx;
     const bearing = idx < coords.length - 1 ? bearingBetween(coords[idx], coords[nextIdx]) : bearingBetween(coords[prevIdx], coords[idx]);
-    points.push({ lat: p[0], lon: p[1], bearing, distanceKm: cumDist[idx] });
+    points.push({ lat: p[0], lon: p[1], bearing, distanceKm: cumDist[idx], idx });
     targetDistance += step;
   }
 
@@ -289,7 +296,8 @@ function pickRoutePoints(coords, cumDist, stepKm){
       lat: last[0],
       lon: last[1],
       bearing: bearingBetween(coords[lastIdx - 1] || coords[lastIdx], coords[lastIdx]),
-      distanceKm: cumDist[lastIdx]
+      distanceKm: cumDist[lastIdx],
+      idx: lastIdx
     });
   }
 
@@ -367,6 +375,17 @@ async function fetchStarredSegments(token){
     headers:{ Authorization: "Bearer " + token }
   });
   if(!res.ok) throw new Error("Segmente konnten nicht geladen werden (" + res.status + ")");
+  return res.json();
+}
+
+// Detailed segment: adds PR time, KOM/QOM and elevation/effort stats that
+// aren't in the starred-segments summary. Strava no longer exposes full
+// leaderboard placement via the public API, only pr_rank (top 10 or null).
+async function fetchSegmentDetail(id, token){
+  const res = await fetch(`https://www.strava.com/api/v3/segments/${id}`, {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok) throw new Error("Segmentdetails nicht verfügbar (" + res.status + ")");
   return res.json();
 }
 
@@ -475,7 +494,7 @@ async function loadActivitiesAndSegments(){
   state.loading.segments = true; render();
   try{
     state.segments = await fetchStarredSegments(state.accessToken);
-    await loadSegmentWeather();
+    await loadSegmentExtras();
   }catch(e){ state.error = e.message; }
   state.loading.segments = false;
   render();
@@ -518,15 +537,22 @@ async function loadRouteWeather(){
   render();
 }
 
-async function loadSegmentWeather(){
+async function loadSegmentExtras(){
   for(const seg of state.segments.slice(0, 12)){
-    if(!seg.start_latlng) continue;
-    try{
-      const w = await fetchWeather(seg.start_latlng[0].toFixed(4), seg.start_latlng[1].toFixed(4));
-      state.segmentWeather[seg.id] = w;
-    }catch(e){
-      state.segmentWeather[seg.id] = null;
+    if(seg.start_latlng){
+      try{
+        const w = await fetchWeather(seg.start_latlng[0].toFixed(4), seg.start_latlng[1].toFixed(4));
+        state.segmentWeather[seg.id] = w;
+      }catch(e){
+        state.segmentWeather[seg.id] = null;
+      }
     }
+    try{
+      state.segmentDetails[seg.id] = await fetchSegmentDetail(seg.id, state.accessToken);
+    }catch(e){
+      state.segmentDetails[seg.id] = null;
+    }
+    render();
   }
 }
 
@@ -634,13 +660,30 @@ function mountRouteMap(){
     maxZoom: 18
   }).addTo(map);
 
-  const latlngs = state.fullRouteCoords.map(c=>[c[0], c[1]]);
-  const line = L.polyline(latlngs, { color:"#6b8fc2", weight:4, opacity:0.9 }).addTo(map);
-  map.fitBounds(line.getBounds(), { padding:[26,26] });
+  const coords = state.fullRouteCoords;
+  const latlngs = coords.map(c=>[c[0], c[1]]);
 
-  const arrowPoints = state.routePoints.filter((_, index) => index % 2 === 0);
-  arrowPoints.forEach((p, i)=>{
-    const w = state.weatherAtRoute[i * 2] || state.weatherAtRoute[state.routePoints.indexOf(p)];
+  // faint base line — carries the route where no wind data covers it
+  const baseLine = L.polyline(latlngs, { color:"#333a47", weight:2.5, opacity:0.55, lineCap:"round", lineJoin:"round" }).addTo(map);
+  map.fitBounds(baseLine.getBounds(), { padding:[26,26] });
+
+  // continuous colored line: one thin segment per stretch between two
+  // consecutive wind-sampled points, colored by that stretch's wind relation
+  const pts = state.routePoints;
+  for(let i=0;i<pts.length-1;i++){
+    const w = state.weatherAtRoute[i];
+    if(!w) continue;
+    const rel = windRelative(pts[i].bearing, w.windDir);
+    const color = rel.type === "tail" ? "#4fb08c" : rel.type === "head" ? "#e2574c" : "#e2b23e";
+    const from = pts[i].idx, to = pts[i+1].idx;
+    if(to <= from) continue;
+    const segCoords = coords.slice(from, to + 1).map(c=>[c[0], c[1]]);
+    L.polyline(segCoords, { color, weight:2.5, opacity:0.95, lineCap:"round", lineJoin:"round" }).addTo(map);
+  }
+
+  // slim directional glyphs at each sampled point
+  pts.forEach((p,i)=>{
+    const w = state.weatherAtRoute[i];
     let color = "#98a1ae", label = "Keine Winddaten";
     let rotateDeg = 0;
     if(w){
@@ -652,9 +695,11 @@ function mountRouteMap(){
     }
     const icon = L.divIcon({
       className: "",
-      html: `<div style="width:16px;height:16px;border-radius:50%;background:${color};opacity:0.9;box-shadow:0 0 0 1px rgba(20,23,29,0.7);display:flex;align-items:center;justify-content:center;transform:rotate(${rotateDeg}deg)">
-               <div style="width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-bottom:8px solid #14171d;"></div>
-             </div>`,
+      html: `<svg width="16" height="16" viewBox="0 0 16 16" style="transform:rotate(${rotateDeg}deg); filter: drop-shadow(0 0 1.5px rgba(20,23,29,0.9));">
+               <circle cx="8" cy="8" r="2" fill="${color}" opacity="0.9"/>
+               <line x1="8" y1="13" x2="8" y2="4" stroke="${color}" stroke-width="1.4" stroke-linecap="round"/>
+               <path d="M4.5 7 L8 3 L11.5 7" fill="none" stroke="${color}" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+             </svg>`,
       iconSize: [16,16], iconAnchor: [8,8]
     });
     L.marker([p.lat, p.lon], { icon }).addTo(map).bindPopup(label);
@@ -692,13 +737,30 @@ function renderSegmentsCard(){
       arrowHtml = arrowSvg(bearing, w.windDir, "#0d1712");
     }
     const badge = el("div", {class:"arrow-badge", style:`background:${badgeColor}`, html: arrowHtml});
-    const left = el("div", {class:"left"}, [
-      badge,
-      el("div", {}, [
-        el("div", {class:"name"}, [seg.name]),
-        el("div", {class:"meta"}, [`${(seg.distance/1000).toFixed(1)} km · ${seg.average_grade}% Ø-Steigung`])
-      ])
-    ]);
+
+    const infoChildren = [
+      el("div", {class:"name"}, [seg.name]),
+      el("div", {class:"meta"}, [`${(seg.distance/1000).toFixed(1)} km · ${seg.average_grade}% Ø-Steigung`])
+    ];
+
+    const detail = state.segmentDetails[seg.id];
+    const stats = [];
+    if(detail){
+      const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
+      if(pr != null) stats.push(`PR ${fmtDuration(pr)}`);
+      const prRank = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_rank;
+      if(prRank) stats.push(`Platz ${prRank}`);
+      if(detail.xoms && detail.xoms.kom) stats.push(`KOM ${detail.xoms.kom}`);
+      if(detail.xoms && detail.xoms.qom) stats.push(`QOM ${detail.xoms.qom}`);
+      if(detail.total_elevation_gain != null) stats.push(`${Math.round(detail.total_elevation_gain)} Hm`);
+      const effortCount = detail.athlete_segment_stats && detail.athlete_segment_stats.effort_count;
+      if(effortCount) stats.push(`${effortCount}× gefahren`);
+    }
+    if(stats.length){
+      infoChildren.push(el("div", {class:"meta stats"}, [stats.join(" · ")]));
+    }
+
+    const left = el("div", {class:"left"}, [badge, el("div", {}, infoChildren)]);
     row.appendChild(left);
     row.appendChild(el("div", {class:"tag " + tagClass}, [tagText]));
     card.appendChild(row);
