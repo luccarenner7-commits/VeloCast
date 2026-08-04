@@ -420,7 +420,7 @@ function computeStrongWindWarning(){
 // Windy.com-style field but without animation. Open-Meteo accepts
 // comma-separated lists of coordinates in a single request, so the whole
 // grid costs exactly one extra API call, regardless of grid size.
-const WIND_FIELD_GRID_SIZE = 8; // 8x8 = 64 points per fetch
+const WIND_FIELD_GRID_SIZE = 10; // 10x10 = 100 points per fetch (Open-Meteo's per-request location cap)
 
 function computeWindFieldGridPoints(bounds){
   const south = bounds.getSouth(), north = bounds.getNorth();
@@ -1435,11 +1435,11 @@ function mountFullRouteView(container){
         const rotateDeg = (p.windDir + 180) % 360;
         const icon = L.divIcon({
           className: "",
-          html: `<svg width="13" height="13" viewBox="0 0 16 16" style="transform:rotate(${rotateDeg}deg); opacity:0.6;">
+          html: `<svg width="11" height="11" viewBox="0 0 16 16" style="transform:rotate(${rotateDeg}deg); opacity:0.6;">
                    <line x1="8" y1="13" x2="8" y2="4" stroke="${color}" stroke-width="1.6" stroke-linecap="round"/>
                    <path d="M4.8 6.6 L8 3 L11.2 6.6" fill="none" stroke="${color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
                  </svg>`,
-          iconSize: [13,13], iconAnchor: [6.5,6.5]
+          iconSize: [11,11], iconAnchor: [5.5,5.5]
         });
         L.marker([p.lat, p.lon], { icon }).addTo(map).bindTooltip(`${Math.round(p.windSpeed)} km/h`);
       });
@@ -1486,9 +1486,11 @@ function mountFullRouteView(container){
     }
   }
 
-  // slim directional glyphs at each sampled point — skip points that sit too
+  // small dots at each sampled point (no more rotated arrow glyphs — the
+  // colored line segments + the Windfeld overlay already convey wind
+  // direction/type, this is now just an anchor for the weather-strip chips
+  // below the map to pan to / open a popup on) — skip points that sit too
   // close to an already-placed marker (e.g. where the route crosses itself)
-  // so arrows don't stack on top of each other
   const markerDedupeRadiusKm = 0.5;
   const shownMarkerPositions = [];
   routeMarkerByIndex = {};
@@ -1498,24 +1500,14 @@ function mountFullRouteView(container){
 
     const w = state.weatherAtRoute[i];
     let color = "#98a1ae", label = "Keine Winddaten";
-    let rotateDeg = 0;
     if(w){
       const rel = windRelative(p.bearing, w.windDir);
       color = rel.type === "tail" ? "#4fb08c" : rel.type === "head" ? "#e2574c" : "#e2b23e";
       const typeLabel = rel.type === "tail" ? "Rückenwind" : rel.type === "head" ? "Gegenwind" : "Seitenwind";
       label = `<b>Ankunft ${fmtTime(p.arrivalTime)} Uhr</b> · ${p.distanceKm.toFixed(0)} km<br><b>${typeLabel}</b><br>${Math.round(w.windSpeed)} km/h · ${Math.round(w.temp)}° · ${w.precip}% Regen`;
-      rotateDeg = (w.windDir + 180) % 360;
     }
-    const icon = L.divIcon({
-      className: "",
-      html: `<svg width="16" height="16" viewBox="0 0 16 16" style="transform:rotate(${rotateDeg}deg); filter: drop-shadow(0 0 1.5px rgba(20,23,29,0.9));">
-               <circle cx="8" cy="8" r="2" fill="${color}" opacity="0.9"/>
-               <line x1="8" y1="13" x2="8" y2="4" stroke="${color}" stroke-width="1.4" stroke-linecap="round"/>
-               <path d="M4.5 7 L8 3 L11.5 7" fill="none" stroke="${color}" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
-             </svg>`,
-      iconSize: [16,16], iconAnchor: [8,8]
-    });
-    const marker = L.marker([p.lat, p.lon], { icon }).addTo(map).bindPopup(label);
+    const marker = L.circleMarker([p.lat, p.lon], { radius:5, weight:2, color:"#14171d", fillColor:color, fillOpacity:0.95 })
+      .addTo(map).bindPopup(label);
     shownMarkerPositions.push({ lat:p.lat, lon:p.lon, marker });
     routeMarkerByIndex[i] = marker;
   });
