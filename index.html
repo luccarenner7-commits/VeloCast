@@ -1,0 +1,749 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Rückenwind</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root{
+    --asphalt: #14171d;
+    --asphalt-2: #1c212a;
+    --asphalt-3: #262c37;
+    --line: #333a47;
+    --chalk: #f2efe9;
+    --chalk-dim: #98a1ae;
+    --tail: #4fb08c;
+    --tail-bg: rgba(79,176,140,0.12);
+    --head: #e2574c;
+    --head-bg: rgba(226,87,76,0.12);
+    --cross: #e2b23e;
+    --cross-bg: rgba(226,178,62,0.12);
+    --route: #6b8fc2;
+  }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; padding:0; background:transparent; color:var(--chalk); }
+  body{
+    font-family:'Inter', sans-serif;
+    background: var(--asphalt);
+    min-height:100vh;
+  }
+  .app{ max-width: 720px; margin: 0 auto; padding: 28px 20px 60px; }
+
+  .brand{ display:flex; align-items:baseline; justify-content:space-between; margin-bottom: 22px; }
+  .brand h1{
+    font-family:'Space Grotesk', sans-serif;
+    font-weight:700; font-size: 26px; letter-spacing: -0.02em; margin:0;
+    color: var(--chalk);
+  }
+  .brand h1 span{ color: var(--tail); }
+  .brand .status{ font-family:'IBM Plex Mono', monospace; font-size:11px; color: var(--chalk-dim); text-transform:uppercase; letter-spacing:0.08em; }
+  .dot{ display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; background:var(--head); }
+  .dot.on{ background: var(--tail); }
+
+  .card{
+    background: var(--asphalt-2);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 22px;
+    margin-bottom: 16px;
+  }
+  .card h2{
+    font-family:'Space Grotesk', sans-serif; font-size:15px; font-weight:600;
+    margin: 0 0 14px; color: var(--chalk);
+    text-transform: uppercase; letter-spacing:0.06em;
+  }
+  .muted{ color: var(--chalk-dim); font-size: 14px; line-height:1.55; }
+
+  .btn{
+    font-family:'Space Grotesk', sans-serif; font-weight:600; font-size:14px;
+    background: var(--tail); color: #0d1712; border:none; border-radius:10px;
+    padding: 12px 18px; cursor:pointer; letter-spacing:0.01em;
+  }
+  .btn:hover{ filter: brightness(1.08); }
+  .btn.secondary{ background: var(--asphalt-3); color: var(--chalk); border:1px solid var(--line); }
+  .btn:disabled{ opacity:0.5; cursor:default; }
+
+  input[type=text], input[type=datetime-local], input[type=number]{
+    width:100%; background: var(--asphalt); border:1px solid var(--line); border-radius:8px;
+    padding:11px 12px; color: var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;
+    margin-bottom:10px;
+  }
+  label{ font-size:12px; color:var(--chalk-dim); display:block; margin-bottom:6px; font-family:'IBM Plex Mono', monospace; }
+
+  .row{ display:flex; gap:10px; flex-wrap:wrap; }
+
+  /* Activity picker */
+  .activity{
+    display:flex; justify-content:space-between; align-items:center;
+    padding: 12px 14px; border:1px solid var(--line); border-radius:10px; margin-bottom:8px;
+    cursor:pointer; background: var(--asphalt);
+  }
+  .activity:hover{ border-color: var(--route); }
+  .activity.selected{ border-color: var(--tail); background: var(--tail-bg); }
+  .activity .name{ font-weight:600; font-size:14px; }
+  .activity .meta{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); margin-top:2px; }
+
+  /* Wind rail — signature element */
+  .rail{ position:relative; padding: 10px 0 26px; }
+  .rail-line{
+    position:relative; height: 3px; background: linear-gradient(90deg, var(--route), var(--asphalt-3));
+    border-radius:2px; margin: 34px 6px 0;
+  }
+  .rail-point{
+    position:absolute; top:-34px; transform: translateX(-50%);
+    display:flex; flex-direction:column; align-items:center; width: 64px;
+  }
+  .rail-point .arrow{
+    width:22px; height:22px; margin-bottom:4px;
+    transition: transform 0.2s ease;
+  }
+  .rail-point .kmh{ font-family:'IBM Plex Mono', monospace; font-size:11px; font-weight:600; }
+  .rail-point .lbl{ font-family:'IBM Plex Mono', monospace; font-size:9px; color:var(--chalk-dim); margin-top:2px; text-align:center; white-space:nowrap; }
+  .rail-point .dotmark{ width:9px; height:9px; border-radius:50%; background: var(--route); margin-top:6px; border:2px solid var(--asphalt-2); }
+
+  .legend{ display:flex; gap:18px; margin-top:10px; font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); }
+  .legend span{ display:flex; align-items:center; gap:6px; }
+  .swatch{ width:10px; height:10px; border-radius:2px; }
+
+  /* Route map */
+  #route-map{
+    width:100%; height:340px; border-radius:12px; overflow:hidden;
+    border:1px solid var(--line); background: var(--asphalt);
+  }
+  .wind-marker{ display:flex; align-items:center; justify-content:center;
+    width:26px; height:26px; border-radius:50%;
+    box-shadow: 0 0 0 2px rgba(20,23,29,0.85), 0 2px 6px rgba(0,0,0,0.4);
+  }
+  .leaflet-popup-content-wrapper{ background: var(--asphalt-2); color: var(--chalk); border-radius:8px; }
+  .leaflet-popup-content{ font-family:'IBM Plex Mono', monospace; font-size:12px; margin:8px 10px; }
+  .leaflet-popup-tip{ background: var(--asphalt-2); }
+  .leaflet-container{ font-family:'Inter', sans-serif; }
+
+  /* Segments */
+  .segment{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:14px; border-radius:10px; margin-bottom:8px; border:1px solid var(--line);
+  }
+  .segment .left{ display:flex; align-items:center; gap:12px; }
+  .segment .arrow-badge{
+    width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+    flex-shrink:0;
+  }
+  .segment .name{ font-weight:600; font-size:14px; }
+  .segment .meta{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); margin-top:3px; }
+  .segment .tag{
+    font-family:'IBM Plex Mono', monospace; font-size:11px; font-weight:600;
+    padding:4px 9px; border-radius:6px; white-space:nowrap;
+  }
+  .tag.tail{ background:var(--tail-bg); color:var(--tail); }
+  .tag.head{ background:var(--head-bg); color:var(--head); }
+  .tag.cross{ background:var(--cross-bg); color:var(--cross); }
+
+  .weather-strip{ display:flex; gap:14px; overflow-x:auto; padding-bottom:4px; }
+  .weather-chip{
+    flex: 0 0 auto; min-width:76px; text-align:center; background:var(--asphalt);
+    border:1px solid var(--line); border-radius:10px; padding:10px 8px;
+  }
+  .weather-chip .t{ font-family:'IBM Plex Mono', monospace; font-size:13px; font-weight:600; }
+  .weather-chip .hr{ font-size:10px; color:var(--chalk-dim); font-family:'IBM Plex Mono', monospace; }
+  .weather-chip .w{ font-size:11px; color:var(--route); margin-top:4px; font-family:'IBM Plex Mono', monospace; }
+
+  .error{ color: var(--head); font-size:13px; font-family:'IBM Plex Mono', monospace; margin-top:8px; }
+  .loading{ color: var(--chalk-dim); font-size:13px; font-family:'IBM Plex Mono', monospace; }
+
+  .footnote{ font-size:11px; color: var(--chalk-dim); margin-top:26px; line-height:1.6; }
+  a{ color: var(--route); }
+
+  @media (prefers-reduced-motion: reduce){ * { transition:none !important; } }
+</style>
+</head>
+<body>
+<div class="app" id="app"></div>
+
+<script>
+const STRAVA_CLIENT_ID = "268232";
+// Token exchange happens server-side (Cloudflare Worker) so the Strava
+// client secret never ships to the browser. Replace with your deployed
+// worker URL, e.g. "https://rueckenwind-oauth.<subdomain>.workers.dev".
+const TOKEN_ENDPOINT = "https://rueckenwind-oauth.lucca-renner7.workers.dev";
+
+function pad2(n){ return String(n).padStart(2,'0'); }
+function toLocalInputValue(date){
+  return `${date.getFullYear()}-${pad2(date.getMonth()+1)}-${pad2(date.getDate())}T${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+}
+function defaultStartTime(){
+  const d = new Date(); d.setMinutes(d.getMinutes()+60);
+  return toLocalInputValue(d);
+}
+function fmtTime(date){
+  if(!date) return "--:--";
+  return pad2(date.getHours())+":"+pad2(date.getMinutes());
+}
+
+let state = {
+  connected: false,
+  athlete: null,
+  accessToken: null,
+  activities: [],
+  selectedActivity: null,
+  routePoints: [], // [{lat,lon,bearing,distanceKm,arrivalTime}] - sampled points used for wind markers
+  fullRouteCoords: [], // [[lat,lon], ...] full-resolution line for the map
+  weatherAtRoute: [], // aligned with routePoints
+  startTime: defaultStartTime(),
+  avgSpeedKmh: 25,
+  routePointDistanceKm: 10,
+  segments: [],
+  segmentWeather: {}, // id -> weather
+  loading: {},
+  error: null,
+  authCodeInput: ""
+};
+
+function el(tag, attrs, children){
+  const e = document.createElement(tag);
+  if(attrs) for(const k in attrs){
+    if(k === "class") e.className = attrs[k];
+    else if(k === "html") e.innerHTML = attrs[k];
+    else if(k.startsWith("on")) e.addEventListener(k.slice(2), attrs[k]);
+    else e.setAttribute(k, attrs[k]);
+  }
+  (children||[]).forEach(c=>{ if(c) e.appendChild(typeof c === "string" ? document.createTextNode(c) : c); });
+  return e;
+}
+
+// ---------- polyline decode (Strava / Google encoded polyline) ----------
+function decodePolyline(str){
+  let index = 0, lat = 0, lng = 0, coords = [];
+  while (index < str.length) {
+    let b, shift = 0, result = 0;
+    do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    const dlat = (result & 1) ? ~(result >> 1) : (result >> 1);
+    lat += dlat;
+    shift = 0; result = 0;
+    do { b = str.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    const dlng = (result & 1) ? ~(result >> 1) : (result >> 1);
+    lng += dlng;
+    coords.push([lat / 1e5, lng / 1e5]);
+  }
+  return coords;
+}
+
+function bearingBetween(p1, p2){
+  const φ1 = p1[0]*Math.PI/180, φ2 = p2[0]*Math.PI/180;
+  const Δλ = (p2[1]-p1[1])*Math.PI/180;
+  const y = Math.sin(Δλ)*Math.cos(φ2);
+  const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+  let θ = Math.atan2(y,x)*180/Math.PI;
+  return (θ+360)%360;
+}
+
+function haversineKm(p1, p2){
+  const R = 6371;
+  const φ1 = p1[0]*Math.PI/180, φ2 = p2[0]*Math.PI/180;
+  const Δφ = (p2[0]-p1[0])*Math.PI/180;
+  const Δλ = (p2[1]-p1[1])*Math.PI/180;
+  const a = Math.sin(Δφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(Δλ/2)**2;
+  return R * 2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function buildCumulativeDistances(coords){
+  const cum = [0];
+  for(let i=1;i<coords.length;i++){
+    cum.push(cum[i-1] + haversineKm(coords[i-1], coords[i]));
+  }
+  return cum;
+}
+
+function estimateArrival(startDate, distanceKm, avgSpeedKmh){
+  const hours = distanceKm / Math.max(1, avgSpeedKmh);
+  return new Date(startDate.getTime() + hours*3600*1000);
+}
+
+function pickRoutePoints(coords, cumDist, stepKm){
+  if(coords.length < 2) return [];
+
+  const step = Math.max(1, stepKm);
+  const totalDistance = cumDist[cumDist.length - 1] || 0;
+  const points = [];
+  let targetDistance = 0;
+  let idx = 0;
+
+  while (targetDistance <= totalDistance + 1e-9) {
+    while (idx < cumDist.length - 1 && cumDist[idx] < targetDistance) idx++;
+    const p = coords[idx];
+    const nextIdx = idx + 1 < coords.length ? idx + 1 : idx;
+    const prevIdx = idx > 0 ? idx - 1 : idx;
+    const bearing = idx < coords.length - 1 ? bearingBetween(coords[idx], coords[nextIdx]) : bearingBetween(coords[prevIdx], coords[idx]);
+    points.push({ lat: p[0], lon: p[1], bearing, distanceKm: cumDist[idx] });
+    targetDistance += step;
+  }
+
+  if (points.length && points[points.length - 1].distanceKm < totalDistance - 1e-6) {
+    const last = coords[coords.length - 1];
+    const lastIdx = coords.length - 1;
+    points.push({
+      lat: last[0],
+      lon: last[1],
+      bearing: bearingBetween(coords[lastIdx - 1] || coords[lastIdx], coords[lastIdx]),
+      distanceKm: cumDist[lastIdx]
+    });
+  }
+
+  return points;
+}
+
+// ---------- wind relative classification ----------
+function windRelative(routeBearing, windFromDeg){
+  // windFromDeg = direction wind is coming FROM (meteorological convention)
+  // wind blowing TOWARD = windFromDeg + 180
+  const windToward = (windFromDeg + 180) % 360;
+  let diff = Math.abs(routeBearing - windToward);
+  if(diff > 180) diff = 360 - diff;
+  // diff small = tailwind (wind pushes same direction as travel)
+  if(diff <= 55) return { type:"tail", diff };
+  if(diff >= 125) return { type:"head", diff };
+  return { type:"cross", diff };
+}
+
+function arrowSvg(routeBearing, windFromDeg, color){
+  // arrow points in the direction wind blows TOWARD, rotated relative to route bearing (route = "up")
+  const windToward = (windFromDeg + 180) % 360;
+  const relAngle = windToward - routeBearing;
+  return `<svg viewBox="0 0 24 24" style="transform:rotate(${relAngle}deg)">
+    <path d="M12 3 L18 15 L12 11.5 L6 15 Z" fill="${color}"/>
+  </svg>`;
+}
+
+// ---------- storage ----------
+// This runs as a standalone site now (GitHub Pages), not inside a Claude
+// artifact preview, so we use plain browser localStorage. Each visitor's
+// token stays only in their own browser — nothing is shared between people.
+async function loadStoredToken(){
+  try{
+    return localStorage.getItem("strava_refresh_token");
+  }catch(e){ return null; }
+}
+async function saveToken(refreshToken){
+  try{ localStorage.setItem("strava_refresh_token", refreshToken); }catch(e){}
+}
+
+// ---------- Strava API ----------
+// The actual client_id/client_secret exchange happens in the Cloudflare
+// Worker (see worker/), which is the only place that knows the secret.
+async function exchangeCode(code){
+  const res = await fetch(TOKEN_ENDPOINT, {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ code })
+  });
+  if(!res.ok) throw new Error("Autorisierung fehlgeschlagen (" + res.status + ")");
+  return res.json();
+}
+
+async function refreshAccessToken(refreshToken){
+  const res = await fetch(TOKEN_ENDPOINT, {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ refresh_token: refreshToken })
+  });
+  if(!res.ok) throw new Error("Token-Erneuerung fehlgeschlagen (" + res.status + ")");
+  return res.json();
+}
+
+async function fetchActivities(token){
+  const res = await fetch("https://www.strava.com/api/v3/athlete/activities?per_page=8", {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok) throw new Error("Aktivitäten konnten nicht geladen werden (" + res.status + ")");
+  return res.json();
+}
+
+async function fetchStarredSegments(token){
+  const res = await fetch("https://www.strava.com/api/v3/segments/starred?per_page=30", {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok) throw new Error("Segmente konnten nicht geladen werden (" + res.status + ")");
+  return res.json();
+}
+
+// ---------- Open-Meteo ----------
+async function fetchWeather(lat, lon, targetDate){
+  targetDate = targetDate || new Date();
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,precipitation_probability&forecast_days=7&timezone=auto`;
+  const res = await fetch(url);
+  if(!res.ok) throw new Error("Wetterdaten nicht verfügbar");
+  const data = await res.json();
+  // find the forecast hour closest to the target (arrival) time
+  const hours = data.hourly.time;
+  let idx = 0, best = Infinity;
+  hours.forEach((t,i)=>{
+    const diff = Math.abs(new Date(t) - targetDate);
+    if(diff < best){ best = diff; idx = i; }
+  });
+  return {
+    temp: data.hourly.temperature_2m[idx],
+    windSpeed: data.hourly.wind_speed_10m[idx],
+    windDir: data.hourly.wind_direction_10m[idx],
+    precip: data.hourly.precipitation_probability[idx],
+    forecastTime: new Date(hours[idx]),
+    hourly: data.hourly,
+    idx
+  };
+}
+
+// ---------- render ----------
+function render(){
+  const app = document.getElementById("app");
+  app.innerHTML = "";
+  app.appendChild(renderBrand());
+
+  if(!state.connected){
+    app.appendChild(renderConnectCard());
+    app.appendChild(renderFootnote());
+    return;
+  }
+
+  app.appendChild(renderRouteCard());
+  app.appendChild(renderSegmentsCard());
+  app.appendChild(renderFootnote());
+  requestAnimationFrame(mountRouteMap);
+}
+
+function renderBrand(){
+  return el("div", {class:"brand"}, [
+    el("h1", {}, ["Rücken", el("span",{},["wind"])]),
+    el("div", {class:"status"}, [
+      el("span", {class:"dot" + (state.connected?" on":"")}, []),
+      state.connected ? "verbunden" : "nicht verbunden"
+    ])
+  ]);
+}
+
+function buildAuthUrl(){
+  // Redirect back to this exact page — works because this page now lives at a
+  // real, fixed URL (GitHub Pages) instead of localhost.
+  const redirectUri = window.location.origin + window.location.pathname;
+  return `https://www.strava.com/oauth/authorize?client_id=${STRAVA_CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(redirectUri)}&approval_prompt=auto&scope=read,activity:read_all,profile:read_all`;
+}
+
+function renderConnectCard(){
+  const card = el("div", {class:"card"});
+  card.appendChild(el("h2", {}, ["Mit Strava verbinden"]));
+  card.appendChild(el("div", {class:"muted"}, [
+    "Autorisiere den Zugriff auf deine Aktivitäten und markierten Segmente. Du wirst zu Strava weitergeleitet und kommst danach automatisch hierher zurück."
+  ]));
+
+  const loginBtn = el("button", {class:"btn", style:"margin-bottom:4px;", onclick: ()=>{ window.location.href = buildAuthUrl(); }}, [state.loading.connect ? "Verbinde…" : "Mit Strava einloggen →"]);
+  if(state.loading.connect) loginBtn.disabled = true;
+  card.appendChild(loginBtn);
+
+  if(state.error) card.appendChild(el("div", {class:"error", style:"margin-top:10px;"}, [state.error]));
+  return card;
+}
+
+async function connectWithCode(code){
+  state.error = null;
+  state.loading.connect = true; render();
+  try{
+    const tokenData = await exchangeCode(code);
+    state.accessToken = tokenData.access_token;
+    state.athlete = tokenData.athlete;
+    await saveToken(tokenData.refresh_token);
+    state.connected = true;
+    await loadActivitiesAndSegments();
+  }catch(e){
+    state.error = e.message || "Verbindung fehlgeschlagen.";
+  }
+  state.loading.connect = false;
+  render();
+}
+
+async function loadActivitiesAndSegments(){
+  state.loading.activities = true; render();
+  try{
+    state.activities = await fetchActivities(state.accessToken);
+    if(state.activities.length){
+      await selectActivity(state.activities[0]);
+    }
+  }catch(e){ state.error = e.message; }
+  state.loading.activities = false;
+
+  state.loading.segments = true; render();
+  try{
+    state.segments = await fetchStarredSegments(state.accessToken);
+    await loadSegmentWeather();
+  }catch(e){ state.error = e.message; }
+  state.loading.segments = false;
+  render();
+}
+
+async function selectActivity(activity){
+  state.selectedActivity = activity;
+  render();
+  if(!activity.map || !activity.map.summary_polyline){
+    state.routePoints = [];
+    state.fullRouteCoords = [];
+    state.weatherAtRoute = [];
+    return;
+  }
+  const coords = decodePolyline(activity.map.summary_polyline);
+  state.fullRouteCoords = coords;
+  const cumDist = buildCumulativeDistances(coords);
+  state.routePoints = pickRoutePoints(coords, cumDist, state.routePointDistanceKm);
+  render();
+  await loadRouteWeather();
+}
+
+async function loadRouteWeather(){
+  if(!state.routePoints.length) return;
+  state.loading.weather = true; render();
+  const startDate = new Date(state.startTime);
+  const weatherResults = [];
+  for(const p of state.routePoints){
+    const arrival = estimateArrival(startDate, p.distanceKm, state.avgSpeedKmh);
+    p.arrivalTime = arrival;
+    try{
+      const w = await fetchWeather(p.lat.toFixed(4), p.lon.toFixed(4), arrival);
+      weatherResults.push(w);
+    }catch(e){
+      weatherResults.push(null);
+    }
+  }
+  state.weatherAtRoute = weatherResults;
+  state.loading.weather = false;
+  render();
+}
+
+async function loadSegmentWeather(){
+  for(const seg of state.segments.slice(0, 12)){
+    if(!seg.start_latlng) continue;
+    try{
+      const w = await fetchWeather(seg.start_latlng[0].toFixed(4), seg.start_latlng[1].toFixed(4));
+      state.segmentWeather[seg.id] = w;
+    }catch(e){
+      state.segmentWeather[seg.id] = null;
+    }
+  }
+}
+
+function renderRouteCard(){
+  const card = el("div", {class:"card"});
+  card.appendChild(el("h2", {}, ["Strecke"]));
+
+  const settingsRow = el("div", {class:"row", style:"margin-top:0; gap:16px; margin-bottom:16px;"}, [
+    el("div", {style:"flex:1; min-width:150px;"}, [
+      el("label", {}, ["Startzeit"]),
+      el("input", {type:"datetime-local", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
+    ]),
+    el("div", {style:"flex:1; min-width:140px;"}, [
+      el("label", {}, ["Ø Geschwindigkeit (km/h)"]),
+      el("input", {type:"number", min:"5", max:"60", step:"1", value: state.avgSpeedKmh, onchange:(e)=>{ state.avgSpeedKmh = parseFloat(e.target.value) || 25; loadRouteWeather(); }})
+    ]),
+    el("div", {style:"flex:1; min-width:160px;"}, [
+      el("label", {}, ["Punktabstand"]),
+      el("select", {
+        style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:8px; padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
+        onchange:(e)=>{
+          state.routePointDistanceKm = parseInt(e.target.value, 10) || 10;
+          if(state.selectedActivity){
+            selectActivity(state.selectedActivity);
+          }
+        }
+      }, [
+        el("option", {value:"5"}, ["alle 5 km"]),
+        el("option", {value:"10", selected: state.routePointDistanceKm === 10 ? "selected" : null}, ["alle 10 km"]),
+        el("option", {value:"15"}, ["alle 15 km"]),
+        el("option", {value:"20"}, ["alle 20 km"]),
+        el("option", {value:"25"}, ["alle 25 km"])
+      ])
+    ])
+  ]);
+  card.appendChild(settingsRow);
+  card.appendChild(el("div", {class:"muted", style:"margin-bottom:12px; font-size:12px;"}, ["Wetterwerte werden jeweils für den erwarteten Ankunftszeitpunkt an diesem Punkt berechnet."]));
+
+  if(state.loading.activities){
+    card.appendChild(el("div", {class:"loading"}, ["Lade letzte Aktivitäten…"]));
+    return card;
+  }
+
+  if(!state.activities.length){
+    card.appendChild(el("div", {class:"muted"}, ["Keine Aktivitäten gefunden."]));
+    return card;
+  }
+
+  const list = el("div", {});
+  state.activities.filter(a => a.type === "Ride" || a.type === "VirtualRide" || a.type === "GravelRide" || a.type === "MountainBikeRide" || !a.type).slice(0,5).forEach(a=>{
+    const isSel = state.selectedActivity && state.selectedActivity.id === a.id;
+    const km = (a.distance/1000).toFixed(1);
+    const date = new Date(a.start_date_local).toLocaleDateString("de-DE", {day:"2-digit", month:"2-digit", year:"numeric"});
+    const item = el("div", {class:"activity" + (isSel?" selected":""), onclick: ()=>selectActivity(a)}, [
+      el("div", {}, [
+        el("div", {class:"name"}, [a.name]),
+        el("div", {class:"meta"}, [`${date} · ${km} km`])
+      ])
+    ]);
+    list.appendChild(item);
+  });
+  card.appendChild(list);
+
+  if(state.loading.weather){
+    card.appendChild(el("div", {class:"loading", style:"margin-top:14px;"}, ["Berechne Wind entlang der Strecke…"]));
+  } else if(state.routePoints.length && state.weatherAtRoute.length){
+    card.appendChild(el("div", {id:"route-map", style:"margin-top:14px;"}));
+    const legend = el("div", {class:"legend", style:"margin-top:10px;"}, [
+      el("span",{},[el("span",{class:"swatch", style:"background:var(--tail)"}), "Rückenwind"]),
+      el("span",{},[el("span",{class:"swatch", style:"background:var(--cross)"}), "Seitenwind"]),
+      el("span",{},[el("span",{class:"swatch", style:"background:var(--head)"}), "Gegenwind"]),
+    ]);
+    card.appendChild(legend);
+
+    const first = state.weatherAtRoute.find(w=>w);
+    if(first){
+      const strip = el("div", {class:"weather-strip", style:"margin-top:16px;"});
+      state.routePoints.forEach((p,i)=>{
+        const w = state.weatherAtRoute[i];
+        if(!w) return;
+        strip.appendChild(el("div", {class:"weather-chip"}, [
+          el("div", {class:"t"}, [Math.round(w.temp) + "°"]),
+          el("div", {class:"hr"}, ["Ankunft " + fmtTime(p.arrivalTime) + " · " + p.distanceKm.toFixed(0) + " km"]),
+          el("div", {class:"w"}, [w.precip + "% Regen"])
+        ]));
+      });
+      card.appendChild(strip);
+    }
+  } else if(state.selectedActivity && !state.selectedActivity.map){
+    card.appendChild(el("div", {class:"muted", style:"margin-top:12px;"}, ["Für diese Aktivität liegt keine Streckenkarte vor."]));
+  }
+
+  return card;
+}
+
+let leafletMapInstance = null;
+function mountRouteMap(){
+  const container = document.getElementById("route-map");
+  if(leafletMapInstance){ leafletMapInstance.remove(); leafletMapInstance = null; }
+  if(!container || !state.fullRouteCoords.length) return;
+
+  const map = L.map(container, { scrollWheelZoom:true });
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap Mitwirkende',
+    maxZoom: 18
+  }).addTo(map);
+
+  const latlngs = state.fullRouteCoords.map(c=>[c[0], c[1]]);
+  const line = L.polyline(latlngs, { color:"#6b8fc2", weight:4, opacity:0.9 }).addTo(map);
+  map.fitBounds(line.getBounds(), { padding:[26,26] });
+
+  const arrowPoints = state.routePoints.filter((_, index) => index % 2 === 0);
+  arrowPoints.forEach((p, i)=>{
+    const w = state.weatherAtRoute[i * 2] || state.weatherAtRoute[state.routePoints.indexOf(p)];
+    let color = "#98a1ae", label = "Keine Winddaten";
+    let rotateDeg = 0;
+    if(w){
+      const rel = windRelative(p.bearing, w.windDir);
+      color = rel.type === "tail" ? "#4fb08c" : rel.type === "head" ? "#e2574c" : "#e2b23e";
+      const typeLabel = rel.type === "tail" ? "Rückenwind" : rel.type === "head" ? "Gegenwind" : "Seitenwind";
+      label = `<b>Ankunft ${fmtTime(p.arrivalTime)} Uhr</b> · ${p.distanceKm.toFixed(0)} km<br><b>${typeLabel}</b><br>${Math.round(w.windSpeed)} km/h · ${Math.round(w.temp)}° · ${w.precip}% Regen`;
+      rotateDeg = (w.windDir + 180) % 360;
+    }
+    const icon = L.divIcon({
+      className: "",
+      html: `<div style="width:16px;height:16px;border-radius:50%;background:${color};opacity:0.9;box-shadow:0 0 0 1px rgba(20,23,29,0.7);display:flex;align-items:center;justify-content:center;transform:rotate(${rotateDeg}deg)">
+               <div style="width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-bottom:8px solid #14171d;"></div>
+             </div>`,
+      iconSize: [16,16], iconAnchor: [8,8]
+    });
+    L.marker([p.lat, p.lon], { icon }).addTo(map).bindPopup(label);
+  });
+
+  leafletMapInstance = map;
+}
+
+function renderSegmentsCard(){
+  const card = el("div", {class:"card"});
+  card.appendChild(el("h2", {}, ["Markierte Segmente"]));
+
+  if(state.loading.segments){
+    card.appendChild(el("div", {class:"loading"}, ["Lade Segmente & Wind…"]));
+    return card;
+  }
+  if(!state.segments.length){
+    card.appendChild(el("div", {class:"muted"}, ["Keine markierten (gesternten) Segmente gefunden."]));
+    return card;
+  }
+
+  state.segments.slice(0,12).forEach(seg=>{
+    const w = state.segmentWeather[seg.id];
+    let bearing = null;
+    if(seg.start_latlng && seg.end_latlng){
+      bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
+    }
+    const row = el("div", {class:"segment"});
+    let badgeColor = "var(--chalk-dim)", tagClass = "", tagText = "k.A.", arrowHtml = "";
+    if(w && bearing !== null){
+      const rel = windRelative(bearing, w.windDir);
+      badgeColor = rel.type === "tail" ? "var(--tail)" : rel.type==="head" ? "var(--head)" : "var(--cross)";
+      tagClass = rel.type === "tail" ? "tail" : rel.type==="head" ? "head" : "cross";
+      tagText = (rel.type === "tail" ? "Rückenwind" : rel.type==="head" ? "Gegenwind" : "Seitenwind") + " · " + Math.round(w.windSpeed) + " km/h";
+      arrowHtml = arrowSvg(bearing, w.windDir, "#0d1712");
+    }
+    const badge = el("div", {class:"arrow-badge", style:`background:${badgeColor}`, html: arrowHtml});
+    const left = el("div", {class:"left"}, [
+      badge,
+      el("div", {}, [
+        el("div", {class:"name"}, [seg.name]),
+        el("div", {class:"meta"}, [`${(seg.distance/1000).toFixed(1)} km · ${seg.average_grade}% Ø-Steigung`])
+      ])
+    ]);
+    row.appendChild(left);
+    row.appendChild(el("div", {class:"tag " + tagClass}, [tagText]));
+    card.appendChild(row);
+  });
+
+  return card;
+}
+
+function renderFootnote(){
+  return el("div", {class:"footnote"}, [
+    "Wetterdaten: Open-Meteo. Wind wird an ausgewählten Punkten entlang der Strecke bzw. am Startpunkt jedes Segments abgefragt und mit der Streckenrichtung verglichen. ",
+    state.connected ? el("a", {href:"#", onclick:(e)=>{e.preventDefault(); loadActivitiesAndSegments();}}, ["Neu laden"]) : ""
+  ]);
+}
+
+// ---------- init ----------
+async function init(){
+  render();
+
+  // Strava just redirected back to this page with ?code=...
+  const params = new URLSearchParams(window.location.search);
+  const codeParam = params.get("code");
+  if(codeParam){
+    window.history.replaceState({}, document.title, window.location.pathname);
+    await connectWithCode(codeParam);
+    return;
+  }
+
+  const stored = await loadStoredToken();
+  if(stored){
+    state.loading.connect = true; render();
+    try{
+      const tokenData = await refreshAccessToken(stored);
+      state.accessToken = tokenData.access_token;
+      await saveToken(tokenData.refresh_token);
+      state.connected = true;
+      await loadActivitiesAndSegments();
+    }catch(e){
+      // stored token invalid, stay on connect screen
+    }
+    state.loading.connect = false;
+    render();
+  }
+}
+init();
+</script>
+</body>
+</html>

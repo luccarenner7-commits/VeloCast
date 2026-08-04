@@ -1,0 +1,13 @@
+name = "rueckenwind-oauth"
+main = "src/index.js"
+compatibility_date = "2026-08-04"
+
+[vars]
+# Public by design (used in the OAuth authorize redirect on the frontend too).
+STRAVA_CLIENT_ID = "268232"
+# Restrict this to your GitHub Pages origin once deployed, e.g.
+# "https://<username>.github.io"
+ALLOWED_ORIGIN = "*"
+
+# STRAVA_CLIENT_SECRET is NOT set here (this file is safe to commit).
+# Set it with: wrangler secret put STRAVA_CLIENT_SECRET
