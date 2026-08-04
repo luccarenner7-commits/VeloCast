@@ -1063,9 +1063,12 @@ function renderSegmentRow(seg, opts){
   }
   const badge = el("div", {class:"arrow-badge", style:`background:${badgeColor}`, html: arrowHtml});
 
-  const info = el("div", {}, [
+  const info = el("div", {style:"flex:1; min-width:0;"}, [
     el("div", {class:"name"}, [seg.name]),
-    el("div", {class:"meta"}, [`${(seg.distance/1000).toFixed(1)} km · ${seg.average_grade}% Ø-Steigung`])
+    el("div", {class:"meta", style:"display:flex; justify-content:space-between; gap:10px;"}, [
+      el("span", {}, [`${(seg.distance/1000).toFixed(1)} km`]),
+      el("span", {}, [`${seg.average_grade}% Ø-Steigung`])
+    ])
   ]);
   const left = el("div", {class:"left"}, [badge, info]);
   const top = el("div", {class:"top"}, [left, el("div", {class:"tag " + tagClass}, [tagText])]);
