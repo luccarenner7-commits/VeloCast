@@ -766,6 +766,24 @@ function mountSegmentView(container, segId){
   L.circleMarker(latlngs[latlngs.length - 1], { radius:6, weight:2, color:"#14171d", fillColor:"#e2574c", fillOpacity:1 })
     .addTo(map).bindTooltip("Ziel");
 
+  // wind direction arrow at the segment's midpoint — points where the wind
+  // blows toward, absolute compass direction (north-up), same convention
+  // as the full-route markers
+  if(w){
+    const midPoint = latlngs[Math.floor(latlngs.length / 2)];
+    const rotateDeg = (w.windDir + 180) % 360;
+    const icon = L.divIcon({
+      className: "",
+      html: `<svg width="26" height="26" viewBox="0 0 16 16" style="transform:rotate(${rotateDeg}deg); filter: drop-shadow(0 0 2px rgba(20,23,29,0.9));">
+               <circle cx="8" cy="8" r="2.4" fill="${color}" opacity="0.95"/>
+               <line x1="8" y1="13.5" x2="8" y2="3" stroke="${color}" stroke-width="1.8" stroke-linecap="round"/>
+               <path d="M3.8 6.6 L8 2 L12.2 6.6" fill="none" stroke="${color}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+             </svg>`,
+      iconSize: [26,26], iconAnchor: [13,13]
+    });
+    L.marker(midPoint, { icon }).addTo(map).bindPopup(label);
+  }
+
   leafletMapInstance = map;
 }
 
