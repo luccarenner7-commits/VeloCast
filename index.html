@@ -245,6 +245,8 @@ let state = {
   routeInfoTab: "elevation", // "elevation" | "beststart"
   elevationProfile: null, // {distances:[km,...], elevations:[m,...]} for the current route, or null if not (yet) loaded
   routeWindCache: {}, // "activity-123" / "route-45" -> {type, windSpeed} quick wind rating for list chips
+  windFieldEnabled: false, // "Windfeld" overlay toggle - grid of small wind arrows over the route's map area
+  windFieldPoints: null, // [{lat,lon,windSpeed,windDir}, ...] for the overlay, or null if not (yet) loaded for the current route
   loading: {},
   error: null,
   authCodeInput: ""
@@ -410,6 +412,70 @@ function computeStrongWindWarning(){
   });
   if(maxWind < STRONG_WIND_KMH && maxGust < STRONG_GUST_KMH) return null;
   return { maxWind, maxGust };
+}
+
+// ---------- wind field overlay (grid of small wind arrows over the map) ----------
+// Optional, off by default (toggle in renderRouteCard): a static NxN grid of
+// wind arrows spanning the route's map bounds, similar in spirit to a
+// Windy.com-style field but without animation. Open-Meteo accepts
+// comma-separated lists of coordinates in a single request, so the whole
+// grid costs exactly one extra API call, regardless of grid size.
+const WIND_FIELD_GRID_SIZE = 5; // 5x5 = 25 points per fetch
+
+function computeWindFieldGridPoints(bounds){
+  const south = bounds.getSouth(), north = bounds.getNorth();
+  const west = bounds.getWest(), east = bounds.getEast();
+  const points = [];
+  for(let i=0;i<WIND_FIELD_GRID_SIZE;i++){
+    for(let j=0;j<WIND_FIELD_GRID_SIZE;j++){
+      points.push({
+        lat: south + (north - south) * (i + 0.5) / WIND_FIELD_GRID_SIZE,
+        lon: west + (east - west) * (j + 0.5) / WIND_FIELD_GRID_SIZE
+      });
+    }
+  }
+  return points;
+}
+
+function windSpeedColor(kmh){
+  if(kmh < 15) return "#4fb08c";
+  if(kmh < 30) return "#e2b23e";
+  if(kmh < 45) return "#e2895c";
+  return "#e2574c";
+}
+
+async function ensureWindField(bounds){
+  if(state.windFieldPoints || state.loading.windField) return;
+  state.loading.windField = true; render();
+  const grid = computeWindFieldGridPoints(bounds);
+  try{
+    const lats = grid.map(p => p.lat.toFixed(3)).join(",");
+    const lons = grid.map(p => p.lon.toFixed(3)).join(",");
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=wind_speed_10m,wind_direction_10m&forecast_days=7&timezone=auto`;
+    const res = await fetch(url);
+    if(!res.ok) throw new Error("Winddaten nicht verfügbar");
+    const data = await res.json();
+    const results = Array.isArray(data) ? data : [data];
+    const targetDate = new Date(state.startTime);
+    state.windFieldPoints = results.map((r, i)=>{
+      const hours = r.hourly.time;
+      let idx = 0, best = Infinity;
+      hours.forEach((t,hi)=>{
+        const diff = Math.abs(new Date(t) - targetDate);
+        if(diff < best){ best = diff; idx = hi; }
+      });
+      return {
+        lat: grid[i].lat,
+        lon: grid[i].lon,
+        windSpeed: r.hourly.wind_speed_10m[idx],
+        windDir: r.hourly.wind_direction_10m[idx]
+      };
+    });
+  }catch(e){
+    state.windFieldPoints = [];
+  }
+  state.loading.windField = false;
+  render();
 }
 
 // Finds the best departure times for the current route within the next 48h,
@@ -858,6 +924,7 @@ async function loadActivitiesAndSegments(){
 async function selectActivity(activity){
   state.selectedActivity = activity;
   state.elevationProfile = null;
+  state.windFieldPoints = null;
   render();
   if(!activity.map || !activity.map.summary_polyline){
     state.routePoints = [];
@@ -906,6 +973,7 @@ async function ensureStravaRoutesLoaded(){
 async function selectStravaRoute(route){
   state.selectedActivity = { id: "route-" + route.id, name: route.name, isRoute: true };
   state.elevationProfile = null;
+  state.windFieldPoints = null;
   render();
   const poly = route.map && (route.map.polyline || route.map.summary_polyline);
   if(!poly){
@@ -952,6 +1020,7 @@ async function loadGpxFile(file){
     return;
   }
   state.selectedActivity = { name: file.name.replace(/\.gpx$/i, ""), isGpx: true };
+  state.windFieldPoints = null;
   state.fullRouteCoords = track.coords;
   state.elevationProfile = track.eles.every(e => e != null)
     ? { distances: buildCumulativeDistances(track.coords), elevations: track.eles }
@@ -1213,6 +1282,19 @@ function renderRouteCard(){
         ])
       ]));
     }
+    card.appendChild(el("div", {style:"display:flex; align-items:center; gap:8px; margin-top:14px; cursor:pointer;", onclick:()=>{ state.windFieldEnabled = !state.windFieldEnabled; render(); }}, [
+      el("div", {style:`width:34px; height:20px; border-radius:10px; flex-shrink:0; background:${state.windFieldEnabled ? "var(--tail)" : "var(--asphalt-3)"}; position:relative; transition:background 0.15s;`}, [
+        el("div", {style:`width:16px; height:16px; border-radius:50%; background:#fff; position:absolute; top:2px; left:${state.windFieldEnabled ? "16px" : "2px"}; transition:left 0.15s;`})
+      ]),
+      el("span", {class:"muted", style:"font-size:12px;"}, [
+        "Windfeld der Umgebung anzeigen" + (state.windFieldEnabled && state.loading.windField ? " (lädt…)" : "")
+      ])
+    ]));
+    if(state.windFieldEnabled){
+      card.appendChild(el("div", {class:"muted", style:"font-size:10.5px; margin-top:4px;"}, [
+        "Windstärke: grün <15 · gelb <30 · orange <45 · rot ≥45 km/h"
+      ]));
+    }
     card.appendChild(el("div", {id:"route-map", style:"margin-top:14px;"}));
     const legend = el("div", {class:"legend", style:"margin-top:10px;"}, [
       el("span",{},[el("span",{class:"swatch", style:"background:var(--tail)"}), "Rückenwind"]),
@@ -1338,6 +1420,29 @@ function mountFullRouteView(container){
   // faint base line — carries the route where no wind data covers it
   const baseLine = L.polyline(latlngs, { color:"#333a47", weight:3, opacity:0.55, lineCap:"round", lineJoin:"round" }).addTo(map);
   map.fitBounds(baseLine.getBounds(), { padding:[26,26] });
+
+  // optional "Windfeld" overlay — a static grid of small wind arrows under
+  // the route line, toggled in renderRouteCard(). Added before the route
+  // line/markers below so it stays visually underneath them.
+  if(state.windFieldEnabled){
+    if(!state.windFieldPoints && !state.loading.windField){
+      ensureWindField(map.getBounds());
+    } else if(state.windFieldPoints){
+      state.windFieldPoints.forEach(p=>{
+        const color = windSpeedColor(p.windSpeed);
+        const rotateDeg = (p.windDir + 180) % 360;
+        const icon = L.divIcon({
+          className: "",
+          html: `<svg width="18" height="18" viewBox="0 0 16 16" style="transform:rotate(${rotateDeg}deg); opacity:0.6;">
+                   <line x1="8" y1="13" x2="8" y2="4" stroke="${color}" stroke-width="1.6" stroke-linecap="round"/>
+                   <path d="M4.8 6.6 L8 3 L11.2 6.6" fill="none" stroke="${color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                 </svg>`,
+          iconSize: [18,18], iconAnchor: [9,9]
+        });
+        L.marker([p.lat, p.lon], { icon }).addTo(map).bindTooltip(`${Math.round(p.windSpeed)} km/h`);
+      });
+    }
+  }
 
   // continuous colored line: one segment per stretch between two
   // consecutive wind-sampled points, colored by that stretch's wind relation
