@@ -247,6 +247,8 @@ let state = {
   routeWindCache: {}, // "activity-123" / "route-45" -> {type, windSpeed} quick wind rating for list chips
   windFieldEnabled: false, // "Windfeld" overlay toggle - grid of small wind arrows over the route's map area
   windFieldPoints: null, // [{lat,lon,windSpeed,windDir}, ...] for the overlay, or null if not (yet) loaded for the current route
+  radarEnabled: false, // rain radar overlay toggle
+  radarFrame: null, // {host, path} of the latest RainViewer radar frame, fetched lazily once per session (not per-route)
   loading: {},
   error: null,
   authCodeInput: ""
@@ -444,6 +446,68 @@ function windSpeedColor(kmh){
   return "#e2574c";
 }
 
+// ---------- range rings (Whoop-style min/max dashboard icons) ----------
+function computeMetricRange(list, field){
+  const vals = list.filter(w => w && w[field] != null).map(w => w[field]);
+  if(!vals.length) return null;
+  return { min: Math.min(...vals), max: Math.max(...vals) };
+}
+
+function polarToCartesian(cx, cy, r, angleDeg){
+  const rad = (angleDeg - 90) * Math.PI / 180;
+  return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
+}
+
+// SVG arc between two angles (0deg = top, clockwise), used to draw the
+// min->max band on the ring rather than a from-zero progress fill.
+function describeArc(cx, cy, r, startAngle, endAngle){
+  const start = polarToCartesian(cx, cy, r, endAngle);
+  const end = polarToCartesian(cx, cy, r, startAngle);
+  const largeArcFlag = endAngle - startAngle <= 180 ? "0" : "1";
+  return `M ${start.x.toFixed(2)} ${start.y.toFixed(2)} A ${r} ${r} 0 ${largeArcFlag} 0 ${end.x.toFixed(2)} ${end.y.toFixed(2)}`;
+}
+
+// Renders one ring: a full pale track circle plus a colored arc spanning
+// from the route's min value to its max value for that metric, mapped onto
+// a fixed domain (so e.g. a 30-45 km/h wind range visibly sits further
+// around the ring than a 5-10 km/h range on a calm day).
+function renderRangeRing({ label, unit, range, domainMin, domainMax, color }){
+  const size = 76, r = 30, cx = size/2, cy = size/2;
+  const valueToAngle = v => Math.min(1, Math.max(0, (v - domainMin) / (domainMax - domainMin))) * 360;
+  const startAngle = valueToAngle(range.min);
+  let endAngle = valueToAngle(range.max);
+  if(endAngle - startAngle < 8) endAngle = Math.min(360, startAngle + 8);
+  const arcPath = describeArc(cx, cy, r, startAngle, endAngle);
+  const svg = `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#262c37" stroke-width="7"/>
+    <path d="${arcPath}" fill="none" stroke="${color}" stroke-width="7" stroke-linecap="round"/>
+  </svg>`;
+  const valueText = Math.round(range.min) === Math.round(range.max)
+    ? `${Math.round(range.min)}${unit}`
+    : `${Math.round(range.min)}–${Math.round(range.max)}${unit}`;
+  return el("div", {style:"display:flex; flex-direction:column; align-items:center; gap:6px; flex:1; min-width:0;"}, [
+    el("div", {html: svg}),
+    el("div", {style:"font-family:'IBM Plex Mono', monospace; font-size:12px; font-weight:600; white-space:nowrap;"}, [valueText]),
+    el("div", {class:"muted", style:"font-size:9.5px; text-transform:uppercase; letter-spacing:0.06em;"}, [label])
+  ]);
+}
+
+function renderRangeRingsRow(){
+  const tempRange = computeMetricRange(state.weatherAtRoute, "temp");
+  const precipRange = computeMetricRange(state.weatherAtRoute, "precip");
+  const windRange = computeMetricRange(state.weatherAtRoute, "windSpeed");
+  const uvRange = computeMetricRange(state.weatherAtRoute, "uvIndex");
+
+  const rings = [];
+  if(tempRange) rings.push(renderRangeRing({ label:"Temperatur", unit:"°", range:tempRange, domainMin:-10, domainMax:35, color:"#e2895c" }));
+  if(precipRange) rings.push(renderRangeRing({ label:"Regen", unit:"%", range:precipRange, domainMin:0, domainMax:100, color:"#6b8fc2" }));
+  if(windRange) rings.push(renderRangeRing({ label:"Wind km/h", unit:"", range:windRange, domainMin:0, domainMax:60, color:"#e2b23e" }));
+  if(uvRange) rings.push(renderRangeRing({ label:"UV-Index", unit:"", range:uvRange, domainMin:0, domainMax:11, color:"#c26bc2" }));
+  if(!rings.length) return null;
+
+  return el("div", {style:"display:flex; justify-content:space-around; gap:6px; margin-top:14px;"}, rings);
+}
+
 async function ensureWindField(bounds){
   if(state.windFieldPoints || state.loading.windField) return;
   state.loading.windField = true; render();
@@ -475,6 +539,29 @@ async function ensureWindField(bounds){
     state.windFieldPoints = [];
   }
   state.loading.windField = false;
+  render();
+}
+
+// ---------- rain radar overlay ----------
+// RainViewer's public API (no key required, same "free/generous" tier as
+// Open-Meteo) lists recent radar frames as {host, path} tile templates. We
+// only need the latest ("now") frame — this is a live-conditions overlay,
+// not a forecast, and isn't tied to a specific route, so it's fetched once
+// per session rather than reset per-route like the Windfeld/elevation data.
+async function ensureRadarFrame(){
+  if(state.radarFrame || state.loading.radar) return;
+  state.loading.radar = true; render();
+  try{
+    const res = await fetch("https://api.rainviewer.com/public/weather-maps.json");
+    if(!res.ok) throw new Error("Regenradar nicht verfügbar");
+    const data = await res.json();
+    const frames = data.radar && data.radar.past;
+    const latest = frames && frames[frames.length - 1];
+    state.radarFrame = latest ? { host: data.host, path: latest.path } : { host:null, path:null };
+  }catch(e){
+    state.radarFrame = { host:null, path:null };
+  }
+  state.loading.radar = false;
   render();
 }
 
@@ -588,6 +675,100 @@ function renderElevationChart(){
   ]);
 }
 
+// ---------- climb detection ----------
+// Simple grade-threshold segmentation over the elevation profile: walk the
+// (lightly smoothed, to filter out GPS/barometric noise) distance/elevation
+// samples and grow a "climb" candidate wherever the grade stays at/above
+// MIN_GRADE, tolerating short dips/flats (MAX_GAP_KM) so one climb with a
+// brief false-flat doesn't get split into two. Candidates below the minimum
+// length/elevation-gain are discarded as noise, not real climbs.
+const CLIMB_MIN_GRADE = 3;      // % - below this it's not "climbing"
+const CLIMB_MAX_GAP_KM = 0.3;   // tolerate short interruptions within a climb
+const CLIMB_MIN_LENGTH_KM = 0.5;
+const CLIMB_MIN_GAIN_M = 30;
+
+function smoothElevations(elevations, radius){
+  return elevations.map((_, i) => {
+    let sum = 0, count = 0;
+    for(let j = Math.max(0, i - radius); j <= Math.min(elevations.length - 1, i + radius); j++){
+      sum += elevations[j]; count++;
+    }
+    return sum / count;
+  });
+}
+
+function gradeBetween(distances, elevations, i, j){
+  const dKm = distances[j] - distances[i];
+  if(dKm <= 0) return 0;
+  return (elevations[j] - elevations[i]) / (dKm * 1000) * 100;
+}
+
+function detectClimbs(profile){
+  const { distances, elevations } = profile;
+  if(distances.length < 3) return [];
+  const smoothed = smoothElevations(elevations, 2);
+
+  const candidates = [];
+  let start = null, lastAboveIdx = null;
+  for(let i=1;i<distances.length;i++){
+    const grade = gradeBetween(distances, smoothed, i-1, i);
+    if(grade >= CLIMB_MIN_GRADE){
+      if(start === null) start = i-1;
+      lastAboveIdx = i;
+    } else if(start !== null && distances[i] - distances[lastAboveIdx] > CLIMB_MAX_GAP_KM){
+      candidates.push([start, lastAboveIdx]);
+      start = null; lastAboveIdx = null;
+    }
+  }
+  if(start !== null) candidates.push([start, lastAboveIdx]);
+
+  return candidates.map(([fromIdx, toIdx])=>{
+    const lengthKm = distances[toIdx] - distances[fromIdx];
+    let gainM = 0, maxGrade = 0;
+    for(let k=fromIdx+1;k<=toIdx;k++){
+      const diff = elevations[k] - elevations[k-1];
+      if(diff > 0) gainM += diff;
+      const g = gradeBetween(distances, smoothed, k-1, k);
+      if(g > maxGrade) maxGrade = g;
+    }
+    const avgGrade = lengthKm > 0 ? (gainM / (lengthKm * 1000)) * 100 : 0;
+    return { fromKm: distances[fromIdx], toKm: distances[toIdx], lengthKm, gainM: Math.round(gainM), avgGrade, maxGrade };
+  }).filter(c => c.lengthKm >= CLIMB_MIN_LENGTH_KM && c.gainM >= CLIMB_MIN_GAIN_M)
+    .sort((a,b) => b.gainM - a.gainM);
+}
+
+function climbDifficultyLabel(avgGrade){
+  if(avgGrade < 4) return "leicht";
+  if(avgGrade < 7) return "mittel";
+  if(avgGrade < 10) return "steil";
+  return "sehr steil";
+}
+
+function renderClimbsContent(card){
+  if(state.loading.elevation){
+    card.appendChild(el("div", {class:"loading"}, ["Lade Höhenprofil…"]));
+    return;
+  }
+  const profile = state.elevationProfile;
+  if(!profile || profile.distances.length < 3){
+    card.appendChild(el("div", {class:"muted", style:"font-size:12px;"}, ["Für diese Strecke sind keine Höhendaten verfügbar."]));
+    return;
+  }
+  const climbs = detectClimbs(profile);
+  if(!climbs.length){
+    card.appendChild(el("div", {class:"muted", style:"font-size:12px;"}, ["Keine nennenswerten Anstiege auf dieser Strecke gefunden."]));
+    return;
+  }
+  climbs.forEach((c,i)=>{
+    card.appendChild(el("div", {class:"activity"}, [
+      el("div", {}, [
+        el("div", {class:"name"}, [`Anstieg ${i+1} · km ${c.fromKm.toFixed(1)}–${c.toKm.toFixed(1)}`]),
+        el("div", {class:"meta"}, [`${c.lengthKm.toFixed(1)} km · ${c.gainM} Hm · Ø ${c.avgGrade.toFixed(1)}% (${climbDifficultyLabel(c.avgGrade)}) · max ${c.maxGrade.toFixed(0)}%`])
+      ])
+    ]));
+  });
+}
+
 function renderBestStartContent(card){
   const best = findBestStartTimes();
   if(!best.length){
@@ -621,6 +802,7 @@ function renderRouteInfoTabsCard(){
   const card = el("div", {class:"card"});
   const tabs = [
     {id:"elevation", label:"Höhenprofil"},
+    {id:"climbs", label:"Anstiege"},
     {id:"beststart", label:"Beste Startzeit"}
   ];
   card.appendChild(el("div", {class:"source-tabs"}, tabs.map(t =>
@@ -636,6 +818,9 @@ function renderRouteInfoTabsCard(){
   if(state.routeInfoTab === "elevation"){
     ensureElevationProfile();
     card.appendChild(renderElevationChart());
+  } else if(state.routeInfoTab === "climbs"){
+    ensureElevationProfile();
+    renderClimbsContent(card);
   } else {
     renderBestStartContent(card);
   }
@@ -785,7 +970,7 @@ async function fetchActivityDetail(activityId, token){
 // ---------- Open-Meteo ----------
 async function fetchWeather(lat, lon, targetDate){
   targetDate = targetDate || new Date();
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,precipitation_probability&forecast_days=7&timezone=auto`;
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,precipitation_probability,uv_index&forecast_days=7&timezone=auto`;
   const res = await fetch(url);
   if(!res.ok) throw new Error("Wetterdaten nicht verfügbar");
   const data = await res.json();
@@ -802,6 +987,7 @@ async function fetchWeather(lat, lon, targetDate){
     windDir: data.hourly.wind_direction_10m[idx],
     windGust: data.hourly.wind_gusts_10m[idx],
     precip: data.hourly.precipitation_probability[idx],
+    uvIndex: data.hourly.uv_index ? data.hourly.uv_index[idx] : null,
     forecastTime: new Date(hours[idx]),
     hourly: data.hourly,
     idx
@@ -1272,6 +1458,8 @@ function renderRouteCard(){
         ])
       ]));
     }
+    const ringsRow = renderRangeRingsRow();
+    if(ringsRow) card.appendChild(ringsRow);
     const strongWind = computeStrongWindWarning();
     if(strongWind){
       const parts = [];
@@ -1297,6 +1485,14 @@ function renderRouteCard(){
         "Windstärke: grün <15 · gelb <30 · orange <45 · rot ≥45 km/h"
       ]));
     }
+    card.appendChild(el("div", {style:"display:flex; align-items:center; gap:8px; margin-top:10px; cursor:pointer;", onclick:()=>{ state.radarEnabled = !state.radarEnabled; render(); }}, [
+      el("div", {style:`width:34px; height:20px; border-radius:10px; flex-shrink:0; background:${state.radarEnabled ? "var(--tail)" : "var(--asphalt-3)"}; position:relative; transition:background 0.15s;`}, [
+        el("div", {style:`width:16px; height:16px; border-radius:50%; background:#fff; position:absolute; top:2px; left:${state.radarEnabled ? "16px" : "2px"}; transition:left 0.15s;`})
+      ]),
+      el("span", {class:"muted", style:"font-size:12px;"}, [
+        "Regenradar (aktuell) anzeigen" + (state.radarEnabled && state.loading.radar ? " (lädt…)" : "")
+      ])
+    ]));
     card.appendChild(el("div", {id:"route-map", style:"margin-top:14px;"}));
     const legend = el("div", {class:"legend", style:"margin-top:10px;"}, [
       el("span",{},[el("span",{class:"swatch", style:"background:var(--tail)"}), "Rückenwind"]),
@@ -1322,7 +1518,7 @@ function renderRouteCard(){
         }}, [
           el("div", {class:"t"}, [Math.round(w.temp) + "°"]),
           el("div", {class:"hr"}, ["Ankunft " + fmtTime(p.arrivalTime) + " · " + p.distanceKm.toFixed(0) + " km"]),
-          el("div", {class:"w"}, [w.precip + "% Regen"])
+          el("div", {class:"w"}, [w.precip + "% Regen" + (w.uvIndex != null ? " · UV " + Math.round(w.uvIndex) : "")])
         ]));
       });
       card.appendChild(strip);
@@ -1415,6 +1611,18 @@ function mountFullRouteView(container){
     maxZoom: 20,
     subdomains: 'abcd'
   }).addTo(map);
+
+  // optional live rain radar overlay (RainViewer), toggled in renderRouteCard()
+  if(state.radarEnabled){
+    if(!state.radarFrame && !state.loading.radar){
+      ensureRadarFrame();
+    } else if(state.radarFrame && state.radarFrame.host){
+      L.tileLayer(`${state.radarFrame.host}${state.radarFrame.path}/256/{z}/{x}/{y}/2/1_1.png`, {
+        opacity: 0.55,
+        attribution: '&copy; RainViewer'
+      }).addTo(map);
+    }
+  }
 
   const coords = state.fullRouteCoords;
   const latlngs = coords.map(c=>[c[0], c[1]]);
