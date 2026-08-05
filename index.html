@@ -74,8 +74,6 @@
   }
   label{ font-size:12px; color:var(--chalk-dim); display:block; margin-bottom:6px; font-family:'IBM Plex Mono', monospace; }
 
-  .row{ display:flex; gap:10px; flex-wrap:wrap; }
-
   .settings-row{ display:grid; grid-template-columns: repeat(3, minmax(190px,1fr)); gap:10px; margin-bottom:16px; }
   .settings-row > div{ min-width:0; }
   @media (max-width:620px){ .settings-row{ grid-template-columns: 1fr; } }
@@ -101,24 +99,6 @@
   .activity .name{ font-weight:600; font-size:14px; }
   .activity .meta{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); margin-top:2px; }
 
-  /* Wind rail — signature element */
-  .rail{ position:relative; padding: 10px 0 26px; }
-  .rail-line{
-    position:relative; height: 3px; background: linear-gradient(90deg, var(--route), var(--asphalt-3));
-    border-radius:2px; margin: 34px 6px 0;
-  }
-  .rail-point{
-    position:absolute; top:-34px; transform: translateX(-50%);
-    display:flex; flex-direction:column; align-items:center; width: 64px;
-  }
-  .rail-point .arrow{
-    width:22px; height:22px; margin-bottom:4px;
-    transition: transform 0.2s ease;
-  }
-  .rail-point .kmh{ font-family:'IBM Plex Mono', monospace; font-size:11px; font-weight:600; }
-  .rail-point .lbl{ font-family:'IBM Plex Mono', monospace; font-size:9px; color:var(--chalk-dim); margin-top:2px; text-align:center; white-space:nowrap; }
-  .rail-point .dotmark{ width:9px; height:9px; border-radius:50%; background: var(--route); margin-top:6px; border:2px solid var(--asphalt-2); }
-
   .legend{ display:flex; gap:18px; margin-top:10px; font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); }
   .legend span{ display:flex; align-items:center; gap:6px; }
   .swatch{ width:10px; height:10px; border-radius:2px; }
@@ -127,10 +107,6 @@
   #route-map{
     width:100%; height:340px; border-radius:12px; overflow:hidden;
     border:1px solid var(--line); background: var(--asphalt);
-  }
-  .wind-marker{ display:flex; align-items:center; justify-content:center;
-    width:26px; height:26px; border-radius:50%;
-    box-shadow: 0 0 0 2px rgba(20,23,29,0.85), 0 2px 6px rgba(0,0,0,0.4);
   }
   .leaflet-popup-content-wrapper{ background: var(--asphalt-2); color: var(--chalk); border-radius:8px; }
   .leaflet-popup-content{ font-family:'IBM Plex Mono', monospace; font-size:12px; margin:8px 10px; }
@@ -155,8 +131,8 @@
   }
   .segment .name{ font-weight:600; font-size:14px; }
   .segment .meta{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); margin-top:3px; }
-  .segment .stat-chips{ display:flex; flex-wrap:wrap; gap:6px; }
-  .segment .stat-chip{
+  .stat-chips{ display:flex; flex-wrap:wrap; gap:6px; }
+  .stat-chip{
     display:inline-flex; align-items:center; white-space:nowrap;
     font-family:'IBM Plex Mono', monospace; font-size:10.5px; font-weight:600;
     color:var(--route); background:rgba(107,143,194,0.14);
@@ -242,13 +218,12 @@ let state = {
   selectedSegmentId: null, // when set, the map shows this segment instead of the full route
   routeSourceTab: "activities", // "routes" | "activities" | "gpx"
   stravaRoutes: [], // saved/planned Strava routes, fetched lazily when that tab opens
-  routeInfoTab: "elevation", // "elevation" | "beststart"
+  routeInfoTab: "elevation", // "elevation" | "climbs" | "beststart"
   elevationProfile: null, // {distances:[km,...], elevations:[m,...]} for the current route, or null if not (yet) loaded
+  climbIndex: 0, // which detected climb is shown in the Anstiege tab
   routeWindCache: {}, // "activity-123" / "route-45" -> {type, windSpeed} quick wind rating for list chips
   windFieldEnabled: false, // "Windfeld" overlay toggle - grid of small wind arrows over the route's map area
   windFieldPoints: null, // [{lat,lon,windSpeed,windDir}, ...] for the overlay, or null if not (yet) loaded for the current route
-  radarEnabled: false, // rain radar overlay toggle
-  radarFrame: null, // {host, path} of the latest RainViewer radar frame, fetched lazily once per session (not per-route)
   loading: {},
   error: null,
   authCodeInput: ""
@@ -257,6 +232,7 @@ let state = {
 function el(tag, attrs, children){
   const e = document.createElement(tag);
   if(attrs) for(const k in attrs){
+    if(attrs[k] == null) continue; // omit conditional attrs (e.g. `selected: cond ? "selected" : null`) instead of stringifying null/undefined
     if(k === "class") e.className = attrs[k];
     else if(k === "html") e.innerHTML = attrs[k];
     else if(k.startsWith("on")) e.addEventListener(k.slice(2), attrs[k]);
@@ -467,28 +443,54 @@ function describeArc(cx, cy, r, startAngle, endAngle){
   return `M ${start.x.toFixed(2)} ${start.y.toFixed(2)} A ${r} ${r} 0 ${largeArcFlag} 0 ${end.x.toFixed(2)} ${end.y.toFixed(2)}`;
 }
 
+// Small glyphs drawn inside each ring so the metric is identifiable without
+// a text caption underneath (icon path coordinates assume a 16x16 viewBox).
+function ringIconSvg(kind, color){
+  switch(kind){
+    case "temp": return `
+      <rect x="7" y="1.5" width="2" height="7" rx="1" fill="none" stroke="${color}" stroke-width="1.2"/>
+      <circle cx="8" cy="11.5" r="2.6" fill="${color}"/>
+      <rect x="7.4" y="3" width="1.2" height="6.8" fill="${color}"/>`;
+    case "rain": return `
+      <path d="M8 1.5C8 1.5 3.6 7.2 3.6 10.2a4.4 4.4 0 0 0 8.8 0C12.4 7.2 8 1.5 8 1.5Z" fill="${color}"/>`;
+    case "wind": return `
+      <path d="M2 6.5h7.2a2 2 0 1 0-2-2" fill="none" stroke="${color}" stroke-width="1.3" stroke-linecap="round"/>
+      <path d="M2 10.5h5.6a1.7 1.7 0 1 1-1.7 1.7" fill="none" stroke="${color}" stroke-width="1.3" stroke-linecap="round"/>`;
+    case "uv": return `
+      <circle cx="8" cy="8" r="3" fill="${color}"/>
+      <g stroke="${color}" stroke-width="1.2" stroke-linecap="round">
+        <line x1="8" y1="1" x2="8" y2="2.6"/><line x1="8" y1="13.4" x2="8" y2="15"/>
+        <line x1="1" y1="8" x2="2.6" y2="8"/><line x1="13.4" y1="8" x2="15" y2="8"/>
+        <line x1="3.2" y1="3.2" x2="4.3" y2="4.3"/><line x1="11.7" y1="11.7" x2="12.8" y2="12.8"/>
+        <line x1="3.2" y1="12.8" x2="4.3" y2="11.7"/><line x1="11.7" y1="4.3" x2="12.8" y2="3.2"/>
+      </g>`;
+    default: return "";
+  }
+}
+
 // Renders one ring: a full pale track circle plus a colored arc spanning
 // from the route's min value to its max value for that metric, mapped onto
 // a fixed domain (so e.g. a 30-45 km/h wind range visibly sits further
-// around the ring than a 5-10 km/h range on a calm day).
-function renderRangeRing({ label, unit, range, domainMin, domainMax, color }){
+// around the ring than a 5-10 km/h range on a calm day). The icon + value
+// live inside the ring itself so no caption text is needed below it.
+function renderRangeRing({ icon, unit, range, domainMin, domainMax, color }){
   const size = 76, r = 30, cx = size/2, cy = size/2;
   const valueToAngle = v => Math.min(1, Math.max(0, (v - domainMin) / (domainMax - domainMin))) * 360;
   const startAngle = valueToAngle(range.min);
   let endAngle = valueToAngle(range.max);
   if(endAngle - startAngle < 8) endAngle = Math.min(360, startAngle + 8);
   const arcPath = describeArc(cx, cy, r, startAngle, endAngle);
-  const svg = `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">
-    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#262c37" stroke-width="7"/>
-    <path d="${arcPath}" fill="none" stroke="${color}" stroke-width="7" stroke-linecap="round"/>
-  </svg>`;
   const valueText = Math.round(range.min) === Math.round(range.max)
     ? `${Math.round(range.min)}${unit}`
     : `${Math.round(range.min)}–${Math.round(range.max)}${unit}`;
-  return el("div", {style:"display:flex; flex-direction:column; align-items:center; gap:6px; flex:1; min-width:0;"}, [
-    el("div", {html: svg}),
-    el("div", {style:"font-family:'IBM Plex Mono', monospace; font-size:12px; font-weight:600; white-space:nowrap;"}, [valueText]),
-    el("div", {class:"muted", style:"font-size:9.5px; text-transform:uppercase; letter-spacing:0.06em;"}, [label])
+  const svg = `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#262c37" stroke-width="7"/>
+    <path d="${arcPath}" fill="none" stroke="${color}" stroke-width="7" stroke-linecap="round"/>
+    <svg x="${cx-8}" y="${cy-15}" width="16" height="16" viewBox="0 0 16 16">${ringIconSvg(icon, color)}</svg>
+    <text x="${cx}" y="${cy+16}" text-anchor="middle" font-family="'IBM Plex Mono', monospace" font-size="10.5" font-weight="600" fill="#f2efe9">${valueText}</text>
+  </svg>`;
+  return el("div", {style:"display:flex; justify-content:center; flex:1; min-width:0;"}, [
+    el("div", {html: svg})
   ]);
 }
 
@@ -499,10 +501,10 @@ function renderRangeRingsRow(){
   const uvRange = computeMetricRange(state.weatherAtRoute, "uvIndex");
 
   const rings = [];
-  if(tempRange) rings.push(renderRangeRing({ label:"Temperatur", unit:"°", range:tempRange, domainMin:-10, domainMax:35, color:"#e2895c" }));
-  if(precipRange) rings.push(renderRangeRing({ label:"Regen", unit:"%", range:precipRange, domainMin:0, domainMax:100, color:"#6b8fc2" }));
-  if(windRange) rings.push(renderRangeRing({ label:"Wind km/h", unit:"", range:windRange, domainMin:0, domainMax:60, color:"#e2b23e" }));
-  if(uvRange) rings.push(renderRangeRing({ label:"UV-Index", unit:"", range:uvRange, domainMin:0, domainMax:11, color:"#c26bc2" }));
+  if(tempRange) rings.push(renderRangeRing({ icon:"temp", unit:"°", range:tempRange, domainMin:-10, domainMax:35, color:"#e2895c" }));
+  if(precipRange) rings.push(renderRangeRing({ icon:"rain", unit:"%", range:precipRange, domainMin:0, domainMax:100, color:"#6b8fc2" }));
+  if(windRange) rings.push(renderRangeRing({ icon:"wind", unit:"", range:windRange, domainMin:0, domainMax:60, color:"#e2b23e" }));
+  if(uvRange) rings.push(renderRangeRing({ icon:"uv", unit:"", range:uvRange, domainMin:0, domainMax:11, color:"#c26bc2" }));
   if(!rings.length) return null;
 
   return el("div", {style:"display:flex; justify-content:space-around; gap:6px; margin-top:14px;"}, rings);
@@ -539,29 +541,6 @@ async function ensureWindField(bounds){
     state.windFieldPoints = [];
   }
   state.loading.windField = false;
-  render();
-}
-
-// ---------- rain radar overlay ----------
-// RainViewer's public API (no key required, same "free/generous" tier as
-// Open-Meteo) lists recent radar frames as {host, path} tile templates. We
-// only need the latest ("now") frame — this is a live-conditions overlay,
-// not a forecast, and isn't tied to a specific route, so it's fetched once
-// per session rather than reset per-route like the Windfeld/elevation data.
-async function ensureRadarFrame(){
-  if(state.radarFrame || state.loading.radar) return;
-  state.loading.radar = true; render();
-  try{
-    const res = await fetch("https://api.rainviewer.com/public/weather-maps.json");
-    if(!res.ok) throw new Error("Regenradar nicht verfügbar");
-    const data = await res.json();
-    const frames = data.radar && data.radar.past;
-    const latest = frames && frames[frames.length - 1];
-    state.radarFrame = latest ? { host: data.host, path: latest.path } : { host:null, path:null };
-  }catch(e){
-    state.radarFrame = { host:null, path:null };
-  }
-  state.loading.radar = false;
   render();
 }
 
@@ -639,6 +618,32 @@ async function ensureElevationProfile(){
   render();
 }
 
+// Builds the elevation line/area SVG for any distance/elevation slice —
+// shared by the full-route Höhenprofil tab and the per-climb zoom-in view
+// in the Anstiege tab. Distances don't need to start at 0 (a climb's slice
+// starts at its own km mark); the x-scale is relative to the slice's own
+// first point.
+function buildElevationChartSvg(distances, elevations){
+  const width = 600, height = 140, pad = 6;
+  const minE = Math.min(...elevations), maxE = Math.max(...elevations);
+  const rangeE = Math.max(1, maxE - minE);
+  const d0 = distances[0];
+  const totalD = (distances[distances.length - 1] - d0) || 1;
+  const x = d => pad + ((d - d0) / totalD) * (width - pad*2);
+  const y = e => (height - pad) - ((e - minE) / rangeE) * (height - pad*2);
+
+  let linePath = `M ${x(distances[0]).toFixed(1)} ${y(elevations[0]).toFixed(1)}`;
+  for(let i=1;i<distances.length;i++){
+    linePath += ` L ${x(distances[i]).toFixed(1)} ${y(elevations[i]).toFixed(1)}`;
+  }
+  const areaPath = `${linePath} L ${x(distances[distances.length-1]).toFixed(1)} ${height-pad} L ${x(distances[0]).toFixed(1)} ${height-pad} Z`;
+
+  return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="width:100%; height:140px; display:block;">
+    <path d="${areaPath}" fill="rgba(107,143,194,0.18)" stroke="none"/>
+    <path d="${linePath}" fill="none" stroke="#6b8fc2" stroke-width="2"/>
+  </svg>`;
+}
+
 function renderElevationChart(){
   if(state.loading.elevation){
     return el("div", {class:"loading"}, ["Lade Höhenprofil…"]);
@@ -648,23 +653,9 @@ function renderElevationChart(){
     return el("div", {class:"muted", style:"font-size:12px;"}, ["Für diese Strecke sind keine Höhendaten verfügbar."]);
   }
   const { distances, elevations } = profile;
-  const width = 600, height = 140, pad = 6;
   const minE = Math.min(...elevations), maxE = Math.max(...elevations);
-  const rangeE = Math.max(1, maxE - minE);
-  const totalD = distances[distances.length - 1] || 1;
-  const x = d => pad + (d / totalD) * (width - pad*2);
-  const y = e => (height - pad) - ((e - minE) / rangeE) * (height - pad*2);
-
-  let linePath = `M ${x(distances[0]).toFixed(1)} ${y(elevations[0]).toFixed(1)}`;
-  for(let i=1;i<distances.length;i++){
-    linePath += ` L ${x(distances[i]).toFixed(1)} ${y(elevations[i]).toFixed(1)}`;
-  }
-  const areaPath = `${linePath} L ${x(totalD).toFixed(1)} ${height-pad} L ${x(distances[0]).toFixed(1)} ${height-pad} Z`;
-
-  const svg = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="width:100%; height:140px; display:block;">
-    <path d="${areaPath}" fill="rgba(107,143,194,0.18)" stroke="none"/>
-    <path d="${linePath}" fill="none" stroke="#6b8fc2" stroke-width="2"/>
-  </svg>`;
+  const totalD = distances[distances.length - 1] - distances[0];
+  const svg = buildElevationChartSvg(distances, elevations);
 
   return el("div", {}, [
     el("div", {html: svg}),
@@ -732,9 +723,9 @@ function detectClimbs(profile){
       if(g > maxGrade) maxGrade = g;
     }
     const avgGrade = lengthKm > 0 ? (gainM / (lengthKm * 1000)) * 100 : 0;
-    return { fromKm: distances[fromIdx], toKm: distances[toIdx], lengthKm, gainM: Math.round(gainM), avgGrade, maxGrade };
+    return { fromIdx, toIdx, fromKm: distances[fromIdx], toKm: distances[toIdx], lengthKm, gainM: Math.round(gainM), avgGrade, maxGrade };
   }).filter(c => c.lengthKm >= CLIMB_MIN_LENGTH_KM && c.gainM >= CLIMB_MIN_GAIN_M)
-    .sort((a,b) => b.gainM - a.gainM);
+    .sort((a,b) => a.fromKm - b.fromKm); // route order, so prev/next paging moves along the route
 }
 
 function climbDifficultyLabel(avgGrade){
@@ -744,6 +735,10 @@ function climbDifficultyLabel(avgGrade){
   return "sehr steil";
 }
 
+// Same visual language as the Höhenprofil tab (chart + min/max-elevation
+// and distance caption below it), but zoomed to one climb at a time with
+// prev/next arrows to page through, and the climb's own stats as stat-chips
+// underneath instead of a list of every climb.
 function renderClimbsContent(card){
   if(state.loading.elevation){
     card.appendChild(el("div", {class:"loading"}, ["Lade Höhenprofil…"]));
@@ -759,14 +754,41 @@ function renderClimbsContent(card){
     card.appendChild(el("div", {class:"muted", style:"font-size:12px;"}, ["Keine nennenswerten Anstiege auf dieser Strecke gefunden."]));
     return;
   }
-  climbs.forEach((c,i)=>{
-    card.appendChild(el("div", {class:"activity"}, [
-      el("div", {}, [
-        el("div", {class:"name"}, [`Anstieg ${i+1} · km ${c.fromKm.toFixed(1)}–${c.toKm.toFixed(1)}`]),
-        el("div", {class:"meta"}, [`${c.lengthKm.toFixed(1)} km · ${c.gainM} Hm · Ø ${c.avgGrade.toFixed(1)}% (${climbDifficultyLabel(c.avgGrade)}) · max ${c.maxGrade.toFixed(0)}%`])
-      ])
-    ]));
-  });
+  if(state.climbIndex >= climbs.length) state.climbIndex = climbs.length - 1;
+  if(state.climbIndex < 0) state.climbIndex = 0;
+  const c = climbs[state.climbIndex];
+
+  const segDistances = profile.distances.slice(c.fromIdx, c.toIdx + 1);
+  const segElevations = profile.elevations.slice(c.fromIdx, c.toIdx + 1);
+  const svg = buildElevationChartSvg(segDistances, segElevations);
+  const minE = Math.min(...segElevations), maxE = Math.max(...segElevations);
+
+  card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;"}, [
+    el("button", {
+      class:"btn secondary", style:"padding:6px 14px; font-size:14px;",
+      disabled: state.climbIndex === 0 ? "disabled" : null,
+      onclick:()=>{ state.climbIndex--; render(); }
+    }, ["←"]),
+    el("div", {class:"muted", style:"font-family:'IBM Plex Mono', monospace; font-size:12px;"}, [`Anstieg ${state.climbIndex+1} / ${climbs.length}`]),
+    el("button", {
+      class:"btn secondary", style:"padding:6px 14px; font-size:14px;",
+      disabled: state.climbIndex === climbs.length - 1 ? "disabled" : null,
+      onclick:()=>{ state.climbIndex++; render(); }
+    }, ["→"])
+  ]));
+
+  card.appendChild(el("div", {html: svg}));
+  card.appendChild(el("div", {class:"muted", style:"display:flex; justify-content:space-between; margin-top:8px; font-size:11px; font-family:'IBM Plex Mono', monospace;"}, [
+    el("span", {}, [`${Math.round(minE)} – ${Math.round(maxE)} m`]),
+    el("span", {}, [`km ${c.fromKm.toFixed(1)} – ${c.toKm.toFixed(1)}`])
+  ]));
+  card.appendChild(el("div", {class:"stat-chips", style:"margin-top:10px;"}, [
+    el("div", {class:"stat-chip"}, [`${c.lengthKm.toFixed(1)} km`]),
+    el("div", {class:"stat-chip"}, [`${c.gainM} Hm`]),
+    el("div", {class:"stat-chip"}, [`Ø ${c.avgGrade.toFixed(1)}%`]),
+    el("div", {class:"stat-chip"}, [`max ${c.maxGrade.toFixed(0)}%`]),
+    el("div", {class:"stat-chip"}, [climbDifficultyLabel(c.avgGrade)])
+  ]));
 }
 
 function renderBestStartContent(card){
@@ -1113,6 +1135,7 @@ async function selectActivity(activity){
   state.selectedActivity = activity;
   state.elevationProfile = null;
   state.windFieldPoints = null;
+  state.climbIndex = 0;
   render();
   if(!activity.map || !activity.map.summary_polyline){
     state.routePoints = [];
@@ -1162,6 +1185,7 @@ async function selectStravaRoute(route){
   state.selectedActivity = { id: "route-" + route.id, name: route.name, isRoute: true };
   state.elevationProfile = null;
   state.windFieldPoints = null;
+  state.climbIndex = 0;
   render();
   const poly = route.map && (route.map.polyline || route.map.summary_polyline);
   if(!poly){
@@ -1209,6 +1233,7 @@ async function loadGpxFile(file){
   }
   state.selectedActivity = { name: file.name.replace(/\.gpx$/i, ""), isGpx: true };
   state.windFieldPoints = null;
+  state.climbIndex = 0;
   state.fullRouteCoords = track.coords;
   state.elevationProfile = track.eles.every(e => e != null)
     ? { distances: buildCumulativeDistances(track.coords), elevations: track.eles }
@@ -1485,14 +1510,6 @@ function renderRouteCard(){
         "Windstärke: grün <15 · gelb <30 · orange <45 · rot ≥45 km/h"
       ]));
     }
-    card.appendChild(el("div", {style:"display:flex; align-items:center; gap:8px; margin-top:10px; cursor:pointer;", onclick:()=>{ state.radarEnabled = !state.radarEnabled; render(); }}, [
-      el("div", {style:`width:34px; height:20px; border-radius:10px; flex-shrink:0; background:${state.radarEnabled ? "var(--tail)" : "var(--asphalt-3)"}; position:relative; transition:background 0.15s;`}, [
-        el("div", {style:`width:16px; height:16px; border-radius:50%; background:#fff; position:absolute; top:2px; left:${state.radarEnabled ? "16px" : "2px"}; transition:left 0.15s;`})
-      ]),
-      el("span", {class:"muted", style:"font-size:12px;"}, [
-        "Regenradar (aktuell) anzeigen" + (state.radarEnabled && state.loading.radar ? " (lädt…)" : "")
-      ])
-    ]));
     card.appendChild(el("div", {id:"route-map", style:"margin-top:14px;"}));
     const legend = el("div", {class:"legend", style:"margin-top:10px;"}, [
       el("span",{},[el("span",{class:"swatch", style:"background:var(--tail)"}), "Rückenwind"]),
@@ -1611,18 +1628,6 @@ function mountFullRouteView(container){
     maxZoom: 20,
     subdomains: 'abcd'
   }).addTo(map);
-
-  // optional live rain radar overlay (RainViewer), toggled in renderRouteCard()
-  if(state.radarEnabled){
-    if(!state.radarFrame && !state.loading.radar){
-      ensureRadarFrame();
-    } else if(state.radarFrame && state.radarFrame.host){
-      L.tileLayer(`${state.radarFrame.host}${state.radarFrame.path}/256/{z}/{x}/{y}/2/1_1.png`, {
-        opacity: 0.55,
-        attribution: '&copy; RainViewer'
-      }).addTo(map);
-    }
-  }
 
   const coords = state.fullRouteCoords;
   const latlngs = coords.map(c=>[c[0], c[1]]);
