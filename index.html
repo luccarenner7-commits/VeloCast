@@ -728,11 +728,47 @@ function detectClimbs(profile){
     .sort((a,b) => a.fromKm - b.fromKm); // route order, so prev/next paging moves along the route
 }
 
-function climbDifficultyLabel(avgGrade){
-  if(avgGrade < 4) return "leicht";
-  if(avgGrade < 7) return "mittel";
-  if(avgGrade < 10) return "steil";
-  return "sehr steil";
+// Maps a grade percentage to a color (+ matching translucent background) —
+// same green/yellow/orange/red bands as the old difficulty label, now used
+// to color-code stat-chips and the chart line directly instead of text.
+function gradeColor(grade){
+  if(grade < 4) return { color:"#4fb08c", bg:"rgba(79,176,140,0.14)" };
+  if(grade < 7) return { color:"#e2b23e", bg:"rgba(226,178,62,0.14)" };
+  if(grade < 10) return { color:"#e2895c", bg:"rgba(226,137,92,0.14)" };
+  return { color:"#e2574c", bg:"rgba(226,87,76,0.14)" };
+}
+
+// Same shape as buildElevationChartSvg, but colors each small line segment
+// by its local (smoothed, to avoid GPS-noise flicker) grade instead of one
+// flat color — steep sections red, gentle sections green. Only used for the
+// zoomed-in climb view; the full-route Höhenprofil tab keeps its plain line.
+function buildClimbChartSvg(distances, elevations){
+  const width = 600, height = 140, pad = 6;
+  const minE = Math.min(...elevations), maxE = Math.max(...elevations);
+  const rangeE = Math.max(1, maxE - minE);
+  const d0 = distances[0];
+  const totalD = (distances[distances.length - 1] - d0) || 1;
+  const x = d => pad + ((d - d0) / totalD) * (width - pad*2);
+  const y = e => (height - pad) - ((e - minE) / rangeE) * (height - pad*2);
+  const smoothed = smoothElevations(elevations, 2);
+
+  let areaPath = `M ${x(distances[0]).toFixed(1)} ${(height-pad).toFixed(1)}`;
+  for(let i=0;i<distances.length;i++){
+    areaPath += ` L ${x(distances[i]).toFixed(1)} ${y(elevations[i]).toFixed(1)}`;
+  }
+  areaPath += ` L ${x(distances[distances.length-1]).toFixed(1)} ${(height-pad).toFixed(1)} Z`;
+
+  let segmentPaths = "";
+  for(let i=1;i<distances.length;i++){
+    const grade = gradeBetween(distances, smoothed, i-1, i);
+    const color = gradeColor(grade).color;
+    segmentPaths += `<path d="M ${x(distances[i-1]).toFixed(1)} ${y(elevations[i-1]).toFixed(1)} L ${x(distances[i]).toFixed(1)} ${y(elevations[i]).toFixed(1)}" fill="none" stroke="${color}" stroke-width="2.5" stroke-linecap="round"/>`;
+  }
+
+  return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="width:100%; height:140px; display:block;">
+    <path d="${areaPath}" fill="rgba(107,143,194,0.12)" stroke="none"/>
+    ${segmentPaths}
+  </svg>`;
 }
 
 // Same visual language as the Höhenprofil tab (chart + min/max-elevation
@@ -760,8 +796,9 @@ function renderClimbsContent(card){
 
   const segDistances = profile.distances.slice(c.fromIdx, c.toIdx + 1);
   const segElevations = profile.elevations.slice(c.fromIdx, c.toIdx + 1);
-  const svg = buildElevationChartSvg(segDistances, segElevations);
+  const svg = buildClimbChartSvg(segDistances, segElevations);
   const minE = Math.min(...segElevations), maxE = Math.max(...segElevations);
+  const avgColor = gradeColor(c.avgGrade), maxColor = gradeColor(c.maxGrade);
 
   card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;"}, [
     el("button", {
@@ -785,9 +822,8 @@ function renderClimbsContent(card){
   card.appendChild(el("div", {class:"stat-chips", style:"margin-top:10px;"}, [
     el("div", {class:"stat-chip"}, [`${c.lengthKm.toFixed(1)} km`]),
     el("div", {class:"stat-chip"}, [`${c.gainM} Hm`]),
-    el("div", {class:"stat-chip"}, [`Ø ${c.avgGrade.toFixed(1)}%`]),
-    el("div", {class:"stat-chip"}, [`max ${c.maxGrade.toFixed(0)}%`]),
-    el("div", {class:"stat-chip"}, [climbDifficultyLabel(c.avgGrade)])
+    el("div", {class:"stat-chip", style:`color:${avgColor.color}; background:${avgColor.bg};`}, [`Ø ${c.avgGrade.toFixed(1)}%`]),
+    el("div", {class:"stat-chip", style:`color:${maxColor.color}; background:${maxColor.bg};`}, [`max ${c.maxGrade.toFixed(0)}%`])
   ]));
 }
 
