@@ -1395,7 +1395,7 @@ function renderRouteCard(){
       card.appendChild(renderSegmentRow(seg, {clickable:false}));
     }
 
-    card.appendChild(el("div", {id:"route-map", style:"margin-top:14px;"}));
+    card.appendChild(routeMapContainer);
     return card;
   }
 
@@ -1501,104 +1501,157 @@ function renderRouteCard(){
     }
   }
 
-  if(state.loading.weather){
-    card.appendChild(el("div", {class:"loading", style:"margin-top:14px;"}, ["Berechne Wind entlang der Strecke…"]));
-  } else if(state.routePoints.length && state.weatherAtRoute.length){
-    const mix = computeWindMix();
-    if(mix){
-      card.appendChild(el("div", {style:"margin-top:14px;"}, [
-        el("div", {style:"display:flex; height:8px; border-radius:4px; overflow:hidden;"}, [
-          el("div", {style:`flex:${mix.tailPct}; background:var(--tail);`}),
-          el("div", {style:`flex:${mix.crossPct}; background:var(--cross);`}),
-          el("div", {style:`flex:${mix.headPct}; background:var(--head);`})
-        ]),
-        el("div", {style:"display:flex; justify-content:space-between; margin-top:6px; font-size:11px; font-family:'IBM Plex Mono', monospace;"}, [
-          el("span", {style:"color:var(--tail);"}, [`${mix.tailPct}% Rückenwind`]),
-          el("span", {style:"color:var(--cross);"}, [`${mix.crossPct}% Seitenwind`]),
-          el("span", {style:"color:var(--head);"}, [`${mix.headPct}% Gegenwind`])
-        ])
-      ]));
+  // The map container is appended whenever we have coordinates at all —
+  // including while weather is still loading — rather than only once
+  // weatherAtRoute is populated. It's the same persistent routeMapContainer
+  // node every time, so keeping it present across the
+  // loading-true -> loading-false transition means mountRouteMap() never
+  // sees it disappear and tear down the Leaflet instance in between.
+  if(state.fullRouteCoords.length){
+    if(state.loading.weather){
+      card.appendChild(el("div", {class:"loading", style:"margin-top:14px;"}, ["Berechne Wind entlang der Strecke…"]));
     }
-    const ringsRow = renderRangeRingsRow();
-    if(ringsRow) card.appendChild(ringsRow);
-    const strongWind = computeStrongWindWarning();
-    if(strongWind){
-      const parts = [];
-      if(strongWind.maxWind >= STRONG_WIND_KMH) parts.push(`${Math.round(strongWind.maxWind)} km/h Wind`);
-      if(strongWind.maxGust >= STRONG_GUST_KMH) parts.push(`${Math.round(strongWind.maxGust)} km/h Böen`);
-      card.appendChild(el("div", {style:"margin-top:14px; padding:10px 12px; border-radius:8px; background:var(--head-bg); border:1px solid var(--head); display:flex; align-items:center; gap:8px;"}, [
-        el("span", {style:"font-size:15px;"}, ["⚠"]),
-        el("span", {style:"font-size:12.5px; color:var(--head); font-family:'IBM Plex Mono', monospace;"}, [
-          `Starker Wind entlang der Strecke: bis zu ${parts.join(" · ")}`
-        ])
-      ]));
-    }
-    card.appendChild(el("div", {style:"display:flex; align-items:center; gap:8px; margin-top:14px; cursor:pointer;", onclick:()=>{ state.windFieldEnabled = !state.windFieldEnabled; render(); }}, [
-      el("div", {style:`width:34px; height:20px; border-radius:10px; flex-shrink:0; background:${state.windFieldEnabled ? "var(--tail)" : "var(--asphalt-3)"}; position:relative; transition:background 0.15s;`}, [
-        el("div", {style:`width:16px; height:16px; border-radius:50%; background:#fff; position:absolute; top:2px; left:${state.windFieldEnabled ? "16px" : "2px"}; transition:left 0.15s;`})
-      ]),
-      el("span", {class:"muted", style:"font-size:12px;"}, [
-        "Windfeld der Umgebung anzeigen" + (state.windFieldEnabled && state.loading.windField ? " (lädt…)" : "")
-      ])
-    ]));
-    if(state.windFieldEnabled){
-      card.appendChild(el("div", {class:"muted", style:"font-size:10.5px; margin-top:4px;"}, [
-        "Windstärke: grün <15 · gelb <30 · orange <45 · rot ≥45 km/h"
-      ]));
-    }
-    card.appendChild(el("div", {id:"route-map", style:"margin-top:14px;"}));
-    const legend = el("div", {class:"legend", style:"margin-top:10px;"}, [
-      el("span",{},[el("span",{class:"swatch", style:"background:var(--tail)"}), "Rückenwind"]),
-      el("span",{},[el("span",{class:"swatch", style:"background:var(--cross)"}), "Seitenwind"]),
-      el("span",{},[el("span",{class:"swatch", style:"background:var(--head)"}), "Gegenwind"]),
-    ]);
-    card.appendChild(legend);
-
-    const first = state.weatherAtRoute.find(w=>w);
-    if(first){
-      const strip = el("div", {class:"weather-strip", style:"margin-top:16px;"});
-      state.routePoints.forEach((p,i)=>{
-        const w = state.weatherAtRoute[i];
-        if(!w) return;
-        strip.appendChild(el("div", {class:"weather-chip", onclick:()=>{
-          const marker = routeMarkerByIndex[i];
-          if(marker){
-            if(leafletMapInstance) leafletMapInstance.panTo(marker.getLatLng());
-            marker.openPopup();
-          }
-          const mapEl = document.getElementById("route-map");
-          if(mapEl) mapEl.scrollIntoView({behavior:"smooth", block:"center"});
-        }}, [
-          el("div", {class:"t"}, [Math.round(w.temp) + "°"]),
-          el("div", {class:"hr"}, ["Ankunft " + fmtTime(p.arrivalTime) + " · " + p.distanceKm.toFixed(0) + " km"]),
-          el("div", {class:"w"}, [w.precip + "% Regen" + (w.uvIndex != null ? " · UV " + Math.round(w.uvIndex) : "")])
+    const weatherReady = state.routePoints.length && state.weatherAtRoute.length;
+    if(weatherReady){
+      const mix = computeWindMix();
+      if(mix){
+        card.appendChild(el("div", {style:"margin-top:14px;"}, [
+          el("div", {style:"display:flex; height:8px; border-radius:4px; overflow:hidden;"}, [
+            el("div", {style:`flex:${mix.tailPct}; background:var(--tail);`}),
+            el("div", {style:`flex:${mix.crossPct}; background:var(--cross);`}),
+            el("div", {style:`flex:${mix.headPct}; background:var(--head);`})
+          ]),
+          el("div", {style:"display:flex; justify-content:space-between; margin-top:6px; font-size:11px; font-family:'IBM Plex Mono', monospace;"}, [
+            el("span", {style:"color:var(--tail);"}, [`${mix.tailPct}% Rückenwind`]),
+            el("span", {style:"color:var(--cross);"}, [`${mix.crossPct}% Seitenwind`]),
+            el("span", {style:"color:var(--head);"}, [`${mix.headPct}% Gegenwind`])
+          ])
         ]));
-      });
-      card.appendChild(strip);
+      }
+      const ringsRow = renderRangeRingsRow();
+      if(ringsRow) card.appendChild(ringsRow);
+      const strongWind = computeStrongWindWarning();
+      if(strongWind){
+        const parts = [];
+        if(strongWind.maxWind >= STRONG_WIND_KMH) parts.push(`${Math.round(strongWind.maxWind)} km/h Wind`);
+        if(strongWind.maxGust >= STRONG_GUST_KMH) parts.push(`${Math.round(strongWind.maxGust)} km/h Böen`);
+        card.appendChild(el("div", {style:"margin-top:14px; padding:10px 12px; border-radius:8px; background:var(--head-bg); border:1px solid var(--head); display:flex; align-items:center; gap:8px;"}, [
+          el("span", {style:"font-size:15px;"}, ["⚠"]),
+          el("span", {style:"font-size:12.5px; color:var(--head); font-family:'IBM Plex Mono', monospace;"}, [
+            `Starker Wind entlang der Strecke: bis zu ${parts.join(" · ")}`
+          ])
+        ]));
+      }
+      card.appendChild(el("div", {style:"display:flex; align-items:center; gap:8px; margin-top:14px; cursor:pointer;", onclick:()=>{ state.windFieldEnabled = !state.windFieldEnabled; render(); }}, [
+        el("div", {style:`width:34px; height:20px; border-radius:10px; flex-shrink:0; background:${state.windFieldEnabled ? "var(--tail)" : "var(--asphalt-3)"}; position:relative; transition:background 0.15s;`}, [
+          el("div", {style:`width:16px; height:16px; border-radius:50%; background:#fff; position:absolute; top:2px; left:${state.windFieldEnabled ? "16px" : "2px"}; transition:left 0.15s;`})
+        ]),
+        el("span", {class:"muted", style:"font-size:12px;"}, [
+          "Windfeld der Umgebung anzeigen" + (state.windFieldEnabled && state.loading.windField ? " (lädt…)" : "")
+        ])
+      ]));
+      if(state.windFieldEnabled){
+        card.appendChild(el("div", {class:"muted", style:"font-size:10.5px; margin-top:4px;"}, [
+          "Windstärke: grün <15 · gelb <30 · orange <45 · rot ≥45 km/h"
+        ]));
+      }
     }
-  } else if(state.selectedActivity && !state.fullRouteCoords.length){
+
+    card.appendChild(routeMapContainer);
+
+    if(weatherReady){
+      const legend = el("div", {class:"legend", style:"margin-top:10px;"}, [
+        el("span",{},[el("span",{class:"swatch", style:"background:var(--tail)"}), "Rückenwind"]),
+        el("span",{},[el("span",{class:"swatch", style:"background:var(--cross)"}), "Seitenwind"]),
+        el("span",{},[el("span",{class:"swatch", style:"background:var(--head)"}), "Gegenwind"]),
+      ]);
+      card.appendChild(legend);
+
+      const first = state.weatherAtRoute.find(w=>w);
+      if(first){
+        const strip = el("div", {class:"weather-strip", style:"margin-top:16px;"});
+        state.routePoints.forEach((p,i)=>{
+          const w = state.weatherAtRoute[i];
+          if(!w) return;
+          strip.appendChild(el("div", {class:"weather-chip", onclick:()=>{
+            const marker = routeMarkerByIndex[i];
+            if(marker){
+              if(leafletMapInstance) leafletMapInstance.panTo(marker.getLatLng());
+              marker.openPopup();
+            }
+            const mapEl = document.getElementById("route-map");
+            if(mapEl) mapEl.scrollIntoView({behavior:"smooth", block:"center"});
+          }}, [
+            el("div", {class:"t"}, [Math.round(w.temp) + "°"]),
+            el("div", {class:"hr"}, ["Ankunft " + fmtTime(p.arrivalTime) + " · " + p.distanceKm.toFixed(0) + " km"]),
+            el("div", {class:"w"}, [w.precip + "% Regen" + (w.uvIndex != null ? " · UV " + Math.round(w.uvIndex) : "")])
+          ]));
+        });
+        card.appendChild(strip);
+      }
+    }
+  } else if(state.selectedActivity){
     card.appendChild(el("div", {class:"muted", style:"margin-top:12px;"}, ["Für diese Aktivität liegt keine Streckenkarte vor."]));
   }
 
   return card;
 }
 
+// Created once and re-inserted (a plain DOM move, not a re-creation) into
+// the freshly rebuilt tree on every render() — letting el() create a brand
+// new #route-map div each render meant the Leaflet map bound to it (and all
+// its map tiles) got torn down and rebuilt from scratch on every single
+// render, which is what caused the visible flicker whenever a route was
+// selected (multiple renders fire in quick succession while weather loads).
+const routeMapContainer = el("div", {id:"route-map", style:"margin-top:14px;"});
+
 let leafletMapInstance = null;
+let routeMapLayers = null; // L.layerGroup holding everything drawn on top of the base tiles for the current route/segment
+let mountedRouteKey = null; // identifies which route/segment leafletMapInstance is currently showing
 let routeMarkerByIndex = {}; // routePoints index -> Leaflet marker (for weather-chip clicks)
+
+// Distinguishes "still the same route/segment, just re-rendering with new
+// data" (keep the map + tiles, only redraw the overlay layer) from
+// "switched to a different route" (full teardown + fresh mount needed).
+function currentRouteKey(){
+  if(state.selectedSegmentId) return "segment-" + state.selectedSegmentId;
+  if(!state.fullRouteCoords.length) return null;
+  const a = state.selectedActivity;
+  return "route-" + (a ? (a.id || a.name || "") : "");
+}
 
 function mountRouteMap(){
   const container = document.getElementById("route-map");
-  if(leafletMapInstance){ leafletMapInstance.remove(); leafletMapInstance = null; }
-  if(!container) return;
+  const key = currentRouteKey();
+
+  if(!container || key === null){
+    if(leafletMapInstance){ leafletMapInstance.remove(); leafletMapInstance = null; routeMapLayers = null; mountedRouteKey = null; }
+    return;
+  }
+
+  const isNewRoute = key !== mountedRouteKey || !leafletMapInstance;
+  if(isNewRoute){
+    if(leafletMapInstance) leafletMapInstance.remove();
+    leafletMapInstance = L.map(container, { scrollWheelZoom:true });
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; OpenStreetMap Mitwirkende &copy; CARTO',
+      maxZoom: 20,
+      subdomains: 'abcd'
+    }).addTo(leafletMapInstance);
+    routeMapLayers = L.layerGroup().addTo(leafletMapInstance);
+    mountedRouteKey = key;
+  } else {
+    routeMapLayers.clearLayers();
+  }
 
   if(state.selectedSegmentId){
-    mountSegmentView(container, state.selectedSegmentId);
-  } else if(state.fullRouteCoords.length){
-    mountFullRouteView(container);
+    mountSegmentView(leafletMapInstance, routeMapLayers, state.selectedSegmentId, isNewRoute);
+  } else {
+    mountFullRouteView(leafletMapInstance, routeMapLayers, isNewRoute);
   }
 }
 
-function mountSegmentView(container, segId){
+function mountSegmentView(map, layers, segId, isNewRoute){
   const seg = state.segments.find(s => s.id === segId);
   const detail = state.segmentDetails[segId];
   const poly = detail && detail.map && (detail.map.polyline || detail.map.summary_polyline);
@@ -1606,13 +1659,6 @@ function mountSegmentView(container, segId){
 
   const coords = decodePolyline(poly);
   const latlngs = coords.map(c => [c[0], c[1]]);
-
-  const map = L.map(container, { scrollWheelZoom:true });
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-    attribution: '&copy; OpenStreetMap Mitwirkende &copy; CARTO',
-    maxZoom: 20,
-    subdomains: 'abcd'
-  }).addTo(map);
 
   let color = "#6b8fc2", label = escapeHtml(seg.name);
   const w = state.segmentWeather[segId];
@@ -1624,14 +1670,14 @@ function mountSegmentView(container, segId){
     label = `<b>${escapeHtml(seg.name)}</b><br>${typeLabel} · ${Math.round(w.windSpeed)} km/h`;
   }
 
-  const line = L.polyline(latlngs, { color, weight:5, opacity:0.95, lineCap:"round", lineJoin:"round" }).addTo(map);
-  map.fitBounds(line.getBounds(), { padding:[30,30] });
+  const line = L.polyline(latlngs, { color, weight:5, opacity:0.95, lineCap:"round", lineJoin:"round" }).addTo(layers);
+  if(isNewRoute) map.fitBounds(line.getBounds(), { padding:[30,30] });
   line.bindPopup(label).openPopup();
 
   L.circleMarker(latlngs[0], { radius:6, weight:2, color:"#14171d", fillColor:"#4fb08c", fillOpacity:1 })
-    .addTo(map).bindTooltip("Start");
+    .addTo(layers).bindTooltip("Start");
   L.circleMarker(latlngs[latlngs.length - 1], { radius:6, weight:2, color:"#14171d", fillColor:"#e2574c", fillOpacity:1 })
-    .addTo(map).bindTooltip("Ziel");
+    .addTo(layers).bindTooltip("Ziel");
 
   // wind direction arrow at the segment's midpoint — points where the wind
   // blows toward, absolute compass direction (north-up), same convention
@@ -1648,29 +1694,17 @@ function mountSegmentView(container, segId){
              </svg>`,
       iconSize: [26,26], iconAnchor: [13,13]
     });
-    L.marker(midPoint, { icon }).addTo(map).bindPopup(label);
+    L.marker(midPoint, { icon }).addTo(layers).bindPopup(label);
   }
-
-  leafletMapInstance = map;
 }
 
-function mountFullRouteView(container){
-  const map = L.map(container, { scrollWheelZoom:true });
-  // Light, low-detail grayscale basemap instead of the colorful default OSM
-  // tiles — much higher contrast for the colored wind line, and easier to
-  // read on a phone in direct sunlight.
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-    attribution: '&copy; OpenStreetMap Mitwirkende &copy; CARTO',
-    maxZoom: 20,
-    subdomains: 'abcd'
-  }).addTo(map);
-
+function mountFullRouteView(map, layers, isNewRoute){
   const coords = state.fullRouteCoords;
   const latlngs = coords.map(c=>[c[0], c[1]]);
 
   // faint base line — carries the route where no wind data covers it
-  const baseLine = L.polyline(latlngs, { color:"#333a47", weight:3, opacity:0.55, lineCap:"round", lineJoin:"round" }).addTo(map);
-  map.fitBounds(baseLine.getBounds(), { padding:[26,26] });
+  const baseLine = L.polyline(latlngs, { color:"#333a47", weight:3, opacity:0.55, lineCap:"round", lineJoin:"round" }).addTo(layers);
+  if(isNewRoute) map.fitBounds(baseLine.getBounds(), { padding:[26,26] });
 
   // optional "Windfeld" overlay — a static grid of small wind arrows under
   // the route line, toggled in renderRouteCard(). Added before the route
@@ -1690,7 +1724,7 @@ function mountFullRouteView(container){
                  </svg>`,
           iconSize: [11,11], iconAnchor: [5.5,5.5]
         });
-        L.marker([p.lat, p.lon], { icon }).addTo(map).bindTooltip(`${Math.round(p.windSpeed)} km/h`);
+        L.marker([p.lat, p.lon], { icon }).addTo(layers).bindTooltip(`${Math.round(p.windSpeed)} km/h`);
       });
     }
   }
@@ -1706,7 +1740,7 @@ function mountFullRouteView(container){
     const from = pts[i].idx, to = pts[i+1].idx;
     if(to <= from) continue;
     const segCoords = coords.slice(from, to + 1).map(c=>[c[0], c[1]]);
-    L.polyline(segCoords, { color, weight:5, opacity:0.95, lineCap:"round", lineJoin:"round" }).addTo(map);
+    L.polyline(segCoords, { color, weight:5, opacity:0.95, lineCap:"round", lineJoin:"round" }).addTo(layers);
   }
 
   // small chevrons along the line showing which way the ride goes — placed
@@ -1731,7 +1765,7 @@ function mountFullRouteView(container){
                </svg>`,
         iconSize: [14,14], iconAnchor: [7,7]
       });
-      L.marker(coords[idx], { icon, interactive:false }).addTo(map);
+      L.marker(coords[idx], { icon, interactive:false }).addTo(layers);
     }
   }
 
@@ -1757,12 +1791,10 @@ function mountFullRouteView(container){
       label = `<b>Ankunft ${fmtTime(p.arrivalTime)} Uhr</b> · ${p.distanceKm.toFixed(0)} km<br><b>${typeLabel}</b><br>${Math.round(w.windSpeed)} km/h · ${Math.round(w.temp)}° · ${w.precip}% Regen`;
     }
     const marker = L.marker([p.lat, p.lon], { icon: invisibleIcon })
-      .addTo(map).bindPopup(label);
+      .addTo(layers).bindPopup(label);
     shownMarkerPositions.push({ lat:p.lat, lon:p.lon, marker });
     routeMarkerByIndex[i] = marker;
   });
-
-  leafletMapInstance = map;
 }
 
 // PR time, PR watts, KOM/QOM, elevation gain, effort count — as short
