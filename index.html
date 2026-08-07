@@ -182,9 +182,10 @@
 
 <script>
 const STRAVA_CLIENT_ID = "268232";
-// Token exchange happens server-side (Cloudflare Worker) so the Strava
-// client secret never ships to the browser. Replace with your deployed
-// worker URL, e.g. "https://rueckenwind-oauth.<subdomain>.workers.dev".
+const HAMMERHEAD_CLIENT_ID = "904ec9d0-c72f-4f08-8001-3efdf38fd9a9";
+// Token exchange happens server-side (Cloudflare Worker) so client secrets
+// never ship to the browser. Replace with your deployed worker URL, e.g.
+// "https://rueckenwind-oauth.<subdomain>.workers.dev".
 const TOKEN_ENDPOINT = "https://rueckenwind-oauth.lucca-renner7.workers.dev";
 
 function pad2(n){ return String(n).padStart(2,'0'); }
@@ -211,6 +212,10 @@ let state = {
   connected: false,
   athlete: null,
   accessToken: null,
+  hammerheadConnected: false,
+  hammerheadAccessToken: null,
+  hammerheadActivities: [],
+  hammerheadError: null,
   activities: [],
   selectedActivity: null,
   routePoints: [], // [{lat,lon,bearing,distanceKm,arrivalTime}] - sampled points used for wind markers
@@ -225,7 +230,7 @@ let state = {
   segmentPrWatts: {}, // id -> {watts, measured} for the PR effort, fetched lazily on click
   segmentSortBy: "default",
   selectedSegmentId: null, // when set, the map shows this segment instead of the full route
-  routeSourceTab: "activities", // "routes" | "activities" | "gpx"
+  routeSourceTab: "activities", // "routes" | "activities" | "hammerhead" | "gpx"
   stravaRoutes: [], // saved/planned Strava routes, fetched lazily when that tab opens
   routeInfoTab: "elevation", // "elevation" | "climbs" | "beststart"
   elevationProfile: null, // {distances:[km,...], elevations:[m,...]} for the current route, or null if not (yet) loaded
@@ -605,7 +610,11 @@ function findBestStartTimes(){
 
 async function ensureElevationProfile(){
   if(state.elevationProfile !== null || state.loading.elevation) return;
-  if(!state.selectedActivity || state.selectedActivity.isGpx) return;
+  // Hammerhead's activity/route data has no elevation stream in the public
+  // API (just the 2D polyline) - nothing to lazily fetch, so this stays
+  // null forever for those, which the elevation/climbs tabs already render
+  // as "keine Höhendaten verfügbar".
+  if(!state.selectedActivity || state.selectedActivity.isGpx || state.selectedActivity.isHammerhead) return;
   state.loading.elevation = true; render();
   try{
     let raw;
@@ -916,6 +925,14 @@ async function loadStoredToken(){
 async function saveToken(refreshToken){
   try{ localStorage.setItem("strava_refresh_token", refreshToken); }catch(e){}
 }
+async function loadStoredHammerheadToken(){
+  try{
+    return localStorage.getItem("hammerhead_refresh_token");
+  }catch(e){ return null; }
+}
+async function saveHammerheadToken(refreshToken){
+  try{ localStorage.setItem("hammerhead_refresh_token", refreshToken); }catch(e){}
+}
 
 // Persisted across sessions: avg speed and point spacing, since those are
 // per-rider preferences. Startzeit is intentionally NOT persisted — it
@@ -964,6 +981,56 @@ async function fetchActivities(token){
     headers:{ Authorization: "Bearer " + token }
   });
   if(!res.ok) throw new Error("Aktivitäten konnten nicht geladen werden (" + res.status + ")");
+  return res.json();
+}
+
+// ---------- Hammerhead API ----------
+// Same server-side token-exchange pattern as Strava, routed through the
+// same Cloudflare Worker (see worker/) via a "provider" field so the
+// Hammerhead client secret never has to live in the browser either.
+function buildHammerheadAuthUrl(){
+  const redirectUri = window.location.origin + window.location.pathname;
+  const scope = "route:read activity:read";
+  return `https://api.hammerhead.io/v1/auth/oauth/authorize?client_id=${HAMMERHEAD_CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=hammerhead`;
+}
+
+async function exchangeHammerheadCode(code, redirectUri){
+  const res = await fetch(TOKEN_ENDPOINT, {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ provider:"hammerhead", code, redirect_uri: redirectUri })
+  });
+  if(!res.ok) throw new Error("Autorisierung fehlgeschlagen (" + res.status + ")");
+  return res.json();
+}
+
+async function refreshHammerheadAccessToken(refreshToken){
+  const res = await fetch(TOKEN_ENDPOINT, {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ provider:"hammerhead", refresh_token: refreshToken })
+  });
+  if(!res.ok) throw new Error("Token-Erneuerung fehlgeschlagen (" + res.status + ")");
+  return res.json();
+}
+
+// List endpoint only returns summaries (no polyline) — full geometry needs
+// a separate per-activity detail fetch, same lazy-loading pattern already
+// used for Strava routes/elevation streams.
+async function fetchHammerheadActivities(token){
+  const res = await fetch("https://api.hammerhead.io/v1/api/activities?perPage=10", {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok) throw new Error("Hammerhead-Aktivitäten konnten nicht geladen werden (" + res.status + ")");
+  const data = await res.json();
+  return data.data || [];
+}
+
+async function fetchHammerheadActivityDetail(activityId, token){
+  const res = await fetch(`https://api.hammerhead.io/v1/api/activities/${activityId}`, {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok) throw new Error("Hammerhead-Aktivität nicht verfügbar (" + res.status + ")");
   return res.json();
 }
 
@@ -1067,9 +1134,10 @@ function render(){
   app.innerHTML = "";
   app.appendChild(renderBrand());
 
-  // Without a Strava login there's no activity list or segments — but a
-  // loaded GPX route still needs the route card + map.
-  if(!state.connected && !state.fullRouteCoords.length){
+  // Without any login there's no activity list or segments — but a loaded
+  // GPX route, or a Hammerhead-only connection, still needs the route card
+  // + map, not the plain connect screen.
+  if(!state.connected && !state.hammerheadConnected && !state.fullRouteCoords.length){
     app.appendChild(renderConnectCard());
     app.appendChild(renderFootnote());
     return;
@@ -1123,16 +1191,64 @@ function renderGpxUploadRow(){
   return wrap;
 }
 
+// Shows the recent rides synced to Hammerhead. Only activities have a
+// polyline in their public API (routes are metadata-only, see worker/ +
+// conversation notes), so unlike the Strava tabs there's no cheap per-item
+// wind-mix chip here — the summary list has no geometry to sample, only
+// name/date/distance. Wind info appears once you actually select one and
+// its full detail (with polyline) is fetched.
+function renderHammerheadTab(){
+  if(!state.hammerheadConnected){
+    return el("div", {}, [
+      el("div", {class:"muted", style:"margin-bottom:10px; font-size:12px;"}, [
+        "Zeigt deine auf Hammerhead aufgezeichneten Fahrten (mit Streckenverlauf)."
+      ]),
+      el("button", {
+        class:"btn secondary", style:"font-size:12px; padding:8px 14px;",
+        onclick: ()=>{ window.location.href = buildHammerheadAuthUrl(); }
+      }, [state.loading.hammerheadConnect ? "Verbinde…" : "Mit Hammerhead verbinden →"]),
+      state.hammerheadError ? el("div", {class:"error", style:"margin-top:8px;"}, [state.hammerheadError]) : null
+    ]);
+  }
+  if(state.loading.hammerheadDetail){
+    return el("div", {class:"loading"}, ["Lade Aktivität…"]);
+  }
+  const wrap = el("div", {});
+  if(state.hammerheadError) wrap.appendChild(el("div", {class:"error", style:"margin-bottom:8px;"}, [state.hammerheadError]));
+  if(!state.hammerheadActivities.length){
+    wrap.appendChild(el("div", {class:"muted"}, ["Keine Hammerhead-Aktivitäten gefunden."]));
+    return wrap;
+  }
+  state.hammerheadActivities.slice(0,10).forEach(a=>{
+    const key = "hammerhead-" + a.id;
+    const isSel = state.selectedActivity && state.selectedActivity.id === key;
+    const km = (a.distance/1000).toFixed(1);
+    const date = new Date(a.createdAt).toLocaleDateString("de-DE", {day:"2-digit", month:"2-digit", year:"numeric"});
+    wrap.appendChild(el("div", {class:"activity" + (isSel?" selected":""), onclick: ()=>selectHammerheadActivity(a)}, [
+      el("div", {}, [
+        el("div", {class:"name"}, [a.name]),
+        el("div", {class:"meta"}, [`${date} · ${km} km`])
+      ])
+    ]));
+  });
+  return wrap;
+}
+
 function renderConnectCard(){
   const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Mit Strava verbinden"]));
-  card.appendChild(el("div", {class:"muted"}, [
-    "Autorisiere den Zugriff auf deine Aktivitäten und markierten Segmente. Du wirst zu Strava weitergeleitet und kommst danach automatisch hierher zurück."
+  card.appendChild(el("h2", {}, ["Verbinden"]));
+  card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [
+    "Autorisiere den Zugriff auf deine Aktivitäten/Routen. Du wirst weitergeleitet und kommst danach automatisch hierher zurück."
   ]));
 
-  const loginBtn = el("button", {class:"btn", style:"margin-bottom:4px;", onclick: ()=>{ window.location.href = buildAuthUrl(); }}, [state.loading.connect ? "Verbinde…" : "Mit Strava einloggen →"]);
-  if(state.loading.connect) loginBtn.disabled = true;
-  card.appendChild(loginBtn);
+  const stravaBtn = el("button", {class:"btn", style:"margin-bottom:8px; width:100%;", onclick: ()=>{ window.location.href = buildAuthUrl(); }}, [state.loading.connect ? "Verbinde…" : "Mit Strava einloggen →"]);
+  if(state.loading.connect) stravaBtn.disabled = true;
+  card.appendChild(stravaBtn);
+
+  const hammerheadBtn = el("button", {class:"btn secondary", style:"margin-bottom:8px; width:100%;", onclick: ()=>{ window.location.href = buildHammerheadAuthUrl(); }}, [state.loading.hammerheadConnect ? "Verbinde…" : "Mit Hammerhead verbinden →"]);
+  if(state.loading.hammerheadConnect) hammerheadBtn.disabled = true;
+  card.appendChild(hammerheadBtn);
+  if(state.hammerheadError) card.appendChild(el("div", {class:"error", style:"margin-bottom:8px;"}, [state.hammerheadError]));
 
   card.appendChild(el("div", {class:"muted", style:"margin:16px 0 8px; font-size:12px;"}, ["oder, ganz ohne Account:"]));
   card.appendChild(renderGpxUploadRow());
@@ -1154,6 +1270,23 @@ async function connectWithCode(code){
     state.error = e.message || "Verbindung fehlgeschlagen.";
   }
   state.loading.connect = false;
+  render();
+}
+
+async function connectHammerheadWithCode(code){
+  state.hammerheadError = null;
+  state.loading.hammerheadConnect = true; render();
+  try{
+    const redirectUri = window.location.origin + window.location.pathname;
+    const tokenData = await exchangeHammerheadCode(code, redirectUri);
+    state.hammerheadAccessToken = tokenData.access_token;
+    await saveHammerheadToken(tokenData.refresh_token);
+    state.hammerheadConnected = true;
+    state.hammerheadActivities = await fetchHammerheadActivities(state.hammerheadAccessToken);
+  }catch(e){
+    state.hammerheadError = e.message || "Verbindung fehlgeschlagen.";
+  }
+  state.loading.hammerheadConnect = false;
   render();
 }
 
@@ -1194,6 +1327,33 @@ async function selectActivity(activity){
   state.routePoints = pickRoutePoints(coords, cumDist, state.routePointDistanceKm);
   render();
   await loadRouteWeather();
+}
+
+// The activities list only has summaries (no polyline), so unlike
+// selectActivity/selectStravaRoute this needs its own detail fetch first.
+async function selectHammerheadActivity(activity){
+  state.hammerheadError = null;
+  state.loading.hammerheadDetail = true; render();
+  try{
+    const detail = await fetchHammerheadActivityDetail(activity.id, state.hammerheadAccessToken);
+    state.selectedActivity = { id: "hammerhead-" + activity.id, name: activity.name, isHammerhead: true };
+    state.elevationProfile = null;
+    state.windFieldPoints = null;
+    state.climbIndex = 0;
+    if(detail.polyline){
+      state.fullRouteCoords = decodePolyline(detail.polyline);
+      state.loading.hammerheadDetail = false;
+      recomputeRoutePoints();
+      return;
+    }
+    state.fullRouteCoords = [];
+    state.routePoints = [];
+    state.weatherAtRoute = [];
+  }catch(e){
+    state.hammerheadError = e.message;
+  }
+  state.loading.hammerheadDetail = false;
+  render();
 }
 
 // Re-samples routePoints from the already-loaded fullRouteCoords — used
@@ -1442,14 +1602,21 @@ function renderRouteCard(){
   card.appendChild(settingsRow);
   card.appendChild(el("div", {class:"muted", style:"margin-bottom:12px; font-size:12px;"}, ["Wetterwerte werden jeweils für den erwarteten Ankunftszeitpunkt an diesem Punkt berechnet."]));
 
-  if(!state.connected){
-    card.appendChild(renderGpxUploadRow());
-  } else {
-    const tabs = [
-      {id:"routes", label:"Routen"},
-      {id:"activities", label:"Fahrten"},
-      {id:"gpx", label:"GPX"}
-    ];
+  {
+    const tabs = [];
+    if(state.connected){
+      tabs.push({id:"routes", label:"Routen"});
+      tabs.push({id:"activities", label:"Fahrten"});
+    }
+    tabs.push({id:"hammerhead", label:"Hammerhead"});
+    tabs.push({id:"gpx", label:"GPX"});
+    // routeSourceTab may point at a tab that isn't currently visible (e.g.
+    // "activities" is the initial default but hidden until Strava is
+    // connected) - fall back to something that's actually shown.
+    if(!tabs.some(t => t.id === state.routeSourceTab)){
+      state.routeSourceTab = state.connected ? "routes" : "gpx";
+    }
+
     card.appendChild(el("div", {class:"source-tabs"}, tabs.map(t =>
       el("div", {
         class:"source-tab" + (state.routeSourceTab === t.id ? " active" : ""),
@@ -1505,6 +1672,8 @@ function renderRouteCard(){
       } else if(!state.fullRouteCoords.length){
         card.appendChild(el("div", {class:"muted"}, ["Keine Aktivitäten gefunden."]));
       }
+    } else if(state.routeSourceTab === "hammerhead"){
+      card.appendChild(renderHammerheadTab());
     } else if(state.routeSourceTab === "gpx"){
       card.appendChild(renderGpxUploadRow());
     }
@@ -1948,29 +2117,58 @@ function renderFootnote(){
 async function init(){
   render();
 
-  // Strava just redirected back to this page with ?code=...
+  // Strava or Hammerhead just redirected back to this page with ?code=...
+  // - distinguish which one via the "state" param (Hammerhead's authorize
+  // request sets state=hammerhead; Strava's doesn't send one at all).
   const params = new URLSearchParams(window.location.search);
   const codeParam = params.get("code");
+  const stateParam = params.get("state");
+  let justConnected = null;
   if(codeParam){
     window.history.replaceState({}, document.title, window.location.pathname);
-    await connectWithCode(codeParam);
-    return;
+    if(stateParam === "hammerhead"){
+      await connectHammerheadWithCode(codeParam);
+      justConnected = "hammerhead";
+    } else {
+      await connectWithCode(codeParam);
+      justConnected = "strava";
+    }
   }
 
-  const stored = await loadStoredToken();
-  if(stored){
-    state.loading.connect = true; render();
-    try{
-      const tokenData = await refreshAccessToken(stored);
-      state.accessToken = tokenData.access_token;
-      await saveToken(tokenData.refresh_token);
-      state.connected = true;
-      await loadActivitiesAndSegments();
-    }catch(e){
-      // stored token invalid, stay on connect screen
+  if(justConnected !== "strava"){
+    const stored = await loadStoredToken();
+    if(stored){
+      state.loading.connect = true; render();
+      try{
+        const tokenData = await refreshAccessToken(stored);
+        state.accessToken = tokenData.access_token;
+        await saveToken(tokenData.refresh_token);
+        state.connected = true;
+        await loadActivitiesAndSegments();
+      }catch(e){
+        // stored token invalid, stay on connect screen
+      }
+      state.loading.connect = false;
+      render();
     }
-    state.loading.connect = false;
-    render();
+  }
+
+  if(justConnected !== "hammerhead"){
+    const storedHammerhead = await loadStoredHammerheadToken();
+    if(storedHammerhead){
+      state.loading.hammerheadConnect = true; render();
+      try{
+        const tokenData = await refreshHammerheadAccessToken(storedHammerhead);
+        state.hammerheadAccessToken = tokenData.access_token;
+        await saveHammerheadToken(tokenData.refresh_token);
+        state.hammerheadConnected = true;
+        state.hammerheadActivities = await fetchHammerheadActivities(state.hammerheadAccessToken);
+      }catch(e){
+        // stored token invalid, stay disconnected
+      }
+      state.loading.hammerheadConnect = false;
+      render();
+    }
   }
 }
 init();

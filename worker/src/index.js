@@ -1,8 +1,11 @@
-// Cloudflare Worker: handles the Strava OAuth token exchange server-side so
-// STRAVA_CLIENT_SECRET never has to live in the browser-served index.html.
+// Cloudflare Worker: handles OAuth token exchange server-side for every
+// connected provider (Strava, Hammerhead) so their client secrets never
+// have to live in the browser-served index.html.
 //
-// Deploy: set env.STRAVA_CLIENT_ID / env.STRAVA_CLIENT_SECRET (see wrangler.toml
-// and `wrangler secret put`), then `wrangler deploy` from the worker/ directory.
+// Deploy: set the *_CLIENT_ID vars and *_CLIENT_SECRET secrets (see
+// wrangler.toml), then `wrangler deploy` from the worker/ directory (or,
+// since this project is deployed via the Cloudflare dashboard rather than
+// the CLI: Worker -> Settings -> Variables and Secrets -> Add).
 
 function corsHeaders(env) {
   return {
@@ -30,6 +33,27 @@ function hasAllowedOrigin(request, env) {
   return request.headers.get("Origin") === allowed;
 }
 
+// Each provider's token endpoint has slightly different requirements:
+// Strava wants a JSON body and doesn't need redirect_uri echoed back;
+// Hammerhead wants form-urlencoded and requires redirect_uri on the
+// authorization_code grant (per its OpenAPI spec).
+const PROVIDERS = {
+  strava: {
+    tokenUrl: "https://www.strava.com/oauth/token",
+    clientIdKey: "STRAVA_CLIENT_ID",
+    clientSecretKey: "STRAVA_CLIENT_SECRET",
+    bodyType: "json",
+    needsRedirectUri: false,
+  },
+  hammerhead: {
+    tokenUrl: "https://api.hammerhead.io/v1/auth/oauth/token",
+    clientIdKey: "HAMMERHEAD_CLIENT_ID",
+    clientSecretKey: "HAMMERHEAD_CLIENT_SECRET",
+    bodyType: "form",
+    needsRedirectUri: true,
+  },
+};
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
@@ -49,26 +73,35 @@ export default {
       return jsonResponse({ error: "invalid_json" }, 400, env);
     }
 
-    const { code, refresh_token } = body || {};
+    const { provider, code, refresh_token, redirect_uri } = body || {};
+    const config = PROVIDERS[provider || "strava"];
+    if (!config) {
+      return jsonResponse({ error: "unknown_provider" }, 400, env);
+    }
     if (!code && !refresh_token) {
       return jsonResponse({ error: "code_or_refresh_token_required" }, 400, env);
     }
 
     const params = {
-      client_id: env.STRAVA_CLIENT_ID,
-      client_secret: env.STRAVA_CLIENT_SECRET,
+      client_id: env[config.clientIdKey],
+      client_secret: env[config.clientSecretKey],
       grant_type: code ? "authorization_code" : "refresh_token",
     };
     if (code) params.code = code;
     if (refresh_token) params.refresh_token = refresh_token;
+    if (config.needsRedirectUri && redirect_uri) params.redirect_uri = redirect_uri;
 
-    const stravaRes = await fetch("https://www.strava.com/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(params),
-    });
+    const fetchOptions = { method: "POST" };
+    if (config.bodyType === "form") {
+      fetchOptions.headers = { "Content-Type": "application/x-www-form-urlencoded" };
+      fetchOptions.body = new URLSearchParams(params).toString();
+    } else {
+      fetchOptions.headers = { "Content-Type": "application/json" };
+      fetchOptions.body = JSON.stringify(params);
+    }
 
-    const data = await stravaRes.json();
-    return jsonResponse(data, stravaRes.status, env);
+    const providerRes = await fetch(config.tokenUrl, fetchOptions);
+    const data = await providerRes.json();
+    return jsonResponse(data, providerRes.status, env);
   },
 };
