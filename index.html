@@ -214,7 +214,7 @@ let state = {
   accessToken: null,
   hammerheadConnected: false,
   hammerheadAccessToken: null,
-  hammerheadActivities: [],
+  hammerheadRoutes: [],
   hammerheadError: null,
   activities: [],
   selectedActivity: null,
@@ -230,7 +230,7 @@ let state = {
   segmentPrWatts: {}, // id -> {watts, measured} for the PR effort, fetched lazily on click
   segmentSortBy: "default",
   selectedSegmentId: null, // when set, the map shows this segment instead of the full route
-  routeSourceTab: "activities", // "routes" | "activities" | "hammerhead" | "gpx"
+  routeSourceTab: "activities", // "routes" | "activities" | "hammerhead" (planned routes) | "gpx"
   stravaRoutes: [], // saved/planned Strava routes, fetched lazily when that tab opens
   routeInfoTab: "elevation", // "elevation" | "climbs" | "beststart"
   elevationProfile: null, // {distances:[km,...], elevations:[m,...]} for the current route, or null if not (yet) loaded
@@ -610,11 +610,10 @@ function findBestStartTimes(){
 
 async function ensureElevationProfile(){
   if(state.elevationProfile !== null || state.loading.elevation) return;
-  // Hammerhead's activity/route data has no elevation stream in the public
-  // API (just the 2D polyline) - nothing to lazily fetch, so this stays
-  // null forever for those, which the elevation/climbs tabs already render
-  // as "keine Höhendaten verfügbar".
-  if(!state.selectedActivity || state.selectedActivity.isGpx || state.selectedActivity.isHammerhead) return;
+  // Hammerhead route elevation comes straight from the parsed GPX file
+  // (elevationProfile is set immediately in selectHammerheadRoute, same as
+  // a GPX upload) - nothing to lazily fetch for those.
+  if(!state.selectedActivity || state.selectedActivity.isGpx || state.selectedActivity.isHammerheadRoute) return;
   state.loading.elevation = true; render();
   try{
     let raw;
@@ -1026,27 +1025,29 @@ async function refreshHammerheadAccessToken(refreshToken){
   return res.json();
 }
 
-// List endpoint only returns summaries (no polyline) — full geometry needs
-// a separate per-activity detail fetch, same lazy-loading pattern already
-// used for Strava routes/elevation streams.
+// Hammerhead activities are just the rides already synced to Strava from
+// the same bike computer — not useful as a second source. Planned routes
+// are the actual point: the list endpoint only returns summaries (no
+// geometry), so the route's coordinates come from a separate per-route file
+// download (GPX), parsed with the same parseGpxTrack() used for GPX upload.
 // Routed through the Worker's /hammerhead-api proxy rather than calling
 // api.hammerhead.io directly — Hammerhead's API doesn't send CORS headers,
 // so a direct browser fetch is blocked ("Load failed").
-async function fetchHammerheadActivities(token){
-  const res = await fetch(TOKEN_ENDPOINT + "/hammerhead-api/activities?perPage=10", {
+async function fetchHammerheadRoutes(token){
+  const res = await fetch(TOKEN_ENDPOINT + "/hammerhead-api/routes?perPage=20", {
     headers:{ Authorization: "Bearer " + token }
   });
-  if(!res.ok) throw new Error("Hammerhead-Aktivitäten konnten nicht geladen werden: " + await readOAuthError(res));
+  if(!res.ok) throw new Error("Hammerhead-Routen konnten nicht geladen werden: " + await readOAuthError(res));
   const data = await res.json();
   return data.data || [];
 }
 
-async function fetchHammerheadActivityDetail(activityId, token){
-  const res = await fetch(TOKEN_ENDPOINT + `/hammerhead-api/activities/${activityId}`, {
+async function fetchHammerheadRouteFile(routeId, token){
+  const res = await fetch(TOKEN_ENDPOINT + `/hammerhead-api/routes/${routeId}/file`, {
     headers:{ Authorization: "Bearer " + token }
   });
-  if(!res.ok) throw new Error("Hammerhead-Aktivität nicht verfügbar: " + await readOAuthError(res));
-  return res.json();
+  if(!res.ok) throw new Error("Routendatei nicht verfügbar: " + await readOAuthError(res));
+  return res.text();
 }
 
 async function fetchActivityStreams(id, token){
@@ -1206,17 +1207,15 @@ function renderGpxUploadRow(){
   return wrap;
 }
 
-// Shows the recent rides synced to Hammerhead. Only activities have a
-// polyline in their public API (routes are metadata-only, see worker/ +
-// conversation notes), so unlike the Strava tabs there's no cheap per-item
-// wind-mix chip here — the summary list has no geometry to sample, only
-// name/date/distance. Wind info appears once you actually select one and
-// its full detail (with polyline) is fetched.
+// Shows planned Hammerhead routes. The list endpoint has no geometry, so
+// unlike the Strava tabs there's no cheap per-item wind-mix chip here — only
+// name/distance from the summary. Wind info appears once you select one and
+// its GPX file (with the actual track) is fetched and parsed.
 function renderHammerheadTab(){
   if(!state.hammerheadConnected){
     return el("div", {}, [
       el("div", {class:"muted", style:"margin-bottom:10px; font-size:12px;"}, [
-        "Zeigt deine auf Hammerhead aufgezeichneten Fahrten (mit Streckenverlauf)."
+        "Zeigt deine auf Hammerhead geplanten Routen."
       ]),
       el("button", {
         class:"btn secondary", style:"font-size:12px; padding:8px 14px;",
@@ -1226,23 +1225,23 @@ function renderHammerheadTab(){
     ]);
   }
   if(state.loading.hammerheadDetail){
-    return el("div", {class:"loading"}, ["Lade Aktivität…"]);
+    return el("div", {class:"loading"}, ["Lade Route…"]);
   }
   const wrap = el("div", {});
   if(state.hammerheadError) wrap.appendChild(el("div", {class:"error", style:"margin-bottom:8px;"}, [state.hammerheadError]));
-  if(!state.hammerheadActivities.length){
-    wrap.appendChild(el("div", {class:"muted"}, ["Keine Hammerhead-Aktivitäten gefunden."]));
+  if(!state.hammerheadRoutes.length){
+    wrap.appendChild(el("div", {class:"muted"}, ["Keine Hammerhead-Routen gefunden."]));
     return wrap;
   }
-  state.hammerheadActivities.slice(0,10).forEach(a=>{
-    const key = "hammerhead-" + a.id;
+  state.hammerheadRoutes.slice(0,20).forEach(r=>{
+    const key = "hammerhead-route-" + r.id;
     const isSel = state.selectedActivity && state.selectedActivity.id === key;
-    const km = (a.distance/1000).toFixed(1);
-    const date = new Date(a.createdAt).toLocaleDateString("de-DE", {day:"2-digit", month:"2-digit", year:"numeric"});
-    wrap.appendChild(el("div", {class:"activity" + (isSel?" selected":""), onclick: ()=>selectHammerheadActivity(a)}, [
+    const distanceM = r.distance ?? r.distanceMeters ?? r.length;
+    const meta = Number.isFinite(distanceM) ? `${(distanceM/1000).toFixed(1)} km` : "";
+    wrap.appendChild(el("div", {class:"activity" + (isSel?" selected":""), onclick: ()=>selectHammerheadRoute(r)}, [
       el("div", {}, [
-        el("div", {class:"name"}, [a.name]),
-        el("div", {class:"meta"}, [`${date} · ${km} km`])
+        el("div", {class:"name"}, [r.name || "Route"]),
+        meta ? el("div", {class:"meta"}, [meta]) : null
       ])
     ]));
   });
@@ -1297,7 +1296,7 @@ async function connectHammerheadWithCode(code){
     state.hammerheadAccessToken = tokenData.access_token;
     await saveHammerheadToken(tokenData.refresh_token);
     state.hammerheadConnected = true;
-    state.hammerheadActivities = await fetchHammerheadActivities(state.hammerheadAccessToken);
+    state.hammerheadRoutes = await fetchHammerheadRoutes(state.hammerheadAccessToken);
   }catch(e){
     state.hammerheadError = e.message || "Verbindung fehlgeschlagen.";
   }
@@ -1346,24 +1345,26 @@ async function selectActivity(activity){
 
 // The activities list only has summaries (no polyline), so unlike
 // selectActivity/selectStravaRoute this needs its own detail fetch first.
-async function selectHammerheadActivity(activity){
+async function selectHammerheadRoute(route){
   state.hammerheadError = null;
   state.loading.hammerheadDetail = true; render();
   try{
-    const detail = await fetchHammerheadActivityDetail(activity.id, state.hammerheadAccessToken);
-    state.selectedActivity = { id: "hammerhead-" + activity.id, name: activity.name, isHammerhead: true };
-    state.elevationProfile = null;
+    const raw = await fetchHammerheadRouteFile(route.id, state.hammerheadAccessToken);
+    const track = parseGpxTrack(raw);
+    if(!track){
+      // Diagnostic fallback — if the file isn't GPX/XML after all, show a
+      // snippet of the raw response so the actual format can be identified
+      // instead of guessing blind again.
+      throw new Error("Unbekanntes Format der Routendatei: " + raw.slice(0, 120));
+    }
+    state.selectedActivity = { id: "hammerhead-route-" + route.id, name: route.name || "Route", isHammerheadRoute: true };
     state.windFieldPoints = null;
     state.climbIndex = 0;
-    if(detail.polyline){
-      state.fullRouteCoords = decodePolyline(detail.polyline);
-      state.loading.hammerheadDetail = false;
-      recomputeRoutePoints();
-      return;
-    }
-    state.fullRouteCoords = [];
-    state.routePoints = [];
-    state.weatherAtRoute = [];
+    state.fullRouteCoords = track.coords;
+    state.elevationProfile = track.eles.every(e => e != null)
+      ? { distances: buildCumulativeDistances(track.coords), elevations: track.eles }
+      : { distances: [], elevations: [] };
+    recomputeRoutePoints();
   }catch(e){
     state.hammerheadError = e.message;
   }
@@ -2177,7 +2178,7 @@ async function init(){
         state.hammerheadAccessToken = tokenData.access_token;
         await saveHammerheadToken(tokenData.refresh_token);
         state.hammerheadConnected = true;
-        state.hammerheadActivities = await fetchHammerheadActivities(state.hammerheadAccessToken);
+        state.hammerheadRoutes = await fetchHammerheadRoutes(state.hammerheadAccessToken);
       }catch(e){
         // stored token invalid, stay disconnected
       }

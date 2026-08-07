@@ -79,9 +79,10 @@ export default {
         headers: auth ? { Authorization: auth } : {},
       });
       const data = await upstreamRes.text();
+      const upstreamContentType = upstreamRes.headers.get("Content-Type") || "application/json";
       return new Response(data, {
         status: upstreamRes.status,
-        headers: { "Content-Type": "application/json", ...corsHeaders(env) },
+        headers: { "Content-Type": upstreamContentType, ...corsHeaders(env) },
       });
     }
 
