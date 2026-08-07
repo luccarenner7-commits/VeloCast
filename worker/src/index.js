@@ -10,8 +10,8 @@
 function corsHeaders(env) {
   return {
     "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN || "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
   };
 }
 
@@ -56,9 +56,35 @@ const PROVIDERS = {
 
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders(env) });
     }
+
+    // GET /hammerhead-api/* -> proxies Hammerhead's REST API. Unlike Strava,
+    // Hammerhead's API doesn't send CORS headers, so the browser can't call
+    // api.hammerhead.io directly (fails with "Load failed"/"Failed to
+    // fetch"). Server-to-server requests aren't subject to CORS, so this
+    // Worker fetches on the browser's behalf and adds its own CORS headers
+    // to the response. The bearer token is only relayed, never stored.
+    if (request.method === "GET" && url.pathname.startsWith("/hammerhead-api/")) {
+      if (!hasAllowedOrigin(request, env)) {
+        return jsonResponse({ error: "forbidden" }, 403, env);
+      }
+      const targetPath = url.pathname.slice("/hammerhead-api".length);
+      const targetUrl = "https://api.hammerhead.io/v1/api" + targetPath + url.search;
+      const auth = request.headers.get("Authorization");
+      const upstreamRes = await fetch(targetUrl, {
+        headers: auth ? { Authorization: auth } : {},
+      });
+      const data = await upstreamRes.text();
+      return new Response(data, {
+        status: upstreamRes.status,
+        headers: { "Content-Type": "application/json", ...corsHeaders(env) },
+      });
+    }
+
     if (request.method !== "POST") {
       return jsonResponse({ error: "method_not_allowed" }, 405, env);
     }

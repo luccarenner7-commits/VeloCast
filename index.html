@@ -994,13 +994,25 @@ function buildHammerheadAuthUrl(){
   return `https://api.hammerhead.io/v1/auth/oauth/authorize?client_id=${HAMMERHEAD_CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=hammerhead`;
 }
 
+// Surfaces the provider's actual OAuth error (e.g. "invalid_client",
+// "invalid_grant") instead of just the HTTP status, since the worker proxies
+// the token endpoint's JSON error body straight through.
+async function readOAuthError(res){
+  try{
+    const data = await res.json();
+    return (data.error_description || data.error || res.statusText || String(res.status));
+  }catch(e){
+    return res.statusText || String(res.status);
+  }
+}
+
 async function exchangeHammerheadCode(code, redirectUri){
   const res = await fetch(TOKEN_ENDPOINT, {
     method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({ provider:"hammerhead", code, redirect_uri: redirectUri })
   });
-  if(!res.ok) throw new Error("Autorisierung fehlgeschlagen (" + res.status + ")");
+  if(!res.ok) throw new Error("Autorisierung fehlgeschlagen: " + await readOAuthError(res));
   return res.json();
 }
 
@@ -1010,27 +1022,30 @@ async function refreshHammerheadAccessToken(refreshToken){
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({ provider:"hammerhead", refresh_token: refreshToken })
   });
-  if(!res.ok) throw new Error("Token-Erneuerung fehlgeschlagen (" + res.status + ")");
+  if(!res.ok) throw new Error("Token-Erneuerung fehlgeschlagen: " + await readOAuthError(res));
   return res.json();
 }
 
 // List endpoint only returns summaries (no polyline) — full geometry needs
 // a separate per-activity detail fetch, same lazy-loading pattern already
 // used for Strava routes/elevation streams.
+// Routed through the Worker's /hammerhead-api proxy rather than calling
+// api.hammerhead.io directly — Hammerhead's API doesn't send CORS headers,
+// so a direct browser fetch is blocked ("Load failed").
 async function fetchHammerheadActivities(token){
-  const res = await fetch("https://api.hammerhead.io/v1/api/activities?perPage=10", {
+  const res = await fetch(TOKEN_ENDPOINT + "/hammerhead-api/activities?perPage=10", {
     headers:{ Authorization: "Bearer " + token }
   });
-  if(!res.ok) throw new Error("Hammerhead-Aktivitäten konnten nicht geladen werden (" + res.status + ")");
+  if(!res.ok) throw new Error("Hammerhead-Aktivitäten konnten nicht geladen werden: " + await readOAuthError(res));
   const data = await res.json();
   return data.data || [];
 }
 
 async function fetchHammerheadActivityDetail(activityId, token){
-  const res = await fetch(`https://api.hammerhead.io/v1/api/activities/${activityId}`, {
+  const res = await fetch(TOKEN_ENDPOINT + `/hammerhead-api/activities/${activityId}`, {
     headers:{ Authorization: "Bearer " + token }
   });
-  if(!res.ok) throw new Error("Hammerhead-Aktivität nicht verfügbar (" + res.status + ")");
+  if(!res.ok) throw new Error("Hammerhead-Aktivität nicht verfügbar: " + await readOAuthError(res));
   return res.json();
 }
 
