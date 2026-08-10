@@ -997,11 +997,17 @@ function buildHammerheadAuthUrl(){
 // "invalid_grant") instead of just the HTTP status, since the worker proxies
 // the token endpoint's JSON error body straight through.
 async function readOAuthError(res){
+  let text = "";
+  try{ text = await res.text(); }catch(e){ /* body already consumed or unreadable */ }
   try{
-    const data = await res.json();
+    const data = JSON.parse(text);
     return (data.error_description || data.error || res.statusText || String(res.status));
   }catch(e){
-    return res.statusText || String(res.status);
+    // Not JSON - surface a snippet of the raw body (e.g. an upstream HTML
+    // error page or plain-text message) instead of just the bare status,
+    // since that's usually the only clue for diagnosing an unfamiliar API.
+    const snippet = text ? text.slice(0, 200) : "";
+    return snippet ? `${res.status} ${snippet}` : (res.statusText || String(res.status));
   }
 }
 
