@@ -1052,7 +1052,7 @@ async function fetchHammerheadRouteFile(routeId, token){
   const res = await fetch(TOKEN_ENDPOINT + `/hammerhead-api/routes/${routeId}/file`, {
     headers:{ Authorization: "Bearer " + token }
   });
-  if(!res.ok) throw new Error("Routendatei nicht verfügbar: " + await readOAuthError(res));
+  if(!res.ok) throw new Error(`Routendatei nicht verfügbar (Route-ID: ${routeId}): ` + await readOAuthError(res));
   return res.text();
 }
 
@@ -1354,6 +1354,10 @@ async function selectActivity(activity){
 async function selectHammerheadRoute(route){
   state.hammerheadError = null;
   state.loading.hammerheadDetail = true; render();
+  // Logged since the exact RouteSummary field names aren't verified against
+  // the live API — if the file fetch below fails, check this for whether
+  // route.id actually matches a real field (e.g. it might be routeId/uuid).
+  console.log("Hammerhead route object:", route);
   try{
     const raw = await fetchHammerheadRouteFile(route.id, state.hammerheadAccessToken);
     const track = parseGpxTrack(raw);
