@@ -86,6 +86,20 @@
     --wind-2: rgba(63,95,143,0.92);
     --wind-3: rgba(42,69,112,0.94);
     --wind-4: rgba(22,41,77,0.97);
+    /* KOM/QOM closeness ramp: its own dedicated 2-tier family for "how close
+       is this athlete's PR to the record time", deliberately separate from
+       --tail/--head/--cross (wind favorability) and --accent (brand/CTA) —
+       same discipline as --grade-*/--wind-* above, one color family per
+       semantic meaning. A violet/plum hue is used because it's otherwise
+       unused anywhere in this palette (wind favorability is green/red/amber,
+       --route/--grade-* are blue, --wind-* is blue) — so "close to the
+       record" can't be misread as any of those. --kom-near is the closer/
+       more-prominent tier (within ~5% of the record time), --kom-mid the
+       milder "getting close" tier (within ~15%); anything beyond that stays
+       on the chip's plain neutral --route/--route-bg styling with no
+       highlight at all. See buildXomChip(). */
+    --kom-near: #c792ea; --kom-near-bg: rgba(199,146,234,0.16);
+    --kom-mid: #9b86bd; --kom-mid-bg: rgba(155,134,189,0.12);
     /* Shape system: one radius per element category, applied everywhere that
        category appears. Circular controls (toggle, arrow-badge, swatch) are
        an intentional exception — they're glyphs/switches, not chips. */
@@ -125,6 +139,23 @@
   }
   .hamburger-btn:hover{ border-color:var(--route); }
   .hamburger-btn svg{ display:block; }
+
+  /* Star/un-star-on-Strava action button — same plain-icon-button vocabulary
+     as .hamburger-btn (asphalt-3 fill, line border, route border on hover)
+     so it reads as a consistent icon-button pattern across the app, just
+     small enough to sit inline among the stat-chips row (see
+     renderStarButton()). .on = currently starred: border/background pick up
+     the same --route "active state" tint .nav-item.active/.dot.on use. */
+  .star-btn{
+    display:flex; align-items:center; justify-content:center;
+    width:30px; height:30px; flex-shrink:0; align-self:center;
+    background: var(--asphalt-3); border:1px solid var(--line); border-radius:var(--r-sm);
+    cursor:pointer; padding:0;
+  }
+  .star-btn:hover{ border-color:var(--route); }
+  .star-btn.on{ border-color:var(--route); background:var(--route-bg); }
+  .star-btn:disabled{ opacity:0.5; cursor:default; }
+  .star-btn svg{ display:block; }
 
   /* Left slide-in nav drawer + backdrop. Both are plain el()-built nodes
      recreated on every render() like the rest of the tree (unlike
@@ -273,6 +304,14 @@
   }
   .stat-chip .v{ font-family:'Space Grotesk', sans-serif; font-size:19px; font-weight:700; line-height:1.1; letter-spacing:-0.01em; color:inherit; }
   .stat-chip .l{ font-family:'IBM Plex Mono', monospace; font-size:9px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:inherit; opacity:0.75; margin-top:2px; }
+  /* Demoted/secondary segment stats (Watt, all-time PR, Hm, × gefahren,
+     effort rank) — one quiet compact line instead of equally-loud hero
+     chips, so only the 1-2 stats computeSegmentStatChips()/
+     computeRideEffortStatChips() picked as `hero` compete for attention.
+     Still visible, just not shouting — same muted mono treatment as
+     .segment .meta, values joined with " · " dividers instead of separate
+     boxes. */
+  .stat-secondary{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); margin-top:7px; line-height:1.5; }
   .tag{
     flex-shrink:0;
     font-family:'IBM Plex Mono', monospace; font-size:11px; font-weight:600;
@@ -356,14 +395,23 @@ function fmtDuration(sec){
   const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = Math.floor(sec%60);
   return h > 0 ? `${h}:${pad2(m)}:${pad2(s)}` : `${m}:${pad2(s)}`;
 }
-// Inverse of fmtDuration(sec) — parses a "M:SS" or "H:MM:SS" duration string
-// (the shape Strava returns for detail.xoms.kom/.qom) back into total
-// seconds. Returns null — never throws, never NaN — for anything that isn't
-// cleanly 2 or 3 numeric, non-negative, colon-separated parts, so callers can
-// skip a delta computation instead of showing garbage.
+// Inverse of fmtDuration(sec) — parses a duration string (the shape Strava
+// returns for detail.xoms.kom/.qom) back into total seconds. Handles the two
+// confirmed formats seen in real usage: colon-separated "M:SS"/"H:MM:SS"
+// (the common case), and bare-seconds-with-"s"-suffix like "27s" (observed
+// for short segments, where Strava apparently skips the "0:27" form
+// entirely). Strava's exact formatting rules aren't documented anywhere this
+// app can query live, so there's no way to confirm every format it might
+// ever use — null remains the safe fallback for anything that isn't one of
+// these two confirmed shapes, so a genuinely unrecognized format degrades to
+// "no delta shown" (see buildXomChip) rather than a wrong delta or a crash.
+// Never throws, never returns NaN.
 function parseDuration(str){
   if(typeof str !== "string") return null;
-  const parts = str.trim().split(":");
+  const trimmed = str.trim();
+  const bareSeconds = trimmed.match(/^(\d+)s$/);
+  if(bareSeconds) return Number(bareSeconds[1]);
+  const parts = trimmed.split(":");
   if(parts.length !== 2 && parts.length !== 3) return null;
   const nums = parts.map(p => p.trim() === "" ? NaN : Number(p));
   if(nums.some(n => !Number.isFinite(n) || n < 0)) return null;
@@ -445,7 +493,18 @@ let state = {
   windFieldPoints: null, // [{lat,lon,windSpeed,windDir}, ...] for the overlay, or null if not (yet) loaded for the current route
   loading: {},
   error: null,
-  authCodeInput: ""
+  authCodeInput: "",
+  // seg.id -> {starred, pending, error} for the star/un-star-on-Strava
+  // action button (see renderStarButton()/toggleSegmentStar()). Keyed
+  // directly by segment id rather than nested under a bucket, since a
+  // Strava segment id is the same real-world segment whether it shows up in
+  // the starred list or the ride-completed list — starring it from either
+  // row means the same thing on Strava's side. `starred` is undefined until
+  // either the segment's own seg.starred field or a successful star action
+  // establishes it (see segmentIsStarred()); `pending` gates the button
+  // while the PUT request is in flight; `error` holds the last failed
+  // attempt's message (cleared on the next attempt).
+  segmentStars: {}
 };
 
 function el(tag, attrs, children){
@@ -1309,6 +1368,27 @@ async function fetchSegmentDetail(id, token){
   return res.json();
 }
 
+// Stars/un-stars a segment on the athlete's actual Strava account (see the
+// star button in renderSegmentRow()/toggleSegmentStar()). Requires the
+// profile:write OAuth scope (see buildAuthUrl()) — a token issued before
+// that scope was added will come back 401/403 here, which is common enough
+// (every existing user's stored token, until they reconnect) that the
+// caller checks for it specifically and shows a "please reconnect" message
+// instead of this function's generic error.
+async function starSegment(segmentId, starred, token){
+  const res = await fetch(`https://www.strava.com/api/v3/segments/${segmentId}/starred`, {
+    method: "PUT",
+    headers:{ "Content-Type":"application/json", Authorization: "Bearer " + token },
+    body: JSON.stringify({ starred })
+  });
+  if(!res.ok){
+    const err = new Error((starred ? "Segment konnte nicht markiert werden" : "Markierung konnte nicht entfernt werden") + " (" + res.status + ")");
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
 // Full activity detail — used for two things: (1) ensureSegmentPrWatts()
 // pulls the average watts of the PR effort out of the activity where that PR
 // was actually set, since the segment endpoint only gives back the PR's
@@ -1372,6 +1452,19 @@ function hamburgerIconSvg(){
     <line x1="1.5" y1="8" x2="14.5" y2="8" stroke="var(--chalk)" stroke-width="1.6" stroke-linecap="round"/>
     <line x1="1.5" y1="12" x2="14.5" y2="12" stroke="var(--chalk)" stroke-width="1.6" stroke-linecap="round"/>
   </svg>`;
+}
+
+// Outline (not starred) vs. filled (starred) star, inline SVG — same
+// zero-icon-dependency approach as hamburgerIconSvg() above. Filled state
+// uses --route, the same "active/selected state" token .dot.on and
+// .nav-item.active already use elsewhere in this file, so "starred" reads as
+// an on/active toggle rather than borrowing the wind-favorability or KOM-
+// closeness color vocabularies.
+function starIconSvg(filled){
+  const path = "M12 2.3 L15.09 8.97 L22.5 9.9 L16.97 14.86 L18.62 22.1 L12 18.2 L5.38 22.1 L7.03 14.86 L1.5 9.9 L8.91 8.97 Z";
+  return filled
+    ? `<svg width="14" height="14" viewBox="0 0 24 24"><path d="${path}" fill="var(--route)" stroke="var(--route)" stroke-width="1.3" stroke-linejoin="round"/></svg>`
+    : `<svg width="14" height="14" viewBox="0 0 24 24"><path d="${path}" fill="none" stroke="var(--chalk-dim)" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
 }
 
 function renderNavDrawer(){
@@ -1442,7 +1535,17 @@ function buildAuthUrl(){
   // Redirect back to this exact page — works because this page now lives at a
   // real, fixed URL (GitHub Pages) instead of localhost.
   const redirectUri = window.location.origin + window.location.pathname;
-  return `https://www.strava.com/oauth/authorize?client_id=${STRAVA_CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(redirectUri)}&approval_prompt=auto&scope=read,activity:read_all,profile:read_all`;
+  // profile:write added for the segment star/un-star button (see
+  // starSegment()) — Strava's scope for starring/unstarring segments and
+  // other profile-level write actions. This is an ADDITIVE change to the
+  // existing comma-separated scope list, not a replacement: every existing
+  // stored refresh token was issued under the old, narrower scope, so it
+  // does NOT carry profile:write — every user (including during testing)
+  // must reconnect/re-authorize once through this URL before the star
+  // button will work; a stale token hitting the starred endpoint fails with
+  // 401/403, which starSegment()'s caller (toggleSegmentStar()) detects and
+  // surfaces as a "please reconnect" message rather than a generic error.
+  return `https://www.strava.com/oauth/authorize?client_id=${STRAVA_CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(redirectUri)}&approval_prompt=auto&scope=read,activity:read_all,profile:read_all,profile:write`;
 }
 
 // File-picker button for GPX import, shared by the connect screen and the
@@ -2431,35 +2534,44 @@ function mountFullRouteView(map, layers, isNewRoute){
   });
 }
 
-// All-time PR time/watts, KOM/QOM, elevation gain, effort count — as
-// {value, label[, style]} pairs (value = the hero numeral, label = the small
-// caption under it), used both in the segment list and the segment map view.
-// This is the starred-segments (bucket.efforts == null) shape, which needs
-// the detail/PR-lookup fetches since it has no single ride to read numbers
-// off of. For the ride-completed-segments bucket (bucket.efforts set, see
-// ensureRideSegments()), computeRideEffortStatChips() below is used instead
-// — it leads with richer, ride-specific stats that are already on hand, no
-// extra lookups needed, then appends the same all-time detail-derived stats
-// built here (bucket.details[seg.id] is fetched for both buckets by
-// loadSegmentExtras(), so no new fetch is needed for the ride case either).
-// Takes a bucket (see segmentBucket()) so callers don't need to know which
-// shape applies.
+// All-time PR time/watts, KOM/QOM, elevation gain, effort count — split into
+// a `hero` list ({value, label[, style]} pairs, rendered as the big
+// hero-numeral .stat-chip boxes) and a `secondary` list (plain strings,
+// rendered as one small muted summary line). Only 1-2 stats get to be
+// hero-sized per the file's WHOOP-inspired "one clearly primary number"
+// hierarchy — flooding 7+ equally-loud chips into one row (the pre-existing
+// behavior here) defeated the point of that hierarchy. For the starred list,
+// the all-time PR is the closest equivalent to "the one number that matters
+// most" (no single ride to anchor on), plus the KOM/QOM delta chips (the
+// actual point of this feature — see buildXomChip) which stay hero-sized in
+// both lists so they read the same way everywhere. Watts, elevation gain and
+// effort count are still shown, just demoted to the quieter summary line —
+// "cleaner", not "less complete". Used both in the segment list and the
+// segment map view. This is the starred-segments (bucket.efforts == null)
+// shape, which needs the detail/PR-lookup fetches since it has no single
+// ride to read numbers off of. For the ride-completed-segments bucket
+// (bucket.efforts set, see ensureRideSegments()), computeRideEffortStatChips()
+// below is used instead — it leads with this ride's own time, then appends
+// the same all-time detail-derived stats built here (bucket.details[seg.id]
+// is fetched for both buckets by loadSegmentExtras(), so no new fetch is
+// needed for the ride case either). Takes a bucket (see segmentBucket()) so
+// callers don't need to know which shape applies.
 function computeSegmentStatChips(seg, bucket){
   if(bucket.efforts) return computeRideEffortStatChips(bucket.efforts[seg.id], bucket.prWatts[seg.id], bucket.details[seg.id]);
   const detail = bucket.details[seg.id];
-  const stats = [];
+  const hero = [], secondary = [];
   if(detail){
     const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
-    if(pr != null) stats.push({value: fmtDuration(pr), label:"PR"});
+    if(pr != null) hero.push({value: fmtDuration(pr), label:"PR"});
     const prWatts = bucket.prWatts[seg.id];
-    if(prWatts) stats.push({value: `${prWatts.measured ? "" : "~"}${prWatts.watts}`, label:"Watt"});
-    if(detail.xoms && detail.xoms.kom) stats.push(buildXomChip(detail.xoms.kom, pr, "KOM"));
-    if(detail.xoms && detail.xoms.qom) stats.push(buildXomChip(detail.xoms.qom, pr, "QOM"));
-    if(detail.total_elevation_gain != null) stats.push({value: `${Math.round(detail.total_elevation_gain)}`, label:"Hm"});
+    if(prWatts) secondary.push(`${prWatts.measured ? "" : "~"}${prWatts.watts} W`);
+    if(detail.xoms && detail.xoms.kom) hero.push(buildXomChip(detail.xoms.kom, pr, "KOM"));
+    if(detail.xoms && detail.xoms.qom) hero.push(buildXomChip(detail.xoms.qom, pr, "QOM"));
+    if(detail.total_elevation_gain != null) secondary.push(`${Math.round(detail.total_elevation_gain)} Hm`);
     const effortCount = detail.athlete_segment_stats && detail.athlete_segment_stats.effort_count;
-    if(effortCount) stats.push({value: `${effortCount}`, label:"× gefahren"});
+    if(effortCount) secondary.push(`${effortCount}× gefahren`);
   }
-  return stats;
+  return {hero, secondary};
 }
 
 // Builds the KOM/QOM stat chip: the record time stays the hero value (.v,
@@ -2477,47 +2589,75 @@ function computeSegmentStatChips(seg, bucket){
 // Shared by computeSegmentStatChips() (starred bucket) and
 // computeRideEffortStatChips() (ride-completed bucket) so the parsing/delta
 // logic lives in one place and the two lists can't drift out of sync.
+//
+// Whenever a delta IS computed, the chip also gets a closeness tint (see
+// --kom-near/--kom-mid in :root) — how close the athlete's PR is to the
+// record, as a PERCENTAGE of the record time (deltaSeconds / xomSeconds),
+// not raw seconds: 10s is huge on a 30s sprint segment but trivial on a
+// 20-minute climb, so the fraction is the fair basis. Within ~5% of the
+// record is the closest/most-prominent tier, within ~15% the milder "getting
+// close" tier, beyond that the chip keeps its plain neutral styling (no
+// style override — statChip() then falls back to the default --route/
+// --route-bg chip look). "On par" (delta <= 0) is treated as the closest
+// possible tier since there's nothing closer than tied-or-ahead.
 function buildXomChip(xomTime, prSeconds, label){
   const xomSeconds = parseDuration(xomTime);
   let chipLabel = label;
+  let style = null;
   if(xomSeconds != null && prSeconds != null){
     const deltaSeconds = prSeconds - xomSeconds;
-    chipLabel = deltaSeconds > 0 ? `${label} +${fmtDuration(deltaSeconds)}` : `${label} GLEICHAUF`;
+    if(deltaSeconds > 0){
+      chipLabel = `${label} +${fmtDuration(deltaSeconds)}`;
+      const closeness = deltaSeconds / xomSeconds;
+      if(closeness <= 0.05) style = "color:var(--kom-near); background:var(--kom-near-bg);";
+      else if(closeness <= 0.15) style = "color:var(--kom-mid); background:var(--kom-mid-bg);";
+    } else {
+      chipLabel = `${label} GLEICHAUF`;
+      style = "color:var(--kom-near); background:var(--kom-near-bg);";
+    }
   }
-  return {value: `${xomTime}`, label: chipLabel};
+  return {value: `${xomTime}`, label: chipLabel, style};
 }
 
-// This ride's own time/watts on the segment, plus a PR/KOM badge when this
-// effort actually was one — pulled straight from the activity's
-// segment_efforts (see ensureRideSegments()), no extra fetches. Ride-specific
-// stats lead (that's the "how did I do on this ride" framing this card
-// exists for), then the same all-time detail-derived stats the starred list
-// shows (all-time PR, KOM/QOM time, elevation gain, effort count) are
-// appended from `detail` — the same bucket.details[seg.id] shape/fetch
-// computeSegmentStatChips() reads from for starred segments, just not read
-// here before. Note effort.kom_rank ("was this specific effort itself in the
-// segment's all-time top 10") and detail.xoms.kom (the segment's current KOM
-// time, e.g. "3:23" — confirmed against the live app, not just docs) are
-// different things and both are shown, not merged.
-// `detail` can be missing (e.g. a failed detail fetch) same as in the
-// starred branch, so every detail-derived chip below is guarded.
+// This ride's own time on the segment, plus the same all-time KOM/QOM delta
+// chips the starred list uses — pulled straight from the activity's
+// segment_efforts (see ensureRideSegments()), no extra fetches. Split into
+// `hero`/`secondary` the same way computeSegmentStatChips() is: this ride's
+// own time (the "how did I do on this ride" framing this card exists for)
+// and the KOM/QOM delta chips are the 1-2 hero numbers; a rare PR on this
+// very effort is folded INTO the Zeit hero chip itself (label becomes
+// "Zeit · PR!", tail-colored) rather than getting its own separate hero
+// chip, since it's just as prominent that way with one fewer box competing
+// for attention. Everything else — watts, this effort's kom_rank ("was this
+// specific effort itself in the segment's all-time top 10" — a different
+// thing from detail.xoms.kom, the segment's current KOM time, and both are
+// still shown, just not merged), all-time PR, elevation gain, effort count —
+// is demoted to the quiet secondary summary line. `detail` can be missing
+// (e.g. a failed detail fetch) same as in the starred branch, so every
+// detail-derived stat below is guarded.
 function computeRideEffortStatChips(effort, prWatts, detail){
-  const stats = [];
-  if(!effort) return stats;
-  if(effort.elapsed_time != null) stats.push({value: fmtDuration(effort.elapsed_time), label:"Zeit"});
-  if(prWatts) stats.push({value: `${prWatts.measured ? "" : "~"}${prWatts.watts}`, label:"Watt"});
-  if(effort.pr_rank === 1) stats.push({value:"PR!", label:"Bestzeit", style:"color:var(--tail); background:var(--tail-bg);"});
-  if(effort.kom_rank) stats.push({value:`${effort.kom_rank}.`, label:"KOM/QOM"});
+  const hero = [], secondary = [];
+  if(!effort) return {hero, secondary};
+  if(effort.elapsed_time != null){
+    const isPr = effort.pr_rank === 1;
+    hero.push({
+      value: fmtDuration(effort.elapsed_time),
+      label: isPr ? "Zeit · PR!" : "Zeit",
+      style: isPr ? "color:var(--tail); background:var(--tail-bg);" : null
+    });
+  }
+  if(prWatts) secondary.push(`${prWatts.measured ? "" : "~"}${prWatts.watts} W`);
+  if(effort.kom_rank) secondary.push(`Platz ${effort.kom_rank} (Effort)`);
   if(detail){
     const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
-    if(pr != null) stats.push({value: fmtDuration(pr), label:"PR"});
-    if(detail.xoms && detail.xoms.kom) stats.push(buildXomChip(detail.xoms.kom, pr, "KOM"));
-    if(detail.xoms && detail.xoms.qom) stats.push(buildXomChip(detail.xoms.qom, pr, "QOM"));
-    if(detail.total_elevation_gain != null) stats.push({value: `${Math.round(detail.total_elevation_gain)}`, label:"Hm"});
+    if(pr != null) secondary.push(`PR ${fmtDuration(pr)}`);
+    if(detail.xoms && detail.xoms.kom) hero.push(buildXomChip(detail.xoms.kom, pr, "KOM"));
+    if(detail.xoms && detail.xoms.qom) hero.push(buildXomChip(detail.xoms.qom, pr, "QOM"));
+    if(detail.total_elevation_gain != null) secondary.push(`${Math.round(detail.total_elevation_gain)} Hm`);
     const effortCount = detail.athlete_segment_stats && detail.athlete_segment_stats.effort_count;
-    if(effortCount) stats.push({value: `${effortCount}`, label:"× gefahren"});
+    if(effortCount) secondary.push(`${effortCount}× gefahren`);
   }
-  return stats;
+  return {hero, secondary};
 }
 
 // diff = 0 means pure tailwind, 180 means pure headwind (see windRelative)
@@ -2543,6 +2683,75 @@ function sortedVisibleSegments(bucket){
     case "tailwind": return list.slice().sort((a,b) => segmentTailwindDiff(a, bucket) - segmentTailwindDiff(b, bucket));
     default: return list;
   }
+}
+
+// Whether `seg` is currently starred on Strava, for the star button's
+// initial icon state. Prefers a successful star action already recorded in
+// state.segmentStars (so the icon reflects what THIS session just did,
+// without waiting on a re-fetch) over the fetched segment detail's own
+// `starred` field (bucket.details[seg.id] — the full DetailedSegment from
+// loadSegmentExtras(), which reliably carries `starred` unlike the summary
+// shapes some segment lists are built from) over the bare seg.starred on
+// the summary object itself, which may be present or absent depending on
+// which endpoint/response shape a given segment came from (starred-segments
+// list vs. segment detail vs. an activity's segment_efforts). When none of
+// those resolve it, default to "not starred" rather than guess, and let a
+// successful star action flip it.
+function segmentIsStarred(seg, bucket){
+  const known = state.segmentStars[seg.id];
+  if(known && known.starred != null) return known.starred;
+  const detail = bucket && bucket.details[seg.id];
+  if(detail && detail.starred != null) return detail.starred;
+  return seg.starred === true;
+}
+
+// Stars/un-stars `seg` on the athlete's Strava account via starSegment().
+// Shared by both segment lists (see renderStarButton() below) since a
+// Strava segment id means the same real segment regardless of which list's
+// row triggered this — starring from "Abgeschlossene Segmente" is exactly
+// as valid an action as starring from "Meine Segmente". Deliberately does
+// NOT try to add/remove `seg` from state.segments (the starred-list bucket)
+// on success — that list is still exclusively driven by
+// fetchStarredSegments(), so a freshly-starred segment only shows up there
+// after the next fetch/reconnect, same as today.
+async function toggleSegmentStar(seg, bucket){
+  const prior = state.segmentStars[seg.id] || {};
+  if(prior.pending) return;
+  const nextStarred = !segmentIsStarred(seg, bucket);
+  state.segmentStars[seg.id] = { starred: prior.starred, pending: true, error: null };
+  render();
+  try{
+    await starSegment(seg.id, nextStarred, state.accessToken);
+    state.segmentStars[seg.id] = { starred: nextStarred, pending: false, error: null };
+  }catch(e){
+    const reconnectNeeded = e.status === 401 || e.status === 403;
+    state.segmentStars[seg.id] = {
+      starred: prior.starred,
+      pending: false,
+      error: reconnectNeeded
+        ? "Strava hat die Berechtigung zum Markieren verweigert — bitte trenne die Verbindung und verbinde dich neu mit Strava, um die neue Berechtigung zu erteilen."
+        : (e.message || "Markieren fehlgeschlagen.")
+    };
+  }
+  render();
+}
+
+// Star icon button for renderSegmentRow(), placed inline in the stat-chips
+// row (per the task brief: "one of the chips, or an icon button near them").
+// ev.stopPropagation() keeps a click here from also bubbling up into the
+// row's own onclick (selectSegment() — clicking the row navigates into the
+// segment's map detail view, an unrelated action this button must not
+// trigger).
+function renderStarButton(seg, bucket){
+  const st = state.segmentStars[seg.id] || {};
+  const starred = segmentIsStarred(seg, bucket);
+  return el("button", {
+    class: "star-btn" + (starred ? " on" : ""),
+    type: "button",
+    "aria-label": starred ? "Segment auf Strava demarkieren" : "Segment auf Strava markieren",
+    disabled: st.pending ? "disabled" : null,
+    onclick: (ev)=>{ ev.stopPropagation(); toggleSegmentStar(seg, bucket); }
+  }, [el("span", {html: starIconSvg(starred)})]);
 }
 
 // Renders a single segment "card" (icon, name, distance/grade, wind tag,
@@ -2586,11 +2795,24 @@ function renderSegmentRow(seg, bucket, opts){
   const top = el("div", {class:"top"}, [left, el("div", {class:"tag " + tagClass}, [tagText])]);
   row.appendChild(top);
 
+  // Hero-numeral chips (1-2 stats — PR/Zeit + KOM/QOM delta, see
+  // computeSegmentStatChips()/computeRideEffortStatChips()) plus the star
+  // button always render together in one row, even when there are no hero
+  // chips yet (detail still loading) — the star action should stay
+  // discoverable regardless of fetch state. Everything else demoted to
+  // `secondary` renders as one quiet compact line underneath instead of
+  // more equally-sized chip boxes.
   const stats = computeSegmentStatChips(seg, bucket);
-  if(stats.length){
-    const chips = el("div", {class:"stat-chips"});
-    stats.forEach(s => chips.appendChild(statChip(s.value, s.label, s.style)));
-    row.appendChild(chips);
+  const chips = el("div", {class:"stat-chips"});
+  stats.hero.forEach(s => chips.appendChild(statChip(s.value, s.label, s.style)));
+  chips.appendChild(renderStarButton(seg, bucket));
+  row.appendChild(chips);
+  if(stats.secondary.length){
+    row.appendChild(el("div", {class:"stat-secondary"}, [stats.secondary.join(" · ")]));
+  }
+  const starError = state.segmentStars[seg.id] && state.segmentStars[seg.id].error;
+  if(starError){
+    row.appendChild(el("div", {class:"error", style:"margin-top:8px;"}, [starError]));
   }
 
   return row;
