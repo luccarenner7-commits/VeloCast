@@ -326,21 +326,6 @@
   .wind-mix-stat .l{ font-family:'IBM Plex Mono', monospace; font-size:10px; color:var(--chalk-dim); margin-top:4px; text-transform:uppercase; letter-spacing:0.04em; }
   .wind-mix-bar{ display:flex; height:8px; border-radius:var(--r-full); overflow:hidden; background:var(--asphalt-3); }
 
-  /* Chunked segments/explore fetch progress (Task 3's "Segmente laden"
-     loading state) — deliberately understated: a thin pill track/fill in the
-     same family as .wind-mix-bar above (asphalt-3 track, --route neutral
-     info-accent fill, NOT a wind-favorability color since finding segments
-     isn't a wind judgment), plus an exact count label rather than a vague
-     spinner, so it reads as connected to the specific button/card it's
-     reporting progress for rather than a generic top-of-page loader. The
-     fill's width transition is real animated motion (communicates chunks
-     completing) and — like every other transition in this file — collapses
-     to an instant jump under the file-wide prefers-reduced-motion rule below. */
-  .route-segments-progress{ margin-top:2px; }
-  .route-segments-progress-track{ height:4px; border-radius:var(--r-full); overflow:hidden; background:var(--asphalt-3); }
-  .route-segments-progress-fill{ height:100%; border-radius:var(--r-full); background:var(--route); transition:width 0.3s ease; }
-  .route-segments-progress-label{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); margin-top:8px; }
-
   @media (prefers-reduced-motion: reduce){ * { transition:none !important; } }
 </style>
 </head>
@@ -393,39 +378,44 @@ let state = {
   segmentSortBy: "default",
   selectedSegmentId: null, // when set, the map shows this segment instead of the full route
   selectedSegmentSource: null, // "starred" | "route" - which of the two segment buckets selectedSegmentId belongs to
-  // "Segmente auf der Strecke" (Task 3): segments found via Strava's public
-  // segment-explore API along the currently selected route, kept in a
-  // separate parallel bucket from the user's starred segments above so the
-  // two sources never overwrite each other's weather/details/PR-watts data.
+  // "Abgeschlossene Segmente": segments the athlete actually rode and
+  // completed on the currently selected Strava ACTIVITY (a genuine past
+  // ride), read straight from that activity's own segment_efforts (see
+  // ensureRideSegments()/fetchActivityDetail()) — NOT a geographic guess at
+  // segments merely near the route's path (that's what this used to be;
+  // replaced because it answered the wrong question). Kept in a separate
+  // parallel bucket from the user's starred segments above so the two
+  // sources never overwrite each other's weather/details/PR-watts data (see
+  // segmentBucket()).
   routeSegments: [],
   routeSegmentWeather: {},
   routeSegmentDetails: {},
   routeSegmentPrWatts: {},
-  // True once a "Segmente laden" fetch has completed for the CURRENT route
-  // AND produced a usable result (all chunks succeeded, or some did) — gates
-  // whether renderRouteSegmentsCard() shows the manual button or the
-  // (possibly empty, possibly partial) result list. Distinct from
-  // routeSegments.length, since a completed fetch with zero matches must
-  // still show "keine gefunden", not the button again. Deliberately stays
-  // false when EVERY chunk of a fetch attempt failed (see
-  // ensureRouteSegments()), so a hard failure re-shows the button for a
-  // retry instead of falling through to "keine gefunden". Reset to false by
-  // resetRouteSegments() whenever a new route/activity/GPX is selected, so
-  // the button reappears for the new route instead of auto-fetching.
+  // seg.id -> this specific ride's DetailedSegmentEffort (elapsed_time,
+  // average_watts, pr_rank, kom_rank, …) for that segment — the richer,
+  // ride-specific numbers computeSegmentStatChips() prefers over the
+  // all-time-PR lookup the starred-segments bucket uses, since we already
+  // have them from the single activity-detail fetch. See
+  // ensureRideSegments().
+  routeSegmentEfforts: {},
+  // True once a "Segmente laden" fetch has completed for the CURRENTLY
+  // selected activity (success — even a genuine "no segments on this ride"
+  // empty result — or failure) — gates whether renderRouteSegmentsCard()
+  // shows the manual button or the result list. Left false on failure (see
+  // ensureRideSegments()) so the button reappears for a retry instead of
+  // falling through to "keine Segmente". Reset to false by
+  // resetRouteSegments() whenever a new activity/route/GPX is selected, so
+  // the button reappears for the new selection instead of auto-fetching.
   routeSegmentsFetched: false,
-  // Route-segments-fetch-specific error, kept separate from the generic
-  // state.error above (which only ever renders on the GPX tab, see
-  // renderGpxUploadRow()) so a failed "Segmente laden" fetch is actually
-  // visible to the user regardless of which tab/page they're on, and so it
-  // can't linger stale into unrelated later views. Set at the end of
-  // ensureRouteSegments() — either a hard-failure message (every chunk
-  // failed, routeSegmentsFetched left false) or a milder partial-coverage
-  // note (some chunks failed, routeSegmentsFetched still set true since real
-  // results did come back) — or in its outer catch for failures outside the
-  // per-chunk loop. Cleared both by resetRouteSegments() (route change) and
-  // at the start of every ensureRouteSegments() run (retry). Rendered by
-  // renderRouteSegmentsCard(), which uses routeSegmentsFetched to tell the
-  // hard-failure and partial-failure cases apart.
+  // Fetch-specific error, kept separate from the generic state.error above
+  // (which only ever renders on the GPX tab, see renderGpxUploadRow()) so a
+  // failed "Segmente laden" fetch is actually visible to the user regardless
+  // of which tab/page they're on, and so it can't linger stale into
+  // unrelated later views. Set by ensureRideSegments() on failure (bad
+  // token, rate limit, network error — now just a single binary
+  // success/failure outcome, no more partial-coverage case since there's
+  // only one API call). Cleared both by resetRouteSegments() (new selection)
+  // and at the start of every ensureRideSegments() run (retry).
   routeSegmentsError: null,
   navOpen: false, // left slide-in nav drawer open/closed
   activePage: "route", // "route" | "segments" - which NAV_ITEMS entry is active
@@ -1303,28 +1293,19 @@ async function fetchSegmentDetail(id, token){
   return res.json();
 }
 
-// Full activity detail — used to pull the average watts of the PR effort,
-// since the segment endpoint only gives back the PR's activity id, not the
-// effort's power data itself.
+// Full activity detail — used for two things: (1) ensureSegmentPrWatts()
+// pulls the average watts of the PR effort out of the activity where that PR
+// was actually set, since the segment endpoint only gives back the PR's
+// activity id, not the effort's power data itself; (2) ensureRideSegments()
+// reads this SAME response's `segment_efforts` array to find exactly which
+// segments the athlete completed on THIS ride, with this ride's own
+// elapsed_time/watts/pr_rank/kom_rank per effort — no separate endpoint
+// needed for that.
 async function fetchActivityDetail(activityId, token){
   const res = await fetch(`https://www.strava.com/api/v3/activities/${activityId}`, {
     headers:{ Authorization: "Bearer " + token }
   });
   if(!res.ok) throw new Error("Aktivität nicht verfügbar (" + res.status + ")");
-  return res.json();
-}
-
-// Strava's public segment database, bbox-scoped (see computeRouteExploreBboxes
-// / ensureRouteSegments below for how the route gets chunked into several of
-// these calls). Distinct from fetchStarredSegments — this surfaces segments
-// the athlete hasn't necessarily starred/ridden, anywhere Strava considers
-// "popular" within the given rectangle.
-async function fetchSegmentExplore(bbox, token){
-  const bounds = `${bbox.swLat.toFixed(5)},${bbox.swLon.toFixed(5)},${bbox.neLat.toFixed(5)},${bbox.neLon.toFixed(5)}`;
-  const res = await fetch(`https://www.strava.com/api/v3/segments/explore?bounds=${bounds}&activity_type=riding`, {
-    headers:{ Authorization: "Bearer " + token }
-  });
-  if(!res.ok) throw new Error("Segmente konnten nicht geladen werden (" + res.status + ")");
   return res.json();
 }
 
@@ -1522,17 +1503,18 @@ async function loadActivitiesAndSegments(){
   render();
 }
 
-// Bundles a segment source's four parallel state fields (list + weather +
-// details + PR-watts) into one object, so the segment-rendering pipeline
-// (renderSegmentRow, computeSegmentStatChips, ensureSegmentPrWatts, etc.) can
-// operate identically on either the user's starred segments or the
-// route-explore segments (Task 3) without duplicating ~150 lines of rendering
-// logic per source. "starred" == today's Markierte Segmente / state.segments;
-// "route" == the new Segmente-auf-der-Strecke / state.routeSegments.
+// Bundles a segment source's parallel state fields (list + weather + details
+// + PR-watts [+ ride-effort stats for the "route" bucket]) into one object,
+// so the segment-rendering pipeline (renderSegmentRow, computeSegmentStatChips,
+// ensureSegmentPrWatts, etc.) can operate identically on either the user's
+// starred segments or the ride-completed segments without duplicating ~150
+// lines of rendering logic per source. "starred" == Markierte Segmente /
+// state.segments (all-time PR data); "route" == Abgeschlossene Segmente /
+// state.routeSegments (this-ride effort data, see `efforts`).
 function segmentBucket(source){
   return source === "route"
-    ? { source, list: state.routeSegments, weather: state.routeSegmentWeather, details: state.routeSegmentDetails, prWatts: state.routeSegmentPrWatts }
-    : { source: "starred", list: state.segments, weather: state.segmentWeather, details: state.segmentDetails, prWatts: state.segmentPrWatts };
+    ? { source, list: state.routeSegments, weather: state.routeSegmentWeather, details: state.routeSegmentDetails, prWatts: state.routeSegmentPrWatts, efforts: state.routeSegmentEfforts }
+    : { source: "starred", list: state.segments, weather: state.segmentWeather, details: state.segmentDetails, prWatts: state.segmentPrWatts, efforts: null };
 }
 
 // True while the map should be showing a single segment's detail view
@@ -1550,32 +1532,32 @@ function isShowingSegmentDetail(){
   return false;
 }
 
-// Clears the route-explore segment bucket (Task 3) — called wherever the
-// underlying route identity changes (new activity/route/GPX selected), same
-// set of call sites as the existing elevationProfile/windFieldPoints resets
-// below, since a previous route's nearby-segments list has no meaning for a
-// newly selected route. Also drops the current selection if it pointed at a
-// route-explore segment that's about to be wiped out from under it.
-// Deliberately does NOT call ensureRouteSegments() — this only clears the
-// cache back to the "Segmente laden" button state; fetching a fresh route's
-// segments is exclusively user-triggered (see renderRouteSegmentsCard()),
-// never automatic, since it's a multi-request operation.
+// Clears the ride-completed-segments bucket — called wherever the underlying
+// selection changes (new activity/route/GPX selected), same set of call
+// sites as the existing elevationProfile/windFieldPoints resets below, since
+// a previous ride's completed-segments list has no meaning for a newly
+// selected activity/route/GPX. Also drops the current selection if it
+// pointed at a ride segment that's about to be wiped out from under it.
+// Deliberately does NOT call ensureRideSegments() — this only clears the
+// cache back to the "Segmente laden" button state; fetching a fresh
+// activity's segments is exclusively user-triggered (see
+// renderRouteSegmentsCard()), never automatic.
 function resetRouteSegments(){
-  // Bumps the generation counter so any ensureRouteSegments() loop still
-  // in flight for the PREVIOUS route (mid-await when this reset fires)
-  // recognizes on its next state-writing step that it's stale and bails
-  // out silently instead of writing its (now-meaningless) results/errors/
-  // progress on top of whatever route is current now. See the comment on
-  // routeSegmentsGeneration below for the full mechanism.
+  // Bumps the generation counter so an ensureRideSegments() call still in
+  // flight for the PREVIOUS selection (mid-await when this reset fires)
+  // recognizes on its next state-writing step that it's stale and bails out
+  // silently instead of writing its (now-meaningless) results/errors on top
+  // of whatever selection is current now. See the comment on
+  // routeSegmentsGeneration for the full mechanism.
   routeSegmentsGeneration++;
   state.routeSegments = [];
   state.routeSegmentWeather = {};
   state.routeSegmentDetails = {};
   state.routeSegmentPrWatts = {};
+  state.routeSegmentEfforts = {};
   state.routeSegmentsFetched = false;
   state.routeSegmentsError = null;
   state.loading.routeSegments = false;
-  state.loading.routeSegmentsProgress = null;
   if(state.selectedSegmentSource === "route"){
     state.selectedSegmentId = null;
     state.selectedSegmentSource = null;
@@ -1600,9 +1582,9 @@ async function selectActivity(activity){
   const cumDist = buildCumulativeDistances(coords);
   state.routePoints = pickRoutePoints(coords, cumDist, state.routePointDistanceKm);
   render();
-  // Deliberately NOT calling ensureRouteSegments() here — Task 3 is
-  // explicitly user-triggered only (see renderRouteSegmentsCard()'s
-  // "Segmente laden" button), never automatic on route selection.
+  // Deliberately NOT calling ensureRideSegments() here — explicitly
+  // user-triggered only (see renderRouteSegmentsCard()'s "Segmente laden"
+  // button), never automatic on activity selection.
   await loadRouteWeather();
 }
 
@@ -1654,7 +1636,9 @@ async function selectStravaRoute(route){
   }
   state.fullRouteCoords = decodePolyline(poly);
   recomputeRoutePoints();
-  // Deliberately NOT calling ensureRouteSegments() here, see selectActivity().
+  // Deliberately NOT calling ensureRideSegments() here, see selectActivity()
+  // — also a no-op anyway, since this is a planned route (isRoute:true) with
+  // no completed segments to fetch (see ensureRideSegments()'s own guard).
 }
 
 // ---------- GPX import ----------
@@ -1699,9 +1683,11 @@ async function loadGpxFile(file){
     ? { distances: buildCumulativeDistances(track.coords), elevations: track.eles }
     : { distances: [], elevations: [] };
   recomputeRoutePoints();
-  // Deliberately NOT calling ensureRouteSegments() here, see selectActivity().
-  // (If not connected, the card shows a neutral connect hint instead of the
-  // button anyway — see renderRouteSegmentsCard().)
+  // Deliberately NOT calling ensureRideSegments() here, see selectActivity()
+  // — also a no-op anyway, since a GPX file (isGpx:true) has no completed
+  // segments to fetch (see ensureRideSegments()'s own guard). The card shows
+  // the explanatory message instead of the button in this case either way —
+  // see renderRouteSegmentsCard().
 }
 
 async function loadRouteWeather(){
@@ -1728,7 +1714,11 @@ async function loadRouteWeather(){
 // effort count) for a list of segments into the given bucket's weather/
 // details maps. Shared by both segment sources (see segmentBucket()) — the
 // starred-segments flow calls this from loadActivitiesAndSegments(), the
-// route-explore flow from ensureRouteSegments() below.
+// ride-completed-segments flow from ensureRideSegments() below. For the
+// ride-completed bucket the `details` fetched here still matters even
+// though computeSegmentStatChips() prefers the richer per-ride effort data
+// for its stat chips — mountSegmentView() needs detail.map.polyline to draw
+// the segment's own path when it's clicked into the map detail view.
 async function loadSegmentExtras(list, bucket){
   for(const seg of list.slice(0, 12)){
     if(seg.start_latlng){
@@ -1769,286 +1759,99 @@ async function ensureSegmentPrWatts(seg, bucket){
   render();
 }
 
-// ---------- "Segmente auf der Strecke" (Task 3): Strava public segment
-// database via segments/explore, matched against the current route ----------
-// segments/explore is bbox-based, caps results per call (historically ~10),
-// and has no idea what the route's actual path looks like — a single call
-// over the whole route's bounding box would both miss segments (long/winding
-// routes) and surface segments that are just "somewhere in that rectangle",
-// nowhere near the actual path. So the route gets sliced into several
-// smaller bboxes along its length instead (one explore call each, capped),
-// results are deduped by id, then filtered down to segments whose actual
-// path (not just its start point) genuinely runs close to the route.
-//
-// CHUNK_KM/MAX_CALLS were tightened from 8km/8 calls to 4km/15 calls: the
-// ~10-result cap on each explore call means a segment-dense chunk (a popular
-// climbing region, a city) can silently drop segments beyond the cap, and
-// since this whole fetch is on-demand (behind the "Segmente laden" button,
-// never automatic) there's headroom to trade a few more seconds of load time
-// for denser sampling — see computeRouteExploreBboxes()'s comment for the
-// contiguous-coverage math at these new numbers.
-const ROUTE_SEGMENT_CHUNK_KM = 4;      // target route-length per bbox chunk (short routes)
-const ROUTE_SEGMENT_MAX_CALLS = 15;    // hard cap on explore API calls per route
-const ROUTE_SEGMENT_BBOX_PAD_DEG = 0.01; // ~1.1km padding so segments right at a chunk's edge aren't missed
-const ROUTE_SEGMENT_BUFFER_KM = 0.3;   // proximity buffer (~300m) to the route's path for the final path-relevance filter
+// ---------- "Abgeschlossene Segmente": segments actually ridden on the
+// currently selected Strava ACTIVITY, read from that activity's own
+// segment_efforts ----------
+// This used to guess at nearby segments geographically (chunking the route
+// into bounding boxes, calling Strava's public segments/explore per chunk,
+// then proximity-matching each candidate's polyline against the route). That
+// answered the wrong question: it surfaced segments merely near the path,
+// not segments the athlete actually rode. Strava's activity detail endpoint
+// (fetchActivityDetail(), already used elsewhere for PR-watts lookups)
+// already returns exactly the right data in `segment_efforts` — one entry
+// per segment the rider covered on that specific ride, complete with
+// ride-specific stats (elapsed_time, average_watts, pr_rank, kom_rank) — so
+// no exploration or matching is needed at all, just one direct fetch.
+// This only makes sense for a genuine past ride, not a planned/saved route
+// or an uploaded GPX file — nothing has been "completed" on those.
 
-// Splits the route into up to ROUTE_SEGMENT_MAX_CALLS bounding boxes along
-// its length. Short routes (<= ROUTE_SEGMENT_MAX_CALLS * ROUTE_SEGMENT_CHUNK_KM,
-// i.e. <= 60km at the current 4km/15-call settings) get one ~ROUTE_SEGMENT_
-// CHUNK_KM-wide, fine-grained chunk every CHUNK_KM. Longer routes are capped
-// at ROUTE_SEGMENT_MAX_CALLS chunks, but each chunk is WIDENED to totalKm /
-// chunkCount so the capped number of bboxes still together span the FULL
-// route length with (approximately) contiguous, gapless coverage — e.g. a
-// 150km route gets 15 bboxes of exactly 10km each covering all 150km, not 15
-// narrow 4km windows with big unqueried gaps between them. A short ~20km
-// route stays at the full 4km density (5 chunks, no widening needed).
-function computeRouteExploreBboxes(coords){
-  if(coords.length < 2) return [];
-  const cumDist = buildCumulativeDistances(coords);
-  const totalKm = cumDist[cumDist.length - 1] || 0;
-  if(totalKm <= 0) return [];
-
-  const rawChunkCount = Math.max(1, Math.ceil(totalKm / ROUTE_SEGMENT_CHUNK_KM));
-  const chunkCount = Math.min(rawChunkCount, ROUTE_SEGMENT_MAX_CALLS);
-  // Width per chunk: at least the CHUNK_KM target (so short/uncapped routes
-  // stay fine-grained), but widened whenever capping to chunkCount would
-  // otherwise leave gaps — i.e. whenever totalKm / chunkCount > CHUNK_KM.
-  const chunkKm = Math.max(ROUTE_SEGMENT_CHUNK_KM, totalKm / chunkCount);
-
-  const bboxes = [];
-  for(let i=0;i<chunkCount;i++){
-    const fromKm = i * chunkKm;
-    const toKm = (i === chunkCount - 1) ? totalKm : Math.min(totalKm, (i + 1) * chunkKm);
-    let lats = [], lons = [];
-    for(let k=0;k<coords.length;k++){
-      if(cumDist[k] >= fromKm - 1e-9 && cumDist[k] <= toKm + 1e-9){
-        lats.push(coords[k][0]); lons.push(coords[k][1]);
-      }
-    }
-    if(!lats.length) continue;
-    bboxes.push({
-      swLat: Math.min(...lats) - ROUTE_SEGMENT_BBOX_PAD_DEG,
-      swLon: Math.min(...lons) - ROUTE_SEGMENT_BBOX_PAD_DEG,
-      neLat: Math.max(...lats) + ROUTE_SEGMENT_BBOX_PAD_DEG,
-      neLon: Math.max(...lons) + ROUTE_SEGMENT_BBOX_PAD_DEG
-    });
-  }
-  return bboxes;
-}
-
-// Walks route coordinates by cumulative distance, emitting one coordinate
-// every stepKm — same walking pattern as pickRoutePoints() above, but
-// deliberately NOT calling it: pickRoutePoints() has its own internal
-// `Math.max(1, stepKm)` floor, which is correct for its other caller (the
-// weather-sampling "Punktabstand" point selection, minimum 5km) but would
-// silently clamp the sub-1km step this proximity sampler needs down to 1km.
-// This is a small standalone copy of the walk instead, with its own floor
-// (0.001km) that only guards against a zero/negative stepKm, not a real
-// minimum-spacing floor. Only used by sampleRouteCoordsForProximity() below;
-// pickRoutePoints() itself and its other call sites are untouched.
-function sampleCoordsByDistance(coords, cumDist, stepKm){
-  if(coords.length < 2) return coords.slice();
-  const step = Math.max(0.001, stepKm);
-  const totalDistance = cumDist[cumDist.length - 1] || 0;
-  const points = [];
-  let targetDistance = 0;
-  let idx = 0;
-  let lastDist = -1;
-  while(targetDistance <= totalDistance + 1e-9){
-    while(idx < cumDist.length - 1 && cumDist[idx] < targetDistance) idx++;
-    points.push(coords[idx]);
-    lastDist = cumDist[idx];
-    targetDistance += step;
-  }
-  if(lastDist < totalDistance - 1e-6){
-    points.push(coords[coords.length - 1]);
-  }
-  return points;
-}
-
-// Builds a reasonably dense, but bounded, sample of the route's coordinates
-// for the path-vs-path proximity check in segmentMatchesRoute() below.
-// state.routePoints (used for weather sampling) defaults to one point every
-// 10km+ and is user-configurable even sparser — nowhere near dense enough for
-// a ~300m buffer check, so this builds its own sample instead, via
-// sampleCoordsByDistance() (see its comment for why this can't just reuse
-// pickRoutePoints()). Step size is at least 150m (well under the 300m
-// buffer, so no real gap in coverage for typical routes), but grows for very
-// long routes so the total sample count stays capped around ~800 points
-// regardless of route length — e.g. a 120km route samples every 150m (~800
-// points), a 240km route every ~300m (still ~800 points), keeping the
-// proximity check below bounded no matter how long or how many raw GPS
-// points the route has.
-function sampleRouteCoordsForProximity(coords){
-  if(coords.length < 2) return coords.slice();
-  const cumDist = buildCumulativeDistances(coords);
-  const totalKm = cumDist[cumDist.length - 1] || 0;
-  if(totalKm <= 0) return coords.slice(0, 1);
-  const stepKm = Math.max(0.15, totalKm / 800);
-  return sampleCoordsByDistance(coords, cumDist, stepKm);
-}
-
-// Path-relevance check for one candidate segment against the (sampled) route
-// coordinates: true if ANY point along the segment's actual path is within
-// ROUTE_SEGMENT_BUFFER_KM of ANY sampled route point — a real path-vs-path
-// check, not just "does the segment's start point sit near the route".
-// segments/explore returns a `points` encoded polyline per segment (same
-// format decodePolyline() already handles for activity/route polylines), so
-// most segments get the full path check. The segment's own polyline is also
-// downsampled (every few points, capped around 40 samples) — a segment's
-// polyline can run to hundreds of points for a long climb, and checking
-// every single one against every sampled route point isn't needed for a
-// 300m buffer to still catch a real match; this mirrors the same
-// "reduced/sampled points are good enough at this buffer size" approximation
-// used for weather sampling and wind-tag classification elsewhere in this
-// file. The segment's last point is always checked too (even if the stride
-// would otherwise skip past it) so a segment that only touches the route
-// right at its very end isn't missed.
-// Falls back to start_latlng/end_latlng proximity (the old behavior) if
-// `points` is missing or fails to decode, rather than dropping the segment
-// or throwing.
-function segmentMatchesRoute(segment, routeSampleCoords){
-  let segCoords = null;
-  if(segment.points){
-    try{ segCoords = decodePolyline(segment.points); }catch(e){ segCoords = null; }
-  }
-  if(segCoords && segCoords.length){
-    const stride = Math.max(1, Math.ceil(segCoords.length / 40));
-    for(let i = 0; i < segCoords.length; i += stride){
-      if(routeSampleCoords.some(c => haversineKm(c, segCoords[i]) <= ROUTE_SEGMENT_BUFFER_KM)) return true;
-    }
-    const last = segCoords[segCoords.length - 1];
-    if(routeSampleCoords.some(c => haversineKm(c, last) <= ROUTE_SEGMENT_BUFFER_KM)) return true;
-    return false;
-  }
-  const fallbackPoints = [segment.start_latlng, segment.end_latlng].filter(Boolean);
-  return fallbackPoints.some(pt => routeSampleCoords.some(c => haversineKm(c, pt) <= ROUTE_SEGMENT_BUFFER_KM));
-}
-
-// Bumped by resetRouteSegments() every time the underlying route identity
-// changes (new activity/route/GPX selected). ensureRouteSegments() captures
-// this value at the start of its run; if it no longer matches by the time an
-// await resolves, a reset happened mid-flight and the in-progress fetch is
-// for a route that's no longer current — see ensureRouteSegments() for how
-// each state-writing step checks this before touching state.
+// Bumped by resetRouteSegments() every time the underlying selection changes
+// (new activity/route/GPX). ensureRideSegments() captures this value at the
+// start of its run; if it no longer matches by the time its one await
+// resolves, a reset happened mid-flight and the in-progress fetch is for a
+// selection that's no longer current — see ensureRideSegments() for how each
+// state-writing step checks this before touching state.
 let routeSegmentsGeneration = 0;
 
-// Fetches + filters segments along the current route into state.routeSegments.
-// EXPLICITLY USER-TRIGGERED ONLY — called from the "Segmente laden" button in
-// renderRouteSegmentsCard(), never automatically on route selection, since
-// this is a potentially slow, multi-request (chunked bbox) operation. No-ops
-// when not connected or already loading; renderRouteSegmentsCard() shows a
-// neutral connect hint instead of the button when not connected, since the
-// explore endpoint needs an access token and has no meaning for a GPX-only
-// route.
-async function ensureRouteSegments(){
-  if(!state.connected || !state.fullRouteCoords.length) return;
+// Fetches the segments actually completed on the currently selected
+// activity into state.routeSegments (+ their per-ride effort stats into
+// state.routeSegmentEfforts). EXPLICITLY USER-TRIGGERED ONLY — called from
+// the "Segmente laden" button in renderRouteSegmentsCard(), never
+// automatically on activity selection (kept from the old design; still the
+// right call even though this is now a single fast request rather than a
+// slow chunked one). No-ops when not connected, no activity is selected, or
+// the selection isn't a genuine ridden activity (a planned route or GPX file
+// has no segment_efforts — renderRouteSegmentsCard() shows an explanatory
+// message instead of the button in that case, so this shouldn't normally
+// even be reachable then).
+async function ensureRideSegments(){
+  const activity = state.selectedActivity;
+  if(!state.connected || !activity || activity.isRoute || activity.isGpx) return;
   if(state.loading.routeSegments) return;
   // Captured once, up front — see routeSegmentsGeneration's comment. Every
   // point below that's about to write state.routeSegments*/state.loading.
-  // routeSegments* re-checks this against the live counter first, and bails
+  // routeSegments re-checks this against the live counter first, and bails
   // out silently (no state writes, no render()) the moment they diverge,
   // since a diverging counter means resetRouteSegments() already ran for a
-  // newer route and put state back to "not fetched" for it — this stale run
-  // must never overwrite that.
+  // newer selection and put state back to "not fetched" for it — this stale
+  // run must never overwrite that.
   const myGeneration = routeSegmentsGeneration;
-  const bboxes = computeRouteExploreBboxes(state.fullRouteCoords);
   state.loading.routeSegments = true;
-  // Progress for the "Segmente laden" loading indicator — total is known
-  // upfront (one call per bbox chunk), done increments as each chunk
-  // completes (success or failure), so the progress bar/label in
-  // renderRouteSegmentsCard() can show real "X / Y Kartenausschnitte
-  // geprüft" progress rather than an indeterminate spinner.
-  state.loading.routeSegmentsProgress = { done: 0, total: bboxes.length };
   // Clear out any error left over from a previous failed attempt at this
-  // same route (retry via the "Segmente laden" button) so it doesn't linger
-  // stale alongside — or instead of — this run's own outcome. Guarded the
-  // same way as every other state-writing step here, even though nothing
-  // async has happened yet at this point.
+  // same activity (retry via the "Segmente laden" button) so it doesn't
+  // linger stale alongside — or instead of — this run's own outcome.
   if(myGeneration === routeSegmentsGeneration) state.routeSegmentsError = null;
   render();
   try{
-    const seen = new Map();
-    // Per-chunk outcome bookkeeping: fetchSegmentExplore() throws on any
-    // non-ok response (expired token, missing scope, rate limiting — all
-    // realistic), and the per-chunk catch below deliberately swallows that
-    // so one bad chunk doesn't abort the rest of the route. But swallowing
-    // it silently would mean a total failure (every chunk down, e.g. an
-    // expired token) looks identical to "genuinely found nothing" — these
-    // counts are how the code tells the two apart once the loop finishes.
-    let failedChunks = 0;
-    let succeededChunks = 0;
-    for(const bbox of bboxes){
-      try{
-        const data = await fetchSegmentExplore(bbox, state.accessToken);
-        if(myGeneration !== routeSegmentsGeneration) return;
-        succeededChunks++;
-        (data.segments || []).forEach(s=>{
-          if(!seen.has(s.id)) seen.set(s.id, s);
-        });
-      }catch(e){
-        if(myGeneration !== routeSegmentsGeneration) return;
-        failedChunks++;
-        // one chunk failing shouldn't block the rest of the route
-      }
-      if(myGeneration !== routeSegmentsGeneration) return;
-      state.loading.routeSegmentsProgress = { done: state.loading.routeSegmentsProgress.done + 1, total: bboxes.length };
-      render();
-    }
+    const data = await fetchActivityDetail(activity.id, state.accessToken);
     if(myGeneration !== routeSegmentsGeneration) return;
-    // Path-relevance filter: keep only segments whose actual path runs close
-    // to SOME point on the actual route, not merely inside one of the
-    // (rectangular, path-agnostic) bboxes above. See segmentMatchesRoute()
-    // for the path-vs-path check (falls back to start/end-point proximity if
-    // a segment has no usable `points` polyline) and
-    // sampleRouteCoordsForProximity() for how the route side is sampled.
-    const routeSampleCoords = sampleRouteCoordsForProximity(state.fullRouteCoords);
-    const near = [...seen.values()].filter(s =>
-      segmentMatchesRoute(s, routeSampleCoords)
-    ).map(s => ({
-      // segments/explore returns `avg_grade`, while the starred-segments /
-      // segment-detail endpoints use `average_grade` — normalize here so
-      // renderSegmentRow() can read one consistent field regardless of
-      // source bucket.
-      ...s,
-      average_grade: s.average_grade != null ? s.average_grade : s.avg_grade
-    }));
-    state.routeSegments = near;
+    const efforts = data.segment_efforts || []; // empty = a normal "no segments on this ride", not an error
+    const segments = [];
+    const effortsById = {};
+    const prWatts = {};
+    efforts.forEach(effort=>{
+      const seg = effort.segment;
+      if(!seg || !seg.id || effortsById[seg.id]) return; // skip malformed entries + (rare) repeat efforts on the same segment, keep the first
+      segments.push(seg);
+      effortsById[seg.id] = effort;
+      // This ride's own watts for the effort — no separate PR-activity
+      // lookup needed the way ensureSegmentPrWatts() needs one for the
+      // starred-segments bucket, since it's right here on the effort.
+      prWatts[seg.id] = effort.average_watts != null
+        ? { watts: Math.round(effort.average_watts), measured: !!effort.device_watts }
+        : null;
+    });
+    state.routeSegments = segments;
+    state.routeSegmentEfforts = effortsById;
+    state.routeSegmentPrWatts = prWatts;
+    // Still fetches per-segment weather + full segment detail (for the
+    // map-detail-view polyline, see mountSegmentView()) the same way the
+    // starred-segments bucket does — that part of the shared pipeline is
+    // unrelated to the old explore/matching system and stays as-is.
     await loadSegmentExtras(state.routeSegments, segmentBucket("route"));
     if(myGeneration !== routeSegmentsGeneration) return;
-    // Now that every chunk has been attempted, turn the failure count into
-    // the right outcome — see renderRouteSegmentsCard() for how each of the
-    // three cases below renders:
-    if(failedChunks > 0 && succeededChunks === 0){
-      // Every chunk failed (e.g. an expired Strava token): a hard failure,
-      // not "no segments found". Leave routeSegmentsFetched false so the
-      // "Segmente laden" button reappears instead of the empty-list message,
-      // giving the user a way to retry.
-      state.routeSegmentsError = "Segmente konnten nicht geladen werden. Bitte erneut versuchen.";
-      state.routeSegmentsFetched = false;
-    } else if(failedChunks > 0){
-      // Some chunks failed but at least one succeeded: a partial result, not
-      // a hard failure. Keep whatever was actually found (don't discard it)
-      // and flag it as possibly incomplete rather than hiding the failure.
-      state.routeSegmentsError = "Einige Kartenausschnitte konnten nicht geladen werden – die Liste ist möglicherweise unvollständig.";
-      state.routeSegmentsFetched = true;
-    } else {
-      // All chunks succeeded — the normal case, no error.
-      state.routeSegmentsFetched = true;
-    }
+    state.routeSegmentsFetched = true;
   }catch(e){
     if(myGeneration === routeSegmentsGeneration){
-      state.routeSegmentsError = e.message;
-      // Same reasoning as the all-chunks-failed case above: this is a hard
-      // failure (outside the per-chunk loop entirely), so the "Segmente
-      // laden" button should reappear for a retry rather than the card
-      // falling through to the empty-list message.
+      // A real failure (expired token, rate limit, network error) — leave
+      // routeSegmentsFetched false so the "Segmente laden" button reappears
+      // for a retry instead of falling through to an empty-list message.
+      state.routeSegmentsError = e.message || "Segmente konnten nicht geladen werden. Bitte erneut versuchen.";
       state.routeSegmentsFetched = false;
     }
   }
   if(myGeneration !== routeSegmentsGeneration) return;
   state.loading.routeSegments = false;
-  state.loading.routeSegmentsProgress = null;
   render();
 }
 
@@ -2601,12 +2404,18 @@ function mountFullRouteView(map, layers, isNewRoute){
   });
 }
 
-// PR time, PR watts, KOM/QOM, elevation gain, effort count — as {value,
-// label} pairs (value = the hero numeral, label = the small caption under
-// it), used both in the segment list and the segment map view. Takes a
-// bucket (see segmentBucket()) so it works identically for starred and
-// route-explore segments.
+// All-time PR time/watts, KOM/QOM, elevation gain, effort count — as
+// {value, label[, style]} pairs (value = the hero numeral, label = the small
+// caption under it), used both in the segment list and the segment map view.
+// This is the starred-segments (bucket.efforts == null) shape, which needs
+// the detail/PR-lookup fetches since it has no single ride to read numbers
+// off of. For the ride-completed-segments bucket (bucket.efforts set, see
+// ensureRideSegments()), computeRideEffortStatChips() below is used instead
+// — richer, ride-specific stats that are already on hand, no extra lookups
+// needed. Takes a bucket (see segmentBucket()) so callers don't need to know
+// which shape applies.
 function computeSegmentStatChips(seg, bucket){
+  if(bucket.efforts) return computeRideEffortStatChips(bucket.efforts[seg.id], bucket.prWatts[seg.id]);
   const detail = bucket.details[seg.id];
   const stats = [];
   if(detail){
@@ -2620,6 +2429,22 @@ function computeSegmentStatChips(seg, bucket){
     const effortCount = detail.athlete_segment_stats && detail.athlete_segment_stats.effort_count;
     if(effortCount) stats.push({value: `${effortCount}`, label:"× gefahren"});
   }
+  return stats;
+}
+
+// This ride's own time/watts on the segment, plus a PR/KOM badge when this
+// effort actually was one — pulled straight from the activity's
+// segment_efforts (see ensureRideSegments()), no extra fetches. Deliberately
+// a separate, parallel builder rather than force-fitting effort data through
+// computeSegmentStatChips()'s all-time-PR-lookup shape above, since the two
+// data shapes don't line up (this one already has everything it needs).
+function computeRideEffortStatChips(effort, prWatts){
+  const stats = [];
+  if(!effort) return stats;
+  if(effort.elapsed_time != null) stats.push({value: fmtDuration(effort.elapsed_time), label:"Zeit"});
+  if(prWatts) stats.push({value: `${prWatts.measured ? "" : "~"}${prWatts.watts}`, label:"Watt"});
+  if(effort.pr_rank === 1) stats.push({value:"PR!", label:"Bestzeit", style:"color:var(--tail); background:var(--tail-bg);"});
+  if(effort.kom_rank) stats.push({value:`${effort.kom_rank}.`, label:"KOM/QOM"});
   return stats;
 }
 
@@ -2649,11 +2474,12 @@ function sortedVisibleSegments(bucket){
 }
 
 // Renders a single segment "card" (icon, name, distance/grade, wind tag,
-// stat chips) — shared between both segment lists (starred + route-explore)
+// stat chips) — shared between both segment lists (starred + ride-completed)
 // and the segment map view, so all three look identical. `bucket` supplies
-// this segment's weather/details/PR-watts data; opts.source ("starred" |
-// "route", default "starred") is what gets passed to selectSegment() so the
-// right bucket is looked up again on click/selection-highlight.
+// this segment's weather/details/PR-watts(/efforts) data; opts.source
+// ("starred" | "route", default "starred") is what gets passed to
+// selectSegment() so the right bucket is looked up again on
+// click/selection-highlight.
 function renderSegmentRow(seg, bucket, opts){
   opts = opts || {};
   const source = opts.source || bucket.source || "starred";
@@ -2691,7 +2517,7 @@ function renderSegmentRow(seg, bucket, opts){
   const stats = computeSegmentStatChips(seg, bucket);
   if(stats.length){
     const chips = el("div", {class:"stat-chips"});
-    stats.forEach(s => chips.appendChild(statChip(s.value, s.label)));
+    stats.forEach(s => chips.appendChild(statChip(s.value, s.label, s.style)));
     row.appendChild(chips);
   }
 
@@ -2804,29 +2630,35 @@ function renderSegmentsPage(){
   return renderSegmentsCard();
 }
 
-// "Segmente auf der Strecke" (Task 3) — Strava's public segment-explore
-// results matched against the current route, rendered with the exact same
-// row treatment as the starred-segments list via the shared bucket-based
-// functions above.
+// "Abgeschlossene Segmente" — segments actually ridden/completed on the
+// currently selected Strava ACTIVITY (see ensureRideSegments()), rendered
+// with the exact same row treatment as the starred-segments list via the
+// shared bucket-based functions above. Only meaningful for a genuine ridden
+// activity; a planned/saved route or an uploaded GPX file gets an honest
+// explanatory message instead (nothing has been "completed" on those), and
+// so does the not-connected case (the activity-detail endpoint needs a
+// token).
 function renderRouteSegmentsCard(){
   if(!state.fullRouteCoords.length) return null;
   const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Segmente auf der Strecke"]));
+  card.appendChild(el("h2", {}, ["Abgeschlossene Segmente"]));
 
-  if(!state.connected){
-    card.appendChild(el("div", {class:"muted"}, ["Verbinde mit Strava, um Segmente entlang dieser Strecke zu laden."]));
+  const activity = state.selectedActivity;
+  const isRideActivity = !!(state.connected && activity && !activity.isRoute && !activity.isGpx);
+
+  if(!isRideActivity){
+    card.appendChild(el("div", {class:"muted"}, [
+      "Nur für bereits gefahrene Aktivitäten verfügbar - geplante Routen und GPX-Dateien haben noch keine abgeschlossenen Segmente."
+    ]));
     return card;
   }
 
-  // Honest about what this is: segments/explore is a curated/popular-segment
-  // API scoped to a handful of bounding boxes along the route, not an
-  // exhaustive scan of every Strava segment that touches the path.
   card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px; font-size:12px;"}, [
-    "Beliebte Strava-Segmente entlang dieser Strecke."
+    "Segmente, die auf dieser Fahrt tatsächlich gefahren und abgeschlossen wurden."
   ]));
 
   if(state.loading.routeSegments){
-    card.appendChild(renderRouteSegmentsProgress());
+    card.appendChild(el("div", {class:"loading"}, ["Lade Segmente…"]));
     return card;
   }
 
@@ -2834,35 +2666,19 @@ function renderRouteSegmentsCard(){
   // renderGpxUploadRow() on the GPX tab) would leave a failed "Segmente
   // laden" fetch invisible on every other tab/page, and could linger stale
   // into unrelated later views. routeSegmentsError is scoped to this card
-  // and cleared by resetRouteSegments() (route change) and at the start of
-  // every ensureRouteSegments() run (retry).
-  //
-  // routeSegmentsError doubles as two different outcomes, told apart by
-  // routeSegmentsFetched (see ensureRouteSegments() for how each is set):
-  //   - hard failure (every bbox chunk failed): routeSegmentsFetched is
-  //     false, so the block below falls through to the "Segmente laden"
-  //     button instead of the empty-list message — a total failure must
-  //     never be presented as a confident "nothing found".
-  //   - partial failure (some chunks failed, at least one succeeded):
-  //     routeSegmentsFetched is true, so this falls through to the actual
-  //     (partial) list below, rendered together with the caveat — a milder
-  //     "muted" note rather than the harder-styled error box, since real
-  //     results did come back and this is coverage-incomplete, not broken.
+  // and cleared by resetRouteSegments() (selection change) and at the start
+  // of every ensureRideSegments() run (retry).
   if(state.routeSegmentsError){
-    const isHardFailure = !state.routeSegmentsFetched;
-    card.appendChild(el("div", {
-      class: isHardFailure ? "error" : "muted",
-      style: "margin-bottom:14px;" + (isHardFailure ? "" : " font-size:12px;")
-    }, [state.routeSegmentsError]));
+    card.appendChild(el("div", {class:"error", style:"margin-bottom:14px;"}, [state.routeSegmentsError]));
   }
 
-  // Not fetched yet for this route (also true after a hard failure — see
-  // above) — manual trigger only (see ensureRouteSegments()'s comment for
-  // why this never runs automatically).
+  // Not fetched yet for this activity (also true after a failure — see
+  // above) — manual trigger only (see ensureRideSegments()'s comment for why
+  // this never runs automatically).
   if(!state.routeSegmentsFetched){
     card.appendChild(el("button", {
       class:"btn secondary", style:"width:100%;",
-      onclick: ()=>ensureRouteSegments()
+      onclick: ()=>ensureRideSegments()
     }, ["Segmente laden"]));
     return card;
   }
@@ -2871,41 +2687,15 @@ function renderRouteSegmentsCard(){
   const list = bucket.list.slice(0, 12);
   if(!list.length){
     // Reached only when routeSegmentsFetched is true, i.e. the fetch
-    // genuinely completed (fully or partially) — never on a hard failure,
-    // which returns above instead. If this was a partial fetch the caveat
-    // above already explains why the list might be incomplete; a truly
-    // empty result here is still an honest "nothing nearby was found among
-    // what could be checked", not a silent false negative.
-    card.appendChild(el("div", {class:"muted"}, ["Keine bekannten Strava-Segmente entlang dieser Strecke gefunden."]));
+    // genuinely completed — never on failure, which returns above instead.
+    // A truly empty result here is a normal outcome (a short/flat ride with
+    // no segments on it), not an error.
+    card.appendChild(el("div", {class:"muted"}, ["Auf dieser Fahrt wurden keine Segmente abgeschlossen."]));
     return card;
   }
 
   list.forEach(seg => card.appendChild(renderSegmentRow(seg, bucket)));
   return card;
-}
-
-// Subtle, on-brand loading indicator for the chunked segments/explore fetch
-// (Task 3): a thin fill bar (same visual family as .wind-mix-bar — pill
-// track on --asphalt-3, --route as the neutral info-accent fill, never a
-// wind-favorability color since this isn't a wind judgment) plus an exact
-// "X / Y Kartenausschnitte geprüft" label, tied directly to
-// state.loading.routeSegmentsProgress rather than a generic top-of-page
-// spinner. Falls back to a plain label if progress isn't available yet
-// (the first render right after the button click, before the first chunk's
-// total is known — practically instant, but handled defensively).
-function renderRouteSegmentsProgress(){
-  const progress = state.loading.routeSegmentsProgress;
-  const total = progress ? progress.total : 0;
-  const done = progress ? progress.done : 0;
-  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-  return el("div", {class:"route-segments-progress"}, [
-    el("div", {class:"route-segments-progress-track"}, [
-      el("div", {class:"route-segments-progress-fill", style:`width:${pct}%;`})
-    ]),
-    el("div", {class:"route-segments-progress-label"}, [
-      total > 0 ? `${done} / ${total} Kartenausschnitte geprüft` : "Suche Segmente entlang der Strecke…"
-    ])
-  ]);
 }
 
 function renderFootnote(){
