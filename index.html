@@ -1048,6 +1048,31 @@ async function fetchHammerheadRoutes(token){
   return data.data || [];
 }
 
+// Hammerhead's OpenAPI spec (api.hammerhead.io/v1/docs/openapi.yml) only
+// documents PUT for /routes/{id}/file (upload/replace an existing route) -
+// there is no documented GET (download) on that path, which is why it 500s.
+// GET /routes/{id} (singular, no /file) is undocumented too, but it's the
+// natural read counterpart to the documented GET /routes list, and unlike a
+// fake PUT it's read-only by construction - it can't ever mutate the route,
+// so it's safe to just try. The Route schema (unlike RouteSummary) includes
+// a `polyline` field in the same encoding Strava uses, decodable with the
+// existing decodePolyline() - but no altitude, so Hammerhead routes never
+// get an elevation profile from this path.
+async function fetchHammerheadRouteCoords(routeId, token){
+  const res = await fetch(TOKEN_ENDPOINT + `/hammerhead-api/routes/${routeId}`, {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok) throw new Error(`Route-Geometrie nicht verfügbar (Route-ID: ${routeId}): ` + await readOAuthError(res));
+  const data = await res.json();
+  if(!data.polyline) throw new Error(`Route-Antwort enthält keine Geometrie (Route-ID: ${routeId}).`);
+  const coords = decodePolyline(data.polyline);
+  if(coords.length < 2) throw new Error(`Route-Geometrie leer (Route-ID: ${routeId}).`);
+  return coords;
+}
+
+// Kept only as a fallback after fetchHammerheadRouteCoords fails - per the
+// OpenAPI spec this GET isn't actually supported (see above), but trying it
+// costs nothing and some accounts/routes may behave differently.
 async function fetchHammerheadRouteFile(routeId, token){
   const res = await fetch(TOKEN_ENDPOINT + `/hammerhead-api/routes/${routeId}/file`, {
     headers:{ Authorization: "Bearer " + token }
@@ -1355,24 +1380,31 @@ async function selectHammerheadRoute(route){
   state.hammerheadError = null;
   state.loading.hammerheadDetail = true; render();
   // Logged since the exact RouteSummary field names aren't verified against
-  // the live API — if the file fetch below fails, check this for whether
-  // route.id actually matches a real field (e.g. it might be routeId/uuid).
+  // the live API — useful if route.id ever turns out not to be what these
+  // fetches expect.
   console.log("Hammerhead route object:", route);
   try{
-    const raw = await fetchHammerheadRouteFile(route.id, state.hammerheadAccessToken);
-    const track = parseGpxTrack(raw);
-    if(!track){
-      // Diagnostic fallback — if the file isn't GPX/XML after all, show a
-      // snippet of the raw response so the actual format can be identified
-      // instead of guessing blind again.
-      throw new Error("Unbekanntes Format der Routendatei: " + raw.slice(0, 120));
+    let coords, eles = null;
+    try{
+      coords = await fetchHammerheadRouteCoords(route.id, state.hammerheadAccessToken);
+    }catch(coordsErr){
+      const raw = await fetchHammerheadRouteFile(route.id, state.hammerheadAccessToken);
+      const track = parseGpxTrack(raw);
+      if(!track){
+        // Diagnostic fallback — if the file isn't GPX/XML after all, show a
+        // snippet of the raw response so the actual format can be identified
+        // instead of guessing blind again.
+        throw new Error("Unbekanntes Format der Routendatei: " + raw.slice(0, 120));
+      }
+      coords = track.coords;
+      eles = track.eles;
     }
     state.selectedActivity = { id: "hammerhead-route-" + route.id, name: route.name || "Route", isHammerheadRoute: true };
     state.windFieldPoints = null;
     state.climbIndex = 0;
-    state.fullRouteCoords = track.coords;
-    state.elevationProfile = track.eles.every(e => e != null)
-      ? { distances: buildCumulativeDistances(track.coords), elevations: track.eles }
+    state.fullRouteCoords = coords;
+    state.elevationProfile = (eles && eles.every(e => e != null))
+      ? { distances: buildCumulativeDistances(coords), elevations: eles }
       : { distances: [], elevations: [] };
     recomputeRoutePoints();
   }catch(e){
