@@ -1388,16 +1388,23 @@ async function selectHammerheadRoute(route){
     try{
       coords = await fetchHammerheadRouteCoords(route.id, state.hammerheadAccessToken);
     }catch(coordsErr){
-      const raw = await fetchHammerheadRouteFile(route.id, state.hammerheadAccessToken);
-      const track = parseGpxTrack(raw);
-      if(!track){
-        // Diagnostic fallback — if the file isn't GPX/XML after all, show a
-        // snippet of the raw response so the actual format can be identified
-        // instead of guessing blind again.
-        throw new Error("Unbekanntes Format der Routendatei: " + raw.slice(0, 120));
+      try{
+        const raw = await fetchHammerheadRouteFile(route.id, state.hammerheadAccessToken);
+        const track = parseGpxTrack(raw);
+        if(!track){
+          // Diagnostic fallback — if the file isn't GPX/XML after all, show a
+          // snippet of the raw response so the actual format can be identified
+          // instead of guessing blind again.
+          throw new Error("Unbekanntes Format der Routendatei: " + raw.slice(0, 120));
+        }
+        coords = track.coords;
+        eles = track.eles;
+      }catch(fileErr){
+        // Both attempts failed — surface both messages together instead of
+        // only the fallback's, since silently swallowing the first (the one
+        // actually expected to work) makes the real cause invisible.
+        throw new Error(`${coordsErr.message} || Fallback fehlgeschlagen: ${fileErr.message}`);
       }
-      coords = track.coords;
-      eles = track.eles;
     }
     state.selectedActivity = { id: "hammerhead-route-" + route.id, name: route.name || "Route", isHammerheadRoute: true };
     state.windFieldPoints = null;
