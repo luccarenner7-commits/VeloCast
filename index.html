@@ -1719,8 +1719,16 @@ async function loadRouteWeather(){
 // though computeSegmentStatChips() prefers the richer per-ride effort data
 // for its stat chips — mountSegmentView() needs detail.map.polyline to draw
 // the segment's own path when it's clicked into the map detail view.
-async function loadSegmentExtras(list, bucket){
-  for(const seg of list.slice(0, 12)){
+// `limit` caps how many of `list`'s segments get fetched — defaults to 12
+// to preserve the starred-segments flow's existing behavior (keeps Strava
+// API usage bounded for a page that can have many starred segments). The
+// ride-completed flow passes Infinity: "Abgeschlossene Segmente" exists
+// specifically to show everything actually completed on the ride, so
+// capping it here would silently drop segments past the 12th — the exact
+// bug this parameter exists to avoid reintroducing.
+async function loadSegmentExtras(list, bucket, limit){
+  if(limit === undefined) limit = 12;
+  for(const seg of list.slice(0, limit)){
     if(seg.start_latlng){
       try{
         const w = await fetchWeather(seg.start_latlng[0].toFixed(4), seg.start_latlng[1].toFixed(4));
@@ -1838,7 +1846,10 @@ async function ensureRideSegments(){
     // map-detail-view polyline, see mountSegmentView()) the same way the
     // starred-segments bucket does — that part of the shared pipeline is
     // unrelated to the old explore/matching system and stays as-is.
-    await loadSegmentExtras(state.routeSegments, segmentBucket("route"));
+    // Uncapped (Infinity): unlike the starred-segments call site, "every
+    // segment actually completed on this ride" is the entire point of this
+    // feature, so truncating it defeats the purpose (see renderRouteSegmentsCard()).
+    await loadSegmentExtras(state.routeSegments, segmentBucket("route"), Infinity);
     if(myGeneration !== routeSegmentsGeneration) return;
     state.routeSegmentsFetched = true;
   }catch(e){
@@ -2684,7 +2695,11 @@ function renderRouteSegmentsCard(){
   }
 
   const bucket = segmentBucket("route");
-  const list = bucket.list.slice(0, 12);
+  // No cap here (unlike sortedVisibleSegments()'s starred-only slice(0,12)):
+  // ensureRideSegments()/loadSegmentExtras() above now fetch every completed
+  // segment for this ride, so the card must show all of them too — that's
+  // the whole point of "Abgeschlossene Segmente".
+  const list = bucket.list;
   if(!list.length){
     // Reached only when routeSegmentsFetched is true, i.e. the fetch
     // genuinely completed — never on failure, which returns above instead.
