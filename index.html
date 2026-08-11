@@ -54,6 +54,12 @@
        line. Deliberately not part of the wind vocabulary above. */
     --route: #82a2d1;
     --route-bg: rgba(130,162,209,0.14);
+    /* --asphalt at 60% alpha, following the --tail-bg/--head-bg/--cross-bg/
+       --route-bg pattern above (a dedicated rgba "-bg" token paired with its
+       base color) — needed because a raw CSS custom property can't be
+       alpha-blended on use without color-mix(), which this file otherwise
+       avoids. Used for the nav drawer's backdrop scrim. */
+    --asphalt-bg-60: rgba(20,23,29,0.6);
     /* Climb-grade intensity ramp: a separate, single-hue (blue) scale for
        steepness, distinct from the wind-favorability colors so a steep climb
        chip never reads as "headwind". Brightness (light = more intense)
@@ -129,7 +135,7 @@
      `@media (prefers-reduced-motion: reduce)` rule below already collapses
      to instant show/hide for every element, this one included. */
   .nav-backdrop{
-    position:fixed; inset:0; background:rgba(20,23,29,0.6);
+    position:fixed; inset:0; background:var(--asphalt-bg-60);
     opacity:0; pointer-events:none; transition:opacity 0.2s ease;
     z-index:40;
   }
@@ -320,6 +326,21 @@
   .wind-mix-stat .l{ font-family:'IBM Plex Mono', monospace; font-size:10px; color:var(--chalk-dim); margin-top:4px; text-transform:uppercase; letter-spacing:0.04em; }
   .wind-mix-bar{ display:flex; height:8px; border-radius:var(--r-full); overflow:hidden; background:var(--asphalt-3); }
 
+  /* Chunked segments/explore fetch progress (Task 3's "Segmente laden"
+     loading state) — deliberately understated: a thin pill track/fill in the
+     same family as .wind-mix-bar above (asphalt-3 track, --route neutral
+     info-accent fill, NOT a wind-favorability color since finding segments
+     isn't a wind judgment), plus an exact count label rather than a vague
+     spinner, so it reads as connected to the specific button/card it's
+     reporting progress for rather than a generic top-of-page loader. The
+     fill's width transition is real animated motion (communicates chunks
+     completing) and — like every other transition in this file — collapses
+     to an instant jump under the file-wide prefers-reduced-motion rule below. */
+  .route-segments-progress{ margin-top:2px; }
+  .route-segments-progress-track{ height:4px; border-radius:var(--r-full); overflow:hidden; background:var(--asphalt-3); }
+  .route-segments-progress-fill{ height:100%; border-radius:var(--r-full); background:var(--route); transition:width 0.3s ease; }
+  .route-segments-progress-label{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); margin-top:8px; }
+
   @media (prefers-reduced-motion: reduce){ * { transition:none !important; } }
 </style>
 </head>
@@ -380,6 +401,32 @@ let state = {
   routeSegmentWeather: {},
   routeSegmentDetails: {},
   routeSegmentPrWatts: {},
+  // True once a "Segmente laden" fetch has completed for the CURRENT route
+  // AND produced a usable result (all chunks succeeded, or some did) — gates
+  // whether renderRouteSegmentsCard() shows the manual button or the
+  // (possibly empty, possibly partial) result list. Distinct from
+  // routeSegments.length, since a completed fetch with zero matches must
+  // still show "keine gefunden", not the button again. Deliberately stays
+  // false when EVERY chunk of a fetch attempt failed (see
+  // ensureRouteSegments()), so a hard failure re-shows the button for a
+  // retry instead of falling through to "keine gefunden". Reset to false by
+  // resetRouteSegments() whenever a new route/activity/GPX is selected, so
+  // the button reappears for the new route instead of auto-fetching.
+  routeSegmentsFetched: false,
+  // Route-segments-fetch-specific error, kept separate from the generic
+  // state.error above (which only ever renders on the GPX tab, see
+  // renderGpxUploadRow()) so a failed "Segmente laden" fetch is actually
+  // visible to the user regardless of which tab/page they're on, and so it
+  // can't linger stale into unrelated later views. Set at the end of
+  // ensureRouteSegments() — either a hard-failure message (every chunk
+  // failed, routeSegmentsFetched left false) or a milder partial-coverage
+  // note (some chunks failed, routeSegmentsFetched still set true since real
+  // results did come back) — or in its outer catch for failures outside the
+  // per-chunk loop. Cleared both by resetRouteSegments() (route change) and
+  // at the start of every ensureRouteSegments() run (retry). Rendered by
+  // renderRouteSegmentsCard(), which uses routeSegmentsFetched to tell the
+  // hard-failure and partial-failure cases apart.
+  routeSegmentsError: null,
   navOpen: false, // left slide-in nav drawer open/closed
   activePage: "route", // "route" | "segments" - which NAV_ITEMS entry is active
   routeSourceTab: "activities", // "routes" | "activities" | "gpx"
@@ -1319,10 +1366,14 @@ const NAV_ITEMS = [
 ];
 
 function hamburgerIconSvg(){
+  // stroke="var(--chalk)" resolves against the SVG's computed style once it's
+  // in the DOM (same as any other presentation attribute), so this stays
+  // sourced from the single --chalk custom property instead of a duplicated
+  // hex literal.
   return `<svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-    <line x1="1.5" y1="4" x2="14.5" y2="4" stroke="#f2efe9" stroke-width="1.6" stroke-linecap="round"/>
-    <line x1="1.5" y1="8" x2="14.5" y2="8" stroke="#f2efe9" stroke-width="1.6" stroke-linecap="round"/>
-    <line x1="1.5" y1="12" x2="14.5" y2="12" stroke="#f2efe9" stroke-width="1.6" stroke-linecap="round"/>
+    <line x1="1.5" y1="4" x2="14.5" y2="4" stroke="var(--chalk)" stroke-width="1.6" stroke-linecap="round"/>
+    <line x1="1.5" y1="8" x2="14.5" y2="8" stroke="var(--chalk)" stroke-width="1.6" stroke-linecap="round"/>
+    <line x1="1.5" y1="12" x2="14.5" y2="12" stroke="var(--chalk)" stroke-width="1.6" stroke-linecap="round"/>
   </svg>`;
 }
 
@@ -1505,11 +1556,26 @@ function isShowingSegmentDetail(){
 // below, since a previous route's nearby-segments list has no meaning for a
 // newly selected route. Also drops the current selection if it pointed at a
 // route-explore segment that's about to be wiped out from under it.
+// Deliberately does NOT call ensureRouteSegments() — this only clears the
+// cache back to the "Segmente laden" button state; fetching a fresh route's
+// segments is exclusively user-triggered (see renderRouteSegmentsCard()),
+// never automatic, since it's a multi-request operation.
 function resetRouteSegments(){
+  // Bumps the generation counter so any ensureRouteSegments() loop still
+  // in flight for the PREVIOUS route (mid-await when this reset fires)
+  // recognizes on its next state-writing step that it's stale and bails
+  // out silently instead of writing its (now-meaningless) results/errors/
+  // progress on top of whatever route is current now. See the comment on
+  // routeSegmentsGeneration below for the full mechanism.
+  routeSegmentsGeneration++;
   state.routeSegments = [];
   state.routeSegmentWeather = {};
   state.routeSegmentDetails = {};
   state.routeSegmentPrWatts = {};
+  state.routeSegmentsFetched = false;
+  state.routeSegmentsError = null;
+  state.loading.routeSegments = false;
+  state.loading.routeSegmentsProgress = null;
   if(state.selectedSegmentSource === "route"){
     state.selectedSegmentId = null;
     state.selectedSegmentSource = null;
@@ -1534,7 +1600,9 @@ async function selectActivity(activity){
   const cumDist = buildCumulativeDistances(coords);
   state.routePoints = pickRoutePoints(coords, cumDist, state.routePointDistanceKm);
   render();
-  ensureRouteSegments(); // not awaited - independent of weather, runs in the background (same pattern as ensureWindField)
+  // Deliberately NOT calling ensureRouteSegments() here — Task 3 is
+  // explicitly user-triggered only (see renderRouteSegmentsCard()'s
+  // "Segmente laden" button), never automatic on route selection.
   await loadRouteWeather();
 }
 
@@ -1586,7 +1654,7 @@ async function selectStravaRoute(route){
   }
   state.fullRouteCoords = decodePolyline(poly);
   recomputeRoutePoints();
-  ensureRouteSegments(); // not awaited, see selectActivity()
+  // Deliberately NOT calling ensureRouteSegments() here, see selectActivity().
 }
 
 // ---------- GPX import ----------
@@ -1631,9 +1699,9 @@ async function loadGpxFile(file){
     ? { distances: buildCumulativeDistances(track.coords), elevations: track.eles }
     : { distances: [], elevations: [] };
   recomputeRoutePoints();
-  // No-op if not connected (ensureRouteSegments needs an access token) - a
-  // GPX-only route just never gets this data, see renderRouteSegmentsCard().
-  ensureRouteSegments();
+  // Deliberately NOT calling ensureRouteSegments() here, see selectActivity().
+  // (If not connected, the card shows a neutral connect hint instead of the
+  // button anyway — see renderRouteSegmentsCard().)
 }
 
 async function loadRouteWeather(){
@@ -1711,16 +1779,19 @@ async function ensureSegmentPrWatts(seg, bucket){
 // smaller bboxes along its length instead (one explore call each, capped),
 // results are deduped by id, then filtered down to segments whose start
 // point is genuinely close to the route.
-const ROUTE_SEGMENT_CHUNK_KM = 8;      // target route-length per bbox chunk
+const ROUTE_SEGMENT_CHUNK_KM = 8;      // target route-length per bbox chunk (short routes)
 const ROUTE_SEGMENT_MAX_CALLS = 8;     // hard cap on explore API calls per route
 const ROUTE_SEGMENT_BBOX_PAD_DEG = 0.01; // ~1.1km padding so segments right at a chunk's edge aren't missed
 const ROUTE_SEGMENT_BUFFER_KM = 0.3;   // proximity buffer (~300m) to state.fullRouteCoords for the final path-relevance filter
 
 // Splits the route into up to ROUTE_SEGMENT_MAX_CALLS bounding boxes along
-// its length. If distance-based chunking would need more calls than the cap
-// (long routes), evenly-spaced chunks covering the FULL route length are
-// kept instead of just the first N, so a long route's back half isn't
-// silently skipped.
+// its length. Short routes (<= ROUTE_SEGMENT_MAX_CALLS * ROUTE_SEGMENT_CHUNK_KM)
+// get one ~ROUTE_SEGMENT_CHUNK_KM-wide, fine-grained chunk every CHUNK_KM.
+// Long routes are capped at ROUTE_SEGMENT_MAX_CALLS chunks, but each chunk is
+// WIDENED to totalKm / chunkCount so the capped number of bboxes still
+// together span the FULL route length with (approximately) contiguous, gapless
+// coverage — e.g. a 150km route gets 8 bboxes of ~18.75km each covering all
+// 150km, not 8 narrow 8km windows with big unqueried gaps between them.
 function computeRouteExploreBboxes(coords){
   if(coords.length < 2) return [];
   const cumDist = buildCumulativeDistances(coords);
@@ -1728,57 +1799,104 @@ function computeRouteExploreBboxes(coords){
   if(totalKm <= 0) return [];
 
   const rawChunkCount = Math.max(1, Math.ceil(totalKm / ROUTE_SEGMENT_CHUNK_KM));
-  let chunkIndexes = Array.from({length: rawChunkCount}, (_, i) => i);
-  if(rawChunkCount > ROUTE_SEGMENT_MAX_CALLS){
-    const picked = new Set();
-    for(let i=0;i<ROUTE_SEGMENT_MAX_CALLS;i++){
-      picked.add(Math.round(i * (rawChunkCount - 1) / (ROUTE_SEGMENT_MAX_CALLS - 1)));
-    }
-    chunkIndexes = [...picked].sort((a,b)=>a-b);
-  }
+  const chunkCount = Math.min(rawChunkCount, ROUTE_SEGMENT_MAX_CALLS);
+  // Width per chunk: at least the CHUNK_KM target (so short/uncapped routes
+  // stay fine-grained), but widened whenever capping to chunkCount would
+  // otherwise leave gaps — i.e. whenever totalKm / chunkCount > CHUNK_KM.
+  const chunkKm = Math.max(ROUTE_SEGMENT_CHUNK_KM, totalKm / chunkCount);
 
-  const chunkKm = totalKm / rawChunkCount;
   const bboxes = [];
-  chunkIndexes.forEach(i=>{
+  for(let i=0;i<chunkCount;i++){
     const fromKm = i * chunkKm;
-    const toKm = Math.min(totalKm, (i + 1) * chunkKm);
+    const toKm = (i === chunkCount - 1) ? totalKm : Math.min(totalKm, (i + 1) * chunkKm);
     let lats = [], lons = [];
     for(let k=0;k<coords.length;k++){
       if(cumDist[k] >= fromKm - 1e-9 && cumDist[k] <= toKm + 1e-9){
         lats.push(coords[k][0]); lons.push(coords[k][1]);
       }
     }
-    if(!lats.length) return;
+    if(!lats.length) continue;
     bboxes.push({
       swLat: Math.min(...lats) - ROUTE_SEGMENT_BBOX_PAD_DEG,
       swLon: Math.min(...lons) - ROUTE_SEGMENT_BBOX_PAD_DEG,
       neLat: Math.max(...lats) + ROUTE_SEGMENT_BBOX_PAD_DEG,
       neLon: Math.max(...lons) + ROUTE_SEGMENT_BBOX_PAD_DEG
     });
-  });
+  }
   return bboxes;
 }
 
+// Bumped by resetRouteSegments() every time the underlying route identity
+// changes (new activity/route/GPX selected). ensureRouteSegments() captures
+// this value at the start of its run; if it no longer matches by the time an
+// await resolves, a reset happened mid-flight and the in-progress fetch is
+// for a route that's no longer current — see ensureRouteSegments() for how
+// each state-writing step checks this before touching state.
+let routeSegmentsGeneration = 0;
+
 // Fetches + filters segments along the current route into state.routeSegments.
-// No-ops (and leaves the card showing its "connect to Strava" hint instead)
-// when not connected, since the explore endpoint needs an access token and
-// has no meaning for a GPX-only route.
+// EXPLICITLY USER-TRIGGERED ONLY — called from the "Segmente laden" button in
+// renderRouteSegmentsCard(), never automatically on route selection, since
+// this is a potentially slow, multi-request (chunked bbox) operation. No-ops
+// when not connected or already loading; renderRouteSegmentsCard() shows a
+// neutral connect hint instead of the button when not connected, since the
+// explore endpoint needs an access token and has no meaning for a GPX-only
+// route.
 async function ensureRouteSegments(){
   if(!state.connected || !state.fullRouteCoords.length) return;
-  state.loading.routeSegments = true; render();
+  if(state.loading.routeSegments) return;
+  // Captured once, up front — see routeSegmentsGeneration's comment. Every
+  // point below that's about to write state.routeSegments*/state.loading.
+  // routeSegments* re-checks this against the live counter first, and bails
+  // out silently (no state writes, no render()) the moment they diverge,
+  // since a diverging counter means resetRouteSegments() already ran for a
+  // newer route and put state back to "not fetched" for it — this stale run
+  // must never overwrite that.
+  const myGeneration = routeSegmentsGeneration;
+  const bboxes = computeRouteExploreBboxes(state.fullRouteCoords);
+  state.loading.routeSegments = true;
+  // Progress for the "Segmente laden" loading indicator — total is known
+  // upfront (one call per bbox chunk), done increments as each chunk
+  // completes (success or failure), so the progress bar/label in
+  // renderRouteSegmentsCard() can show real "X / Y Kartenausschnitte
+  // geprüft" progress rather than an indeterminate spinner.
+  state.loading.routeSegmentsProgress = { done: 0, total: bboxes.length };
+  // Clear out any error left over from a previous failed attempt at this
+  // same route (retry via the "Segmente laden" button) so it doesn't linger
+  // stale alongside — or instead of — this run's own outcome. Guarded the
+  // same way as every other state-writing step here, even though nothing
+  // async has happened yet at this point.
+  if(myGeneration === routeSegmentsGeneration) state.routeSegmentsError = null;
+  render();
   try{
-    const bboxes = computeRouteExploreBboxes(state.fullRouteCoords);
     const seen = new Map();
+    // Per-chunk outcome bookkeeping: fetchSegmentExplore() throws on any
+    // non-ok response (expired token, missing scope, rate limiting — all
+    // realistic), and the per-chunk catch below deliberately swallows that
+    // so one bad chunk doesn't abort the rest of the route. But swallowing
+    // it silently would mean a total failure (every chunk down, e.g. an
+    // expired token) looks identical to "genuinely found nothing" — these
+    // counts are how the code tells the two apart once the loop finishes.
+    let failedChunks = 0;
+    let succeededChunks = 0;
     for(const bbox of bboxes){
       try{
         const data = await fetchSegmentExplore(bbox, state.accessToken);
+        if(myGeneration !== routeSegmentsGeneration) return;
+        succeededChunks++;
         (data.segments || []).forEach(s=>{
           if(!seen.has(s.id)) seen.set(s.id, s);
         });
       }catch(e){
+        if(myGeneration !== routeSegmentsGeneration) return;
+        failedChunks++;
         // one chunk failing shouldn't block the rest of the route
       }
+      if(myGeneration !== routeSegmentsGeneration) return;
+      state.loading.routeSegmentsProgress = { done: state.loading.routeSegmentsProgress.done + 1, total: bboxes.length };
+      render();
     }
+    if(myGeneration !== routeSegmentsGeneration) return;
     // Path-relevance filter: keep only segments whose start point is close
     // to SOME point on the actual route, not merely inside one of the
     // (rectangular, path-agnostic) bboxes above — same level of
@@ -1796,10 +1914,40 @@ async function ensureRouteSegments(){
     }));
     state.routeSegments = near;
     await loadSegmentExtras(state.routeSegments, segmentBucket("route"));
+    if(myGeneration !== routeSegmentsGeneration) return;
+    // Now that every chunk has been attempted, turn the failure count into
+    // the right outcome — see renderRouteSegmentsCard() for how each of the
+    // three cases below renders:
+    if(failedChunks > 0 && succeededChunks === 0){
+      // Every chunk failed (e.g. an expired Strava token): a hard failure,
+      // not "no segments found". Leave routeSegmentsFetched false so the
+      // "Segmente laden" button reappears instead of the empty-list message,
+      // giving the user a way to retry.
+      state.routeSegmentsError = "Segmente konnten nicht geladen werden. Bitte erneut versuchen.";
+      state.routeSegmentsFetched = false;
+    } else if(failedChunks > 0){
+      // Some chunks failed but at least one succeeded: a partial result, not
+      // a hard failure. Keep whatever was actually found (don't discard it)
+      // and flag it as possibly incomplete rather than hiding the failure.
+      state.routeSegmentsError = "Einige Kartenausschnitte konnten nicht geladen werden – die Liste ist möglicherweise unvollständig.";
+      state.routeSegmentsFetched = true;
+    } else {
+      // All chunks succeeded — the normal case, no error.
+      state.routeSegmentsFetched = true;
+    }
   }catch(e){
-    state.error = e.message;
+    if(myGeneration === routeSegmentsGeneration){
+      state.routeSegmentsError = e.message;
+      // Same reasoning as the all-chunks-failed case above: this is a hard
+      // failure (outside the per-chunk loop entirely), so the "Segmente
+      // laden" button should reappear for a retry rather than the card
+      // falling through to the empty-list message.
+      state.routeSegmentsFetched = false;
+    }
   }
+  if(myGeneration !== routeSegmentsGeneration) return;
   state.loading.routeSegments = false;
+  state.loading.routeSegmentsProgress = null;
   render();
 }
 
@@ -1853,17 +2001,23 @@ function renderRouteCard(){
   if(isShowingSegmentDetail()){
     const bucket = segmentBucket("route");
     const seg = bucket.list.find(s => s.id === state.selectedSegmentId);
-    card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
-      el("h2", {style:"margin:0;"}, ["Segment"]),
-      el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{ state.selectedSegmentId = null; state.selectedSegmentSource = null; render(); }}, ["Zur Strecke"])
-    ]));
-
-    if(seg){
+    if(!seg){
+      // Selection survived into a state where the "route" bucket no longer
+      // has this id (e.g. stale after a route change raced with a fetch) —
+      // recover by clearing it and falling through to the normal route card
+      // below instead of rendering an empty "Segment" shell (heading + back
+      // button + blank map, with nothing in between).
+      state.selectedSegmentId = null;
+      state.selectedSegmentSource = null;
+    } else {
+      card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
+        el("h2", {style:"margin:0;"}, ["Segment"]),
+        el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{ state.selectedSegmentId = null; state.selectedSegmentSource = null; render(); }}, ["Zur Strecke"])
+      ]));
       card.appendChild(renderSegmentRow(seg, bucket, {clickable:false}));
+      card.appendChild(routeMapContainer);
+      return card;
     }
-
-    card.appendChild(routeMapContainer);
-    return card;
   }
 
   card.appendChild(el("h2", {}, ["Strecke"]));
@@ -2528,14 +2682,22 @@ function renderSegmentsPage(){
   if(isShowingSegmentDetail()){
     const bucket = segmentBucket("starred");
     const seg = bucket.list.find(s => s.id === state.selectedSegmentId);
-    const card = el("div", {class:"card"});
-    card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
-      el("h2", {style:"margin:0;"}, ["Segment"]),
-      el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{ state.selectedSegmentId = null; state.selectedSegmentSource = null; render(); }}, ["Zurück zur Liste"])
-    ]));
-    if(seg) card.appendChild(renderSegmentRow(seg, bucket, {clickable:false}));
-    card.appendChild(routeMapContainer);
-    return card;
+    if(!seg){
+      // Same recovery as renderRouteCard()'s equivalent branch: a stale
+      // selection whose id no longer exists in the bucket falls through to
+      // the plain list instead of an empty "Segment" shell.
+      state.selectedSegmentId = null;
+      state.selectedSegmentSource = null;
+    } else {
+      const card = el("div", {class:"card"});
+      card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
+        el("h2", {style:"margin:0;"}, ["Segment"]),
+        el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{ state.selectedSegmentId = null; state.selectedSegmentSource = null; render(); }}, ["Zurück zur Liste"])
+      ]));
+      card.appendChild(renderSegmentRow(seg, bucket, {clickable:false}));
+      card.appendChild(routeMapContainer);
+      return card;
+    }
   }
 
   return renderSegmentsCard();
@@ -2551,7 +2713,7 @@ function renderRouteSegmentsCard(){
   card.appendChild(el("h2", {}, ["Segmente auf der Strecke"]));
 
   if(!state.connected){
-    card.appendChild(el("div", {class:"muted"}, ["Verbinde mit Strava, um Segmente entlang dieser Strecke zu sehen."]));
+    card.appendChild(el("div", {class:"muted"}, ["Verbinde mit Strava, um Segmente entlang dieser Strecke zu laden."]));
     return card;
   }
 
@@ -2563,19 +2725,86 @@ function renderRouteSegmentsCard(){
   ]));
 
   if(state.loading.routeSegments){
-    card.appendChild(el("div", {class:"loading"}, ["Suche Segmente entlang der Strecke…"]));
+    card.appendChild(renderRouteSegmentsProgress());
+    return card;
+  }
+
+  // Local error display for THIS feature — state.error (rendered only inside
+  // renderGpxUploadRow() on the GPX tab) would leave a failed "Segmente
+  // laden" fetch invisible on every other tab/page, and could linger stale
+  // into unrelated later views. routeSegmentsError is scoped to this card
+  // and cleared by resetRouteSegments() (route change) and at the start of
+  // every ensureRouteSegments() run (retry).
+  //
+  // routeSegmentsError doubles as two different outcomes, told apart by
+  // routeSegmentsFetched (see ensureRouteSegments() for how each is set):
+  //   - hard failure (every bbox chunk failed): routeSegmentsFetched is
+  //     false, so the block below falls through to the "Segmente laden"
+  //     button instead of the empty-list message — a total failure must
+  //     never be presented as a confident "nothing found".
+  //   - partial failure (some chunks failed, at least one succeeded):
+  //     routeSegmentsFetched is true, so this falls through to the actual
+  //     (partial) list below, rendered together with the caveat — a milder
+  //     "muted" note rather than the harder-styled error box, since real
+  //     results did come back and this is coverage-incomplete, not broken.
+  if(state.routeSegmentsError){
+    const isHardFailure = !state.routeSegmentsFetched;
+    card.appendChild(el("div", {
+      class: isHardFailure ? "error" : "muted",
+      style: "margin-bottom:14px;" + (isHardFailure ? "" : " font-size:12px;")
+    }, [state.routeSegmentsError]));
+  }
+
+  // Not fetched yet for this route (also true after a hard failure — see
+  // above) — manual trigger only (see ensureRouteSegments()'s comment for
+  // why this never runs automatically).
+  if(!state.routeSegmentsFetched){
+    card.appendChild(el("button", {
+      class:"btn secondary", style:"width:100%;",
+      onclick: ()=>ensureRouteSegments()
+    }, ["Segmente laden"]));
     return card;
   }
 
   const bucket = segmentBucket("route");
   const list = bucket.list.slice(0, 12);
   if(!list.length){
+    // Reached only when routeSegmentsFetched is true, i.e. the fetch
+    // genuinely completed (fully or partially) — never on a hard failure,
+    // which returns above instead. If this was a partial fetch the caveat
+    // above already explains why the list might be incomplete; a truly
+    // empty result here is still an honest "nothing nearby was found among
+    // what could be checked", not a silent false negative.
     card.appendChild(el("div", {class:"muted"}, ["Keine bekannten Strava-Segmente entlang dieser Strecke gefunden."]));
     return card;
   }
 
   list.forEach(seg => card.appendChild(renderSegmentRow(seg, bucket)));
   return card;
+}
+
+// Subtle, on-brand loading indicator for the chunked segments/explore fetch
+// (Task 3): a thin fill bar (same visual family as .wind-mix-bar — pill
+// track on --asphalt-3, --route as the neutral info-accent fill, never a
+// wind-favorability color since this isn't a wind judgment) plus an exact
+// "X / Y Kartenausschnitte geprüft" label, tied directly to
+// state.loading.routeSegmentsProgress rather than a generic top-of-page
+// spinner. Falls back to a plain label if progress isn't available yet
+// (the first render right after the button click, before the first chunk's
+// total is known — practically instant, but handled defensively).
+function renderRouteSegmentsProgress(){
+  const progress = state.loading.routeSegmentsProgress;
+  const total = progress ? progress.total : 0;
+  const done = progress ? progress.done : 0;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  return el("div", {class:"route-segments-progress"}, [
+    el("div", {class:"route-segments-progress-track"}, [
+      el("div", {class:"route-segments-progress-fill", style:`width:${pct}%;`})
+    ]),
+    el("div", {class:"route-segments-progress-label"}, [
+      total > 0 ? `${done} / ${total} Kartenausschnitte geprüft` : "Suche Segmente entlang der Strecke…"
+    ])
+  ]);
 }
 
 function renderFootnote(){
