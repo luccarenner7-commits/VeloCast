@@ -99,6 +99,7 @@
   .app{ max-width: 720px; margin: 0 auto; padding: 28px 20px 60px; }
 
   .brand{ display:flex; align-items:baseline; justify-content:space-between; margin-bottom: 22px; }
+  .brand .brand-left{ display:flex; align-items:baseline; gap:12px; }
   .brand h1{
     font-family:'Space Grotesk', sans-serif;
     font-weight:700; font-size: 26px; letter-spacing: -0.02em; margin:0;
@@ -106,6 +107,56 @@
   }
   .brand h1 span{ color: var(--accent); }
   .brand .status{ font-family:'IBM Plex Mono', monospace; font-size:11px; color: var(--chalk-dim); text-transform:uppercase; letter-spacing:0.08em; }
+
+  /* Hamburger nav trigger — plain icon button, same asphalt/line vocabulary
+     as .btn.secondary rather than a borderless glyph, so it reads as a
+     tappable control at a glance. */
+  .hamburger-btn{
+    display:flex; align-items:center; justify-content:center;
+    width:32px; height:32px; flex-shrink:0; align-self:center;
+    background: var(--asphalt-3); border:1px solid var(--line); border-radius:var(--r-sm);
+    cursor:pointer; padding:0;
+  }
+  .hamburger-btn:hover{ border-color:var(--route); }
+  .hamburger-btn svg{ display:block; }
+
+  /* Left slide-in nav drawer + backdrop. Both are plain el()-built nodes
+     recreated on every render() like the rest of the tree (unlike
+     routeMapContainer/the settings inputs, neither holds any mid-interaction
+     native browser state, so there's no Safari-crash-style reason to make
+     them persistent module-level nodes). The slide transition is real CSS
+     (transform/opacity), which the file-wide
+     `@media (prefers-reduced-motion: reduce)` rule below already collapses
+     to instant show/hide for every element, this one included. */
+  .nav-backdrop{
+    position:fixed; inset:0; background:rgba(20,23,29,0.6);
+    opacity:0; pointer-events:none; transition:opacity 0.2s ease;
+    z-index:40;
+  }
+  .nav-backdrop.open{ opacity:1; pointer-events:auto; }
+  .nav-drawer{
+    position:fixed; top:0; left:0; bottom:0; width:260px; max-width:80vw;
+    background:var(--asphalt-2); border-right:1px solid var(--line);
+    transform:translateX(-100%); transition:transform 0.22s ease;
+    z-index:41; padding:24px 16px; display:flex; flex-direction:column; gap:4px;
+    overflow-y:auto;
+  }
+  .nav-drawer.open{ transform:translateX(0); }
+  .nav-drawer .nav-drawer-title{
+    font-family:'Space Grotesk', sans-serif; font-weight:700; font-size:18px;
+    letter-spacing:-0.02em; margin:0 0 18px; color:var(--chalk);
+  }
+  .nav-drawer .nav-drawer-title span{ color:var(--accent); }
+  /* Same neutral "active" treatment as .source-tab.active (asphalt-3 fill +
+     chalk border/text) for visual consistency across the app's tab/nav
+     controls. */
+  .nav-item{
+    padding:12px 14px; border-radius:var(--r-md); cursor:pointer;
+    font-family:'Space Grotesk', sans-serif; font-weight:600; font-size:14px;
+    color:var(--chalk-dim); border:1px solid transparent;
+  }
+  .nav-item:hover{ border-color:var(--route); color:var(--chalk); }
+  .nav-item.active{ background:var(--asphalt-3); border-color:var(--chalk); color:var(--chalk); }
   /* Connection status is a UI on/off state, not a wind-favorability judgment
      — deliberately neutral (chalk-dim/route) rather than red/green so it
      can't be misread as "bad wind / good wind". */
@@ -320,6 +371,17 @@ let state = {
   segmentPrWatts: {}, // id -> {watts, measured} for the PR effort, fetched lazily on click
   segmentSortBy: "default",
   selectedSegmentId: null, // when set, the map shows this segment instead of the full route
+  selectedSegmentSource: null, // "starred" | "route" - which of the two segment buckets selectedSegmentId belongs to
+  // "Segmente auf der Strecke" (Task 3): segments found via Strava's public
+  // segment-explore API along the currently selected route, kept in a
+  // separate parallel bucket from the user's starred segments above so the
+  // two sources never overwrite each other's weather/details/PR-watts data.
+  routeSegments: [],
+  routeSegmentWeather: {},
+  routeSegmentDetails: {},
+  routeSegmentPrWatts: {},
+  navOpen: false, // left slide-in nav drawer open/closed
+  activePage: "route", // "route" | "segments" - which NAV_ITEMS entry is active
   routeSourceTab: "activities", // "routes" | "activities" | "gpx"
   stravaRoutes: [], // saved/planned Strava routes, fetched lazily when that tab opens
   routeInfoTab: "elevation", // "elevation" | "climbs" | "beststart"
@@ -496,27 +558,66 @@ function computeStrongWindWarning(){
   return { maxWind, maxGust };
 }
 
-// ---------- wind field overlay (grid of small wind arrows over the map) ----------
-// Optional, off by default (toggle in renderRouteCard): a static NxN grid of
-// wind arrows spanning the route's map bounds, similar in spirit to a
-// Windy.com-style field but without animation. Open-Meteo accepts
-// comma-separated lists of coordinates in a single request, so the whole
-// grid costs exactly one extra API call, regardless of grid size.
-const WIND_FIELD_GRID_SIZE = 10; // 10x10 = 100 points per fetch (Open-Meteo's per-request location cap)
+// ---------- wind field overlay (arrows sampled along the route) ----------
+// Optional, off by default (toggle in renderRouteCard): a field of small
+// wind arrows tracking the route, similar in spirit to a Windy.com-style
+// field but without animation. Open-Meteo accepts comma-separated lists of
+// coordinates in a single request, so the whole field costs exactly one
+// extra API call, regardless of point count.
+//
+// This used to be a fixed 10x10 grid spanning the map's current
+// getBounds() — fine for a short, roughly square-ish route, but for a long
+// route (which needs the map zoomed out much further to fit) the same 100
+// points get spread across a much bigger box, so arrow density near the
+// route itself drops and long stretches can end up with no nearby arrows at
+// all. Sampling along state.fullRouteCoords instead (reusing the same
+// buildCumulativeDistances()/pickRoutePoints() pattern used to place the
+// weather-sample route points) keeps arrow density tied to the route's own
+// length, not the map's zoom level, so both a short loop and a long century
+// route end up with arrows tracking their whole path.
+const WIND_FIELD_MAX_POINTS = 100; // Open-Meteo's per-request location cap (see ensureWindField below)
+const WIND_FIELD_LATERAL_OFFSETS_KM = [-1.2, 0, 1.2]; // perpendicular spread around each along-route sample, so arrows read as a "field" around the route rather than markers directly on top of the line
+const WIND_FIELD_MIN_STEP_KM = 0.5; // floor so very short routes don't get a near-zero along-route step
 
-function computeWindFieldGridPoints(bounds){
-  const south = bounds.getSouth(), north = bounds.getNorth();
-  const west = bounds.getWest(), east = bounds.getEast();
+// Offsets (lat, lon) from a point by a compass bearing (0=N, clockwise) and
+// a distance in km — flat-earth approximation, plenty accurate at the scale
+// of a single ride route.
+function offsetLatLon(lat, lon, bearingDeg, distanceKm){
+  const bearingRad = bearingDeg * Math.PI / 180;
+  const kmPerDegLat = 110.574;
+  const kmPerDegLon = 111.320 * Math.cos(lat * Math.PI / 180) || 1e-6;
+  return {
+    lat: lat + (distanceKm * Math.cos(bearingRad)) / kmPerDegLat,
+    lon: lon + (distanceKm * Math.sin(bearingRad)) / kmPerDegLon
+  };
+}
+
+function computeWindFieldRoutePoints(coords){
+  if(coords.length < 2) return [];
+  const cumDist = buildCumulativeDistances(coords);
+  const totalKm = cumDist[cumDist.length - 1] || 0;
+  if(totalKm <= 0) return [];
+
+  // Budget the along-route samples so samples * lateral-offsets stays within
+  // the Open-Meteo per-request cap, then space them evenly across the whole
+  // route length (short routes get a dense field, long routes get a sparser
+  // one, but both cover start-to-finish).
+  const samplesBudget = Math.max(1, Math.floor(WIND_FIELD_MAX_POINTS / WIND_FIELD_LATERAL_OFFSETS_KM.length));
+  const stepKm = Math.max(WIND_FIELD_MIN_STEP_KM, totalKm / samplesBudget);
+  const samples = pickRoutePoints(coords, cumDist, stepKm);
+
   const points = [];
-  for(let i=0;i<WIND_FIELD_GRID_SIZE;i++){
-    for(let j=0;j<WIND_FIELD_GRID_SIZE;j++){
-      points.push({
-        lat: south + (north - south) * (i + 0.5) / WIND_FIELD_GRID_SIZE,
-        lon: west + (east - west) * (j + 0.5) / WIND_FIELD_GRID_SIZE
-      });
-    }
-  }
-  return points;
+  samples.forEach(s=>{
+    const perpBearing = (s.bearing + 90) % 360;
+    WIND_FIELD_LATERAL_OFFSETS_KM.forEach(offsetKm=>{
+      if(offsetKm === 0) points.push({ lat: s.lat, lon: s.lon });
+      else points.push(offsetLatLon(s.lat, s.lon, perpBearing, offsetKm));
+    });
+  });
+
+  // Hard cap regardless of how pickRoutePoints() rounds its last point —
+  // stay within Open-Meteo's documented per-request location cap.
+  return points.slice(0, WIND_FIELD_MAX_POINTS);
 }
 
 // Windfeld overlay arrows encode ABSOLUTE wind speed, drawn directly on top
@@ -627,10 +728,10 @@ function renderRangeRingsRow(){
   return el("div", {style:"display:flex; justify-content:space-around; gap:6px; margin-top:14px;"}, rings);
 }
 
-async function ensureWindField(bounds){
+async function ensureWindField(){
   if(state.windFieldPoints || state.loading.windField) return;
   state.loading.windField = true; render();
-  const grid = computeWindFieldGridPoints(bounds);
+  const grid = computeWindFieldRoutePoints(state.fullRouteCoords);
   try{
     const lats = grid.map(p => p.lat.toFixed(3)).join(",");
     const lons = grid.map(p => p.lon.toFixed(3)).join(",");
@@ -995,7 +1096,7 @@ function renderBestStartContent(card){
 }
 
 function renderRouteInfoTabsCard(){
-  if(state.selectedSegmentId) return null;
+  if(isShowingSegmentDetail()) return null;
   if(!state.routePoints.length || !state.weatherAtRoute.length) return null;
 
   const card = el("div", {class:"card"});
@@ -1166,6 +1267,20 @@ async function fetchActivityDetail(activityId, token){
   return res.json();
 }
 
+// Strava's public segment database, bbox-scoped (see computeRouteExploreBboxes
+// / ensureRouteSegments below for how the route gets chunked into several of
+// these calls). Distinct from fetchStarredSegments — this surfaces segments
+// the athlete hasn't necessarily starred/ridden, anywhere Strava considers
+// "popular" within the given rectangle.
+async function fetchSegmentExplore(bbox, token){
+  const bounds = `${bbox.swLat.toFixed(5)},${bbox.swLon.toFixed(5)},${bbox.neLat.toFixed(5)},${bbox.neLon.toFixed(5)}`;
+  const res = await fetch(`https://www.strava.com/api/v3/segments/explore?bounds=${bounds}&activity_type=riding`, {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok) throw new Error("Segmente konnten nicht geladen werden (" + res.status + ")");
+  return res.json();
+}
+
 // ---------- Open-Meteo ----------
 async function fetchWeather(lat, lon, targetDate){
   targetDate = targetDate || new Date();
@@ -1193,33 +1308,81 @@ async function fetchWeather(lat, lon, targetDate){
   };
 }
 
+// ---------- nav drawer ----------
+// Single array driving the drawer's nav list — the "build the shell now"
+// requirement: adding a third destination later is just appending another
+// {id,label} entry here, nothing else in renderNavDrawer()/render() needs to
+// change.
+const NAV_ITEMS = [
+  {id:"route", label:"Strecke"},
+  {id:"segments", label:"Meine Segmente"}
+];
+
+function hamburgerIconSvg(){
+  return `<svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+    <line x1="1.5" y1="4" x2="14.5" y2="4" stroke="#f2efe9" stroke-width="1.6" stroke-linecap="round"/>
+    <line x1="1.5" y1="8" x2="14.5" y2="8" stroke="#f2efe9" stroke-width="1.6" stroke-linecap="round"/>
+    <line x1="1.5" y1="12" x2="14.5" y2="12" stroke="#f2efe9" stroke-width="1.6" stroke-linecap="round"/>
+  </svg>`;
+}
+
+function renderNavDrawer(){
+  const close = ()=>{ state.navOpen = false; render(); };
+  const backdrop = el("div", {
+    class: "nav-backdrop" + (state.navOpen ? " open" : ""),
+    onclick: close
+  });
+  const items = NAV_ITEMS.map(item => el("div", {
+    class: "nav-item" + (state.activePage === item.id ? " active" : ""),
+    onclick: ()=>{ state.activePage = item.id; close(); }
+  }, [item.label]));
+  const drawer = el("div", {class: "nav-drawer" + (state.navOpen ? " open" : "")}, [
+    el("div", {class:"nav-drawer-title"}, ["Velo", el("span",{},["Cast"])]),
+    ...items
+  ]);
+  return [backdrop, drawer];
+}
+
 // ---------- render ----------
 function render(){
   const app = document.getElementById("app");
   app.innerHTML = "";
   app.appendChild(renderBrand());
+  renderNavDrawer().forEach(n => app.appendChild(n));
 
-  // Without any login there's no activity list or segments — but a loaded
-  // GPX route still needs the route card + map, not the plain connect screen.
-  if(!state.connected && !state.fullRouteCoords.length){
+  if(state.activePage === "segments"){
+    app.appendChild(renderSegmentsPage());
+  } else if(!state.connected && !state.fullRouteCoords.length){
+    // Without any login there's no activity list or segments — but a loaded
+    // GPX route still needs the route card + map, not the plain connect
+    // screen. Only applies to the "route" page; "Meine Segmente" has its own
+    // always-visible connect prompt inside renderSegmentsPage().
     app.appendChild(renderConnectCard());
-    app.appendChild(renderFootnote());
-    return;
+  } else {
+    app.appendChild(renderRouteCard());
+    const infoTabsCard = renderRouteInfoTabsCard();
+    if(infoTabsCard) app.appendChild(infoTabsCard);
+    const routeSegmentsCard = renderRouteSegmentsCard();
+    if(routeSegmentsCard) app.appendChild(routeSegmentsCard);
   }
 
-  app.appendChild(renderRouteCard());
-  const infoTabsCard = renderRouteInfoTabsCard();
-  if(infoTabsCard) app.appendChild(infoTabsCard);
-  if(state.connected){
-    app.appendChild(renderSegmentsCard());
-  }
   app.appendChild(renderFootnote());
+  // Called unconditionally (not just on the route page) so navigating away
+  // from a page that had the Leaflet map mounted still tears it down
+  // properly — mountRouteMap() already no-ops/cleans up when #route-map
+  // isn't present in the freshly rebuilt tree.
   requestAnimationFrame(mountRouteMap);
 }
 
 function renderBrand(){
   return el("div", {class:"brand"}, [
-    el("h1", {}, ["Velo", el("span",{},["Cast"])]),
+    el("div", {class:"brand-left"}, [
+      el("button", {
+        class:"hamburger-btn", type:"button", "aria-label":"Menü öffnen",
+        onclick: ()=>{ state.navOpen = true; render(); }
+      }, [el("span", {html: hamburgerIconSvg()})]),
+      el("h1", {}, ["Velo", el("span",{},["Cast"])])
+    ]),
     el("div", {class:"status"}, [
       el("span", {class:"dot" + (state.connected?" on":"")}, []),
       state.connected ? "verbunden" : "nicht verbunden"
@@ -1302,10 +1465,55 @@ async function loadActivitiesAndSegments(){
   state.loading.segments = true; render();
   try{
     state.segments = await fetchStarredSegments(state.accessToken);
-    await loadSegmentExtras();
+    await loadSegmentExtras(state.segments, segmentBucket("starred"));
   }catch(e){ state.error = e.message; }
   state.loading.segments = false;
   render();
+}
+
+// Bundles a segment source's four parallel state fields (list + weather +
+// details + PR-watts) into one object, so the segment-rendering pipeline
+// (renderSegmentRow, computeSegmentStatChips, ensureSegmentPrWatts, etc.) can
+// operate identically on either the user's starred segments or the
+// route-explore segments (Task 3) without duplicating ~150 lines of rendering
+// logic per source. "starred" == today's Markierte Segmente / state.segments;
+// "route" == the new Segmente-auf-der-Strecke / state.routeSegments.
+function segmentBucket(source){
+  return source === "route"
+    ? { source, list: state.routeSegments, weather: state.routeSegmentWeather, details: state.routeSegmentDetails, prWatts: state.routeSegmentPrWatts }
+    : { source: "starred", list: state.segments, weather: state.segmentWeather, details: state.segmentDetails, prWatts: state.segmentPrWatts };
+}
+
+// True while the map should be showing a single segment's detail view
+// (instead of the full route / the plain segment list) — i.e. a segment is
+// selected AND it belongs to whichever bucket is relevant on the currently
+// active page (a starred segment selected on "Meine Segmente" stays shown
+// there even if you'd left activePage on "route" some other way; a
+// route-explore segment only makes sense inside the route page). Centralized
+// here so renderRouteCard(), renderSegmentsPage(), currentRouteKey() and
+// mountRouteMap() can't disagree about it.
+function isShowingSegmentDetail(){
+  if(!state.selectedSegmentId) return false;
+  if(state.activePage === "segments") return state.selectedSegmentSource === "starred";
+  if(state.activePage === "route") return state.selectedSegmentSource === "route";
+  return false;
+}
+
+// Clears the route-explore segment bucket (Task 3) — called wherever the
+// underlying route identity changes (new activity/route/GPX selected), same
+// set of call sites as the existing elevationProfile/windFieldPoints resets
+// below, since a previous route's nearby-segments list has no meaning for a
+// newly selected route. Also drops the current selection if it pointed at a
+// route-explore segment that's about to be wiped out from under it.
+function resetRouteSegments(){
+  state.routeSegments = [];
+  state.routeSegmentWeather = {};
+  state.routeSegmentDetails = {};
+  state.routeSegmentPrWatts = {};
+  if(state.selectedSegmentSource === "route"){
+    state.selectedSegmentId = null;
+    state.selectedSegmentSource = null;
+  }
 }
 
 async function selectActivity(activity){
@@ -1313,6 +1521,7 @@ async function selectActivity(activity){
   state.elevationProfile = null;
   state.windFieldPoints = null;
   state.climbIndex = 0;
+  resetRouteSegments();
   render();
   if(!activity.map || !activity.map.summary_polyline){
     state.routePoints = [];
@@ -1325,13 +1534,16 @@ async function selectActivity(activity){
   const cumDist = buildCumulativeDistances(coords);
   state.routePoints = pickRoutePoints(coords, cumDist, state.routePointDistanceKm);
   render();
+  ensureRouteSegments(); // not awaited - independent of weather, runs in the background (same pattern as ensureWindField)
   await loadRouteWeather();
 }
 
 // Re-samples routePoints from the already-loaded fullRouteCoords — used
 // whenever Punktabstand changes, and after loading a GPX file or a saved
 // Strava route, since the full coordinate list doesn't need to change,
-// just how it's sliced into wind-sample points.
+// just how it's sliced into wind-sample points. Deliberately does NOT touch
+// elevationProfile/windFieldPoints/routeSegments — Punktabstand changing
+// doesn't change which route is loaded, so none of those need to reset.
 function recomputeRoutePoints(){
   if(!state.fullRouteCoords.length) return;
   const cumDist = buildCumulativeDistances(state.fullRouteCoords);
@@ -1363,6 +1575,7 @@ async function selectStravaRoute(route){
   state.elevationProfile = null;
   state.windFieldPoints = null;
   state.climbIndex = 0;
+  resetRouteSegments();
   render();
   const poly = route.map && (route.map.polyline || route.map.summary_polyline);
   if(!poly){
@@ -1373,6 +1586,7 @@ async function selectStravaRoute(route){
   }
   state.fullRouteCoords = decodePolyline(poly);
   recomputeRoutePoints();
+  ensureRouteSegments(); // not awaited, see selectActivity()
 }
 
 // ---------- GPX import ----------
@@ -1411,11 +1625,15 @@ async function loadGpxFile(file){
   state.selectedActivity = { name: file.name.replace(/\.gpx$/i, ""), isGpx: true };
   state.windFieldPoints = null;
   state.climbIndex = 0;
+  resetRouteSegments();
   state.fullRouteCoords = track.coords;
   state.elevationProfile = track.eles.every(e => e != null)
     ? { distances: buildCumulativeDistances(track.coords), elevations: track.eles }
     : { distances: [], elevations: [] };
   recomputeRoutePoints();
+  // No-op if not connected (ensureRouteSegments needs an access token) - a
+  // GPX-only route just never gets this data, see renderRouteSegmentsCard().
+  ensureRouteSegments();
 }
 
 async function loadRouteWeather(){
@@ -1438,20 +1656,25 @@ async function loadRouteWeather(){
   render();
 }
 
-async function loadSegmentExtras(){
-  for(const seg of state.segments.slice(0, 12)){
+// Fetches per-segment weather + Strava detail (PR, KOM/QOM, elevation,
+// effort count) for a list of segments into the given bucket's weather/
+// details maps. Shared by both segment sources (see segmentBucket()) — the
+// starred-segments flow calls this from loadActivitiesAndSegments(), the
+// route-explore flow from ensureRouteSegments() below.
+async function loadSegmentExtras(list, bucket){
+  for(const seg of list.slice(0, 12)){
     if(seg.start_latlng){
       try{
         const w = await fetchWeather(seg.start_latlng[0].toFixed(4), seg.start_latlng[1].toFixed(4));
-        state.segmentWeather[seg.id] = w;
+        bucket.weather[seg.id] = w;
       }catch(e){
-        state.segmentWeather[seg.id] = null;
+        bucket.weather[seg.id] = null;
       }
     }
     try{
-      state.segmentDetails[seg.id] = await fetchSegmentDetail(seg.id, state.accessToken);
+      bucket.details[seg.id] = await fetchSegmentDetail(seg.id, state.accessToken);
     }catch(e){
-      state.segmentDetails[seg.id] = null;
+      bucket.details[seg.id] = null;
     }
     render();
   }
@@ -1461,20 +1684,122 @@ async function loadSegmentExtras(){
 // fetch per segment to find it, so we only do this on demand (when a
 // segment is clicked) instead of eagerly for all visible segments, to keep
 // Strava API usage down.
-async function ensureSegmentPrWatts(seg){
-  if(state.segmentPrWatts[seg.id] !== undefined) return;
-  const detail = state.segmentDetails[seg.id];
+async function ensureSegmentPrWatts(seg, bucket){
+  if(bucket.prWatts[seg.id] !== undefined) return;
+  const detail = bucket.details[seg.id];
   const prActivityId = detail && detail.athlete_segment_stats && detail.athlete_segment_stats.pr_activity_id;
-  if(!prActivityId){ state.segmentPrWatts[seg.id] = null; return; }
+  if(!prActivityId){ bucket.prWatts[seg.id] = null; return; }
   try{
     const activity = await fetchActivityDetail(prActivityId, state.accessToken);
     const effort = (activity.segment_efforts || []).find(e => e.segment && e.segment.id === seg.id);
-    state.segmentPrWatts[seg.id] = (effort && effort.average_watts != null)
+    bucket.prWatts[seg.id] = (effort && effort.average_watts != null)
       ? { watts: Math.round(effort.average_watts), measured: !!effort.device_watts }
       : null;
   }catch(e){
-    state.segmentPrWatts[seg.id] = null;
+    bucket.prWatts[seg.id] = null;
   }
+  render();
+}
+
+// ---------- "Segmente auf der Strecke" (Task 3): Strava public segment
+// database via segments/explore, matched against the current route ----------
+// segments/explore is bbox-based, caps results per call (historically ~10),
+// and has no idea what the route's actual path looks like — a single call
+// over the whole route's bounding box would both miss segments (long/winding
+// routes) and surface segments that are just "somewhere in that rectangle",
+// nowhere near the actual path. So the route gets sliced into several
+// smaller bboxes along its length instead (one explore call each, capped),
+// results are deduped by id, then filtered down to segments whose start
+// point is genuinely close to the route.
+const ROUTE_SEGMENT_CHUNK_KM = 8;      // target route-length per bbox chunk
+const ROUTE_SEGMENT_MAX_CALLS = 8;     // hard cap on explore API calls per route
+const ROUTE_SEGMENT_BBOX_PAD_DEG = 0.01; // ~1.1km padding so segments right at a chunk's edge aren't missed
+const ROUTE_SEGMENT_BUFFER_KM = 0.3;   // proximity buffer (~300m) to state.fullRouteCoords for the final path-relevance filter
+
+// Splits the route into up to ROUTE_SEGMENT_MAX_CALLS bounding boxes along
+// its length. If distance-based chunking would need more calls than the cap
+// (long routes), evenly-spaced chunks covering the FULL route length are
+// kept instead of just the first N, so a long route's back half isn't
+// silently skipped.
+function computeRouteExploreBboxes(coords){
+  if(coords.length < 2) return [];
+  const cumDist = buildCumulativeDistances(coords);
+  const totalKm = cumDist[cumDist.length - 1] || 0;
+  if(totalKm <= 0) return [];
+
+  const rawChunkCount = Math.max(1, Math.ceil(totalKm / ROUTE_SEGMENT_CHUNK_KM));
+  let chunkIndexes = Array.from({length: rawChunkCount}, (_, i) => i);
+  if(rawChunkCount > ROUTE_SEGMENT_MAX_CALLS){
+    const picked = new Set();
+    for(let i=0;i<ROUTE_SEGMENT_MAX_CALLS;i++){
+      picked.add(Math.round(i * (rawChunkCount - 1) / (ROUTE_SEGMENT_MAX_CALLS - 1)));
+    }
+    chunkIndexes = [...picked].sort((a,b)=>a-b);
+  }
+
+  const chunkKm = totalKm / rawChunkCount;
+  const bboxes = [];
+  chunkIndexes.forEach(i=>{
+    const fromKm = i * chunkKm;
+    const toKm = Math.min(totalKm, (i + 1) * chunkKm);
+    let lats = [], lons = [];
+    for(let k=0;k<coords.length;k++){
+      if(cumDist[k] >= fromKm - 1e-9 && cumDist[k] <= toKm + 1e-9){
+        lats.push(coords[k][0]); lons.push(coords[k][1]);
+      }
+    }
+    if(!lats.length) return;
+    bboxes.push({
+      swLat: Math.min(...lats) - ROUTE_SEGMENT_BBOX_PAD_DEG,
+      swLon: Math.min(...lons) - ROUTE_SEGMENT_BBOX_PAD_DEG,
+      neLat: Math.max(...lats) + ROUTE_SEGMENT_BBOX_PAD_DEG,
+      neLon: Math.max(...lons) + ROUTE_SEGMENT_BBOX_PAD_DEG
+    });
+  });
+  return bboxes;
+}
+
+// Fetches + filters segments along the current route into state.routeSegments.
+// No-ops (and leaves the card showing its "connect to Strava" hint instead)
+// when not connected, since the explore endpoint needs an access token and
+// has no meaning for a GPX-only route.
+async function ensureRouteSegments(){
+  if(!state.connected || !state.fullRouteCoords.length) return;
+  state.loading.routeSegments = true; render();
+  try{
+    const bboxes = computeRouteExploreBboxes(state.fullRouteCoords);
+    const seen = new Map();
+    for(const bbox of bboxes){
+      try{
+        const data = await fetchSegmentExplore(bbox, state.accessToken);
+        (data.segments || []).forEach(s=>{
+          if(!seen.has(s.id)) seen.set(s.id, s);
+        });
+      }catch(e){
+        // one chunk failing shouldn't block the rest of the route
+      }
+    }
+    // Path-relevance filter: keep only segments whose start point is close
+    // to SOME point on the actual route, not merely inside one of the
+    // (rectangular, path-agnostic) bboxes above — same level of
+    // approximation the per-list-item wind tag already uses elsewhere in
+    // this file (checking against the route's start point only).
+    const near = [...seen.values()].filter(s =>
+      s.start_latlng && state.fullRouteCoords.some(c => haversineKm(c, s.start_latlng) <= ROUTE_SEGMENT_BUFFER_KM)
+    ).map(s => ({
+      // segments/explore returns `avg_grade`, while the starred-segments /
+      // segment-detail endpoints use `average_grade` — normalize here so
+      // renderSegmentRow() can read one consistent field regardless of
+      // source bucket.
+      ...s,
+      average_grade: s.average_grade != null ? s.average_grade : s.avg_grade
+    }));
+    state.routeSegments = near;
+    await loadSegmentExtras(state.routeSegments, segmentBucket("route"));
+  }catch(e){
+    state.error = e.message;
+  }
+  state.loading.routeSegments = false;
   render();
 }
 
@@ -1525,15 +1850,16 @@ function renderListItemWindTag(key){
 function renderRouteCard(){
   const card = el("div", {class:"card"});
 
-  if(state.selectedSegmentId){
-    const seg = state.segments.find(s => s.id === state.selectedSegmentId);
+  if(isShowingSegmentDetail()){
+    const bucket = segmentBucket("route");
+    const seg = bucket.list.find(s => s.id === state.selectedSegmentId);
     card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
       el("h2", {style:"margin:0;"}, ["Segment"]),
-      el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{ state.selectedSegmentId = null; render(); }}, ["Zur Strecke"])
+      el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{ state.selectedSegmentId = null; state.selectedSegmentSource = null; render(); }}, ["Zur Strecke"])
     ]));
 
     if(seg){
-      card.appendChild(renderSegmentRow(seg, {clickable:false}));
+      card.appendChild(renderSegmentRow(seg, bucket, {clickable:false}));
     }
 
     card.appendChild(routeMapContainer);
@@ -1542,33 +1868,27 @@ function renderRouteCard(){
 
   card.appendChild(el("h2", {}, ["Strecke"]));
 
+  // Sync the persistent settings-row inputs' live values from state before
+  // (re)inserting them — see the "persistent settings-row inputs" comment
+  // near their declaration below for why these are never recreated by el().
+  syncPersistentInputValue(startTimeInput, state.startTime);
+  syncPersistentInputValue(avgSpeedInput, String(state.avgSpeedKmh));
+  syncPersistentInputValue(routePointDistanceSelect, String(state.routePointDistanceKm));
+
   const settingsRow = el("div", {class:"settings-row"}, [
     el("div", {}, [
       el("label", {}, ["Startzeit"]),
       el("div", {style:"display:flex; justify-content:center;"}, [
-        el("input", {type:"datetime-local", style:"width:100%;", value: state.startTime, onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }})
+        startTimeInput
       ])
     ]),
     el("div", {}, [
       el("label", {}, ["Ø Geschwindigkeit (km/h)"]),
-      el("input", {type:"number", style:"width:100%;", min:"5", max:"60", step:"1", value: state.avgSpeedKmh, onchange:(e)=>{ state.avgSpeedKmh = parseFloat(e.target.value) || 25; saveSettings(); loadRouteWeather(); }})
+      avgSpeedInput
     ]),
     el("div", {}, [
       el("label", {}, ["Punktabstand"]),
-      el("select", {
-        style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:var(--r-sm); padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
-        onchange:(e)=>{
-          state.routePointDistanceKm = parseInt(e.target.value, 10) || 10;
-          saveSettings();
-          if(state.fullRouteCoords.length) recomputeRoutePoints();
-        }
-      }, [
-        el("option", {value:"5", selected: state.routePointDistanceKm === 5 ? "selected" : null}, ["alle 5 km"]),
-        el("option", {value:"10", selected: state.routePointDistanceKm === 10 ? "selected" : null}, ["alle 10 km"]),
-        el("option", {value:"15", selected: state.routePointDistanceKm === 15 ? "selected" : null}, ["alle 15 km"]),
-        el("option", {value:"20", selected: state.routePointDistanceKm === 20 ? "selected" : null}, ["alle 20 km"]),
-        el("option", {value:"25", selected: state.routePointDistanceKm === 25 ? "selected" : null}, ["alle 25 km"])
-      ])
+      routePointDistanceSelect
     ])
   ]);
   card.appendChild(settingsRow);
@@ -1766,6 +2086,69 @@ function renderRouteCard(){
 // selected (multiple renders fire in quick succession while weather loads).
 const routeMapContainer = el("div", {id:"route-map", style:"margin-top:14px;"});
 
+// Persistent settings-row inputs — same "created once, re-inserted not
+// re-created" pattern as routeMapContainer above. Letting el() build a fresh
+// <input>/<select> node on every render() is merely wasteful for a plain
+// number/select, but it's actively dangerous for the Startzeit
+// datetime-local input: Safari's datetime-local control is backed by a real
+// OS-level picker overlay, and WebKit can crash the whole renderer process
+// if the DOM node underneath an actively-focused/mid-interaction native
+// control gets destroyed and replaced out from under it. That's exactly
+// what happened here — this input's own onchange calls loadRouteWeather(),
+// which calls render() twice in quick succession (once synchronously when
+// weather loading starts, once again when it finishes), and Safari can fire
+// `change` per-segment (e.g. right after editing just the hour) while the
+// native picker overlay is still open. Keeping the node persistent and only
+// ever mutating its .value (never recreating it) avoids that entirely. The
+// avg-speed input and Punktabstand select are fixed the same way for
+// consistency, since they're the same category of bug even though a plain
+// number/select is much less likely to crash outright.
+const startTimeInput = el("input", {
+  type:"datetime-local", style:"width:100%;",
+  onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }
+});
+const avgSpeedInput = el("input", {
+  type:"number", style:"width:100%;", min:"5", max:"60", step:"1",
+  onchange:(e)=>{ state.avgSpeedKmh = parseFloat(e.target.value) || 25; saveSettings(); loadRouteWeather(); }
+});
+const routePointDistanceSelect = el("select", {
+  style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:var(--r-sm); padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
+  onchange:(e)=>{
+    state.routePointDistanceKm = parseInt(e.target.value, 10) || 10;
+    saveSettings();
+    if(state.fullRouteCoords.length) recomputeRoutePoints();
+  }
+}, [
+  el("option", {value:"5"}, ["alle 5 km"]),
+  el("option", {value:"10"}, ["alle 10 km"]),
+  el("option", {value:"15"}, ["alle 15 km"]),
+  el("option", {value:"20"}, ["alle 20 km"]),
+  el("option", {value:"25"}, ["alle 25 km"])
+]);
+
+// Pushes a fresh state value into a persistent input/select's live .value —
+// guarded so it never overwrites a value the user is still actively typing.
+// Note: render() does `app.innerHTML = ""` before rebuilding the tree (see
+// render() above), which itself synchronously blurs whatever was focused —
+// so in practice, by the time this runs from inside renderRouteCard()/
+// renderSegmentsCard(), document.activeElement is never still inputEl. That
+// blur-on-every-render is a pre-existing property of the "rebuild everything"
+// architecture (it happened before this fix too — el() used to hand back a
+// brand new node every render either way) and is not what this fix targets;
+// it isn't a regression. What matters for the Safari crash is that the same
+// <input> Element object survives that detach/reattach instead of being
+// destroyed and replaced by a new one (which is what let WebKit's native
+// datetime-local picker end up pointing at a torn-down node). The guard is
+// still kept, both because it's what was asked for and because it's the
+// correct defensive check if this ever gets called from anywhere that
+// *doesn't* wipe focus first — and since state.startTime/etc. were only
+// ever written here from that same input's own already-committed onchange
+// value, re-syncing never actually discards unsaved user input either way.
+function syncPersistentInputValue(inputEl, value){
+  if(document.activeElement === inputEl) return;
+  if(inputEl.value !== value) inputEl.value = value;
+}
+
 let leafletMapInstance = null;
 let routeMapLayers = null; // L.layerGroup holding everything drawn on top of the base tiles for the current route/segment
 let mountedRouteKey = null; // identifies which route/segment leafletMapInstance is currently showing
@@ -1775,7 +2158,7 @@ let routeMarkerByIndex = {}; // routePoints index -> Leaflet marker (for weather
 // data" (keep the map + tiles, only redraw the overlay layer) from
 // "switched to a different route" (full teardown + fresh mount needed).
 function currentRouteKey(){
-  if(state.selectedSegmentId) return "segment-" + state.selectedSegmentId;
+  if(isShowingSegmentDetail()) return "segment-" + state.selectedSegmentSource + "-" + state.selectedSegmentId;
   if(!state.fullRouteCoords.length) return null;
   const a = state.selectedActivity;
   return "route-" + (a ? (a.id || a.name || "") : "");
@@ -1805,7 +2188,7 @@ function mountRouteMap(){
     routeMapLayers.clearLayers();
   }
 
-  if(state.selectedSegmentId){
+  if(isShowingSegmentDetail()){
     mountSegmentView(leafletMapInstance, routeMapLayers, state.selectedSegmentId, isNewRoute);
   } else {
     mountFullRouteView(leafletMapInstance, routeMapLayers, isNewRoute);
@@ -1813,8 +2196,9 @@ function mountRouteMap(){
 }
 
 function mountSegmentView(map, layers, segId, isNewRoute){
-  const seg = state.segments.find(s => s.id === segId);
-  const detail = state.segmentDetails[segId];
+  const bucket = segmentBucket(state.selectedSegmentSource);
+  const seg = bucket.list.find(s => s.id === segId);
+  const detail = bucket.details[segId];
   const poly = detail && detail.map && (detail.map.polyline || detail.map.summary_polyline);
   if(!seg || !poly) return;
 
@@ -1822,7 +2206,7 @@ function mountSegmentView(map, layers, segId, isNewRoute){
   const latlngs = coords.map(c => [c[0], c[1]]);
 
   let color = "#82a2d1", label = escapeHtml(seg.name);
-  const w = state.segmentWeather[segId];
+  const w = bucket.weather[segId];
   if(w && seg.start_latlng && seg.end_latlng){
     const bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
     const rel = windRelative(bearing, w.windDir);
@@ -1871,12 +2255,12 @@ function mountFullRouteView(map, layers, isNewRoute){
   const baseLine = L.polyline(latlngs, { color:"#333a47", weight:3, opacity:0.55, lineCap:"round", lineJoin:"round" }).addTo(layers);
   if(isNewRoute) map.fitBounds(baseLine.getBounds(), { padding:[26,26] });
 
-  // optional "Windfeld" overlay — a static grid of small wind arrows under
-  // the route line, toggled in renderRouteCard(). Added before the route
+  // optional "Windfeld" overlay — a field of small wind arrows sampled along
+  // the route, toggled in renderRouteCard(). Added before the route
   // line/markers below so it stays visually underneath them.
   if(state.windFieldEnabled){
     if(!state.windFieldPoints && !state.loading.windField){
-      ensureWindField(map.getBounds());
+      ensureWindField();
     } else if(state.windFieldPoints){
       state.windFieldPoints.forEach(p=>{
         const color = windSpeedColor(p.windSpeed);
@@ -1964,14 +2348,16 @@ function mountFullRouteView(map, layers, isNewRoute){
 
 // PR time, PR watts, KOM/QOM, elevation gain, effort count — as {value,
 // label} pairs (value = the hero numeral, label = the small caption under
-// it), used both in the segment list and the segment map view.
-function computeSegmentStatChips(seg){
-  const detail = state.segmentDetails[seg.id];
+// it), used both in the segment list and the segment map view. Takes a
+// bucket (see segmentBucket()) so it works identically for starred and
+// route-explore segments.
+function computeSegmentStatChips(seg, bucket){
+  const detail = bucket.details[seg.id];
   const stats = [];
   if(detail){
     const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
     if(pr != null) stats.push({value: fmtDuration(pr), label:"PR"});
-    const prWatts = state.segmentPrWatts[seg.id];
+    const prWatts = bucket.prWatts[seg.id];
     if(prWatts) stats.push({value: `${prWatts.measured ? "" : "~"}${prWatts.watts}`, label:"Watt"});
     if(detail.xoms && detail.xoms.kom) stats.push({value: `${detail.xoms.kom}`, label:"KOM"});
     if(detail.xoms && detail.xoms.qom) stats.push({value: `${detail.xoms.qom}`, label:"QOM"});
@@ -1983,40 +2369,48 @@ function computeSegmentStatChips(seg){
 }
 
 // diff = 0 means pure tailwind, 180 means pure headwind (see windRelative)
-function segmentTailwindDiff(seg){
-  const w = state.segmentWeather[seg.id];
+function segmentTailwindDiff(seg, bucket){
+  const w = bucket.weather[seg.id];
   if(!w || !seg.start_latlng || !seg.end_latlng) return Infinity;
   const bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
   return windRelative(bearing, w.windDir).diff;
 }
 
-function sortedVisibleSegments(){
-  const list = state.segments.slice(0, 12);
-  const effortCount = seg => (state.segmentDetails[seg.id] && state.segmentDetails[seg.id].athlete_segment_stats && state.segmentDetails[seg.id].athlete_segment_stats.effort_count) || 0;
+// Sorting UI only exists on the "Meine Segmente" (starred) page today, so
+// this stays keyed off the shared state.segmentSortBy — but it's still
+// bucket-parameterized like everything else here in case a future nav entry
+// wants sorting over a different bucket.
+function sortedVisibleSegments(bucket){
+  const list = bucket.list.slice(0, 12);
+  const effortCount = seg => (bucket.details[seg.id] && bucket.details[seg.id].athlete_segment_stats && bucket.details[seg.id].athlete_segment_stats.effort_count) || 0;
   switch(state.segmentSortBy){
     case "effort": return list.slice().sort((a,b) => effortCount(b) - effortCount(a));
     case "shortest": return list.slice().sort((a,b) => a.distance - b.distance);
     case "longest": return list.slice().sort((a,b) => b.distance - a.distance);
     case "steepest": return list.slice().sort((a,b) => b.average_grade - a.average_grade);
-    case "tailwind": return list.slice().sort((a,b) => segmentTailwindDiff(a) - segmentTailwindDiff(b));
+    case "tailwind": return list.slice().sort((a,b) => segmentTailwindDiff(a, bucket) - segmentTailwindDiff(b, bucket));
     default: return list;
   }
 }
 
 // Renders a single segment "card" (icon, name, distance/grade, wind tag,
-// stat chips) — shared between the segments list and the segment map view,
-// so both look identical.
-function renderSegmentRow(seg, opts){
+// stat chips) — shared between both segment lists (starred + route-explore)
+// and the segment map view, so all three look identical. `bucket` supplies
+// this segment's weather/details/PR-watts data; opts.source ("starred" |
+// "route", default "starred") is what gets passed to selectSegment() so the
+// right bucket is looked up again on click/selection-highlight.
+function renderSegmentRow(seg, bucket, opts){
   opts = opts || {};
-  const w = state.segmentWeather[seg.id];
+  const source = opts.source || bucket.source || "starred";
+  const w = bucket.weather[seg.id];
   let bearing = null;
   if(seg.start_latlng && seg.end_latlng){
     bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
   }
-  const isSelected = state.selectedSegmentId === seg.id;
+  const isSelected = state.selectedSegmentId === seg.id && state.selectedSegmentSource === source;
   const clickable = opts.clickable !== false;
   const rowClass = "segment" + (isSelected ? " selected" : "") + (clickable ? "" : " static");
-  const row = el("div", clickable ? {class:rowClass, onclick:()=>selectSegment(seg)} : {class:rowClass});
+  const row = el("div", clickable ? {class:rowClass, onclick:()=>selectSegment(seg, source)} : {class:rowClass});
 
   let badgeColor = "var(--chalk-dim)", tagClass = "", tagText = "k.A.", arrowHtml = "";
   if(w && bearing !== null){
@@ -2039,7 +2433,7 @@ function renderSegmentRow(seg, opts){
   const top = el("div", {class:"top"}, [left, el("div", {class:"tag " + tagClass}, [tagText])]);
   row.appendChild(top);
 
-  const stats = computeSegmentStatChips(seg);
+  const stats = computeSegmentStatChips(seg, bucket);
   if(stats.length){
     const chips = el("div", {class:"stat-chips"});
     stats.forEach(s => chips.appendChild(statChip(s.value, s.label)));
@@ -2049,16 +2443,38 @@ function renderSegmentRow(seg, opts){
   return row;
 }
 
-function selectSegment(seg){
-  state.selectedSegmentId = state.selectedSegmentId === seg.id ? null : seg.id;
+function selectSegment(seg, source){
+  source = source || "starred";
+  const same = state.selectedSegmentId === seg.id && state.selectedSegmentSource === source;
+  state.selectedSegmentId = same ? null : seg.id;
+  state.selectedSegmentSource = same ? null : source;
   render();
-  if(state.selectedSegmentId) ensureSegmentPrWatts(seg);
+  if(state.selectedSegmentId) ensureSegmentPrWatts(seg, segmentBucket(source));
   requestAnimationFrame(()=>{
     const mapEl = document.getElementById("route-map");
     if(mapEl) mapEl.scrollIntoView({behavior:"smooth", block:"center"});
   });
 }
 
+// Same persistent-node pattern as the settings-row inputs above (see the
+// comment there) — this select's onchange also calls render() directly, so
+// letting el() recreate it fresh every render meant this <select> node was
+// destroyed and replaced from under itself on every single sort change.
+const segmentSortSelect = el("select", {
+  style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:var(--r-sm); padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
+  onchange:(e)=>{ state.segmentSortBy = e.target.value; render(); }
+}, [
+  el("option", {value:"default"}, ["Standard"]),
+  el("option", {value:"tailwind"}, ["Bester Rückenwind zuerst"]),
+  el("option", {value:"effort"}, ["Am häufigsten gefahren"]),
+  el("option", {value:"shortest"}, ["Länge: kurz → lang"]),
+  el("option", {value:"longest"}, ["Länge: lang → kurz"]),
+  el("option", {value:"steepest"}, ["Steilste zuerst"])
+]);
+
+// The plain starred-segments list (sort dropdown + rows) — content/behavior
+// unchanged from before Task 2, just now rendered from renderSegmentsPage()
+// on the "Meine Segmente" nav page instead of inline below the route card.
 function renderSegmentsCard(){
   const card = el("div", {class:"card"});
   card.appendChild(el("h2", {}, ["Markierte Segmente"]));
@@ -2072,25 +2488,93 @@ function renderSegmentsCard(){
     return card;
   }
 
+  syncPersistentInputValue(segmentSortSelect, state.segmentSortBy);
   card.appendChild(el("div", {style:"margin-bottom:14px;"}, [
     el("label", {}, ["Sortierung"]),
-    el("select", {
-      style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:var(--r-sm); padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
-      onchange:(e)=>{ state.segmentSortBy = e.target.value; render(); }
-    }, [
-      el("option", {value:"default", selected: state.segmentSortBy==="default" ? "selected" : null}, ["Standard"]),
-      el("option", {value:"tailwind", selected: state.segmentSortBy==="tailwind" ? "selected" : null}, ["Bester Rückenwind zuerst"]),
-      el("option", {value:"effort", selected: state.segmentSortBy==="effort" ? "selected" : null}, ["Am häufigsten gefahren"]),
-      el("option", {value:"shortest", selected: state.segmentSortBy==="shortest" ? "selected" : null}, ["Länge: kurz → lang"]),
-      el("option", {value:"longest", selected: state.segmentSortBy==="longest" ? "selected" : null}, ["Länge: lang → kurz"]),
-      el("option", {value:"steepest", selected: state.segmentSortBy==="steepest" ? "selected" : null}, ["Steilste zuerst"])
-    ])
+    segmentSortSelect
   ]));
 
-  sortedVisibleSegments().forEach(seg=>{
-    card.appendChild(renderSegmentRow(seg));
+  const bucket = segmentBucket("starred");
+  sortedVisibleSegments(bucket).forEach(seg=>{
+    card.appendChild(renderSegmentRow(seg, bucket));
   });
 
+  return card;
+}
+
+// "Meine Segmente" nav page (Task 2). Connect-prompt when not connected
+// (mirrors renderConnectCard()'s Strava button, since starred segments have
+// no meaning without an account); the plain list when connected and nothing
+// selected; or — when a starred segment is selected — that segment's detail
+// view (map + back button) as the page's ENTIRE content, unlike the route
+// page where the equivalent detail view sits above the still-visible full
+// list. That's a deliberate difference from the route page's pattern: this
+// page has no separate "route" above it to hold a persistent list, so
+// swapping the whole page is the natural equivalent of the "Zur Strecke"
+// back-button pattern there.
+function renderSegmentsPage(){
+  if(!state.connected){
+    const card = el("div", {class:"card"});
+    card.appendChild(el("h2", {}, ["Meine Segmente"]));
+    card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [
+      "Verbinde dich mit Strava, um deine markierten (gesternten) Segmente mit Windbewertung zu sehen."
+    ]));
+    const stravaBtn = el("button", {class:"btn", style:"width:100%;", onclick: ()=>{ window.location.href = buildAuthUrl(); }}, [state.loading.connect ? "Verbinde…" : "Mit Strava einloggen →"]);
+    if(state.loading.connect) stravaBtn.disabled = true;
+    card.appendChild(stravaBtn);
+    return card;
+  }
+
+  if(isShowingSegmentDetail()){
+    const bucket = segmentBucket("starred");
+    const seg = bucket.list.find(s => s.id === state.selectedSegmentId);
+    const card = el("div", {class:"card"});
+    card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
+      el("h2", {style:"margin:0;"}, ["Segment"]),
+      el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{ state.selectedSegmentId = null; state.selectedSegmentSource = null; render(); }}, ["Zurück zur Liste"])
+    ]));
+    if(seg) card.appendChild(renderSegmentRow(seg, bucket, {clickable:false}));
+    card.appendChild(routeMapContainer);
+    return card;
+  }
+
+  return renderSegmentsCard();
+}
+
+// "Segmente auf der Strecke" (Task 3) — Strava's public segment-explore
+// results matched against the current route, rendered with the exact same
+// row treatment as the starred-segments list via the shared bucket-based
+// functions above.
+function renderRouteSegmentsCard(){
+  if(!state.fullRouteCoords.length) return null;
+  const card = el("div", {class:"card"});
+  card.appendChild(el("h2", {}, ["Segmente auf der Strecke"]));
+
+  if(!state.connected){
+    card.appendChild(el("div", {class:"muted"}, ["Verbinde mit Strava, um Segmente entlang dieser Strecke zu sehen."]));
+    return card;
+  }
+
+  // Honest about what this is: segments/explore is a curated/popular-segment
+  // API scoped to a handful of bounding boxes along the route, not an
+  // exhaustive scan of every Strava segment that touches the path.
+  card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px; font-size:12px;"}, [
+    "Beliebte Strava-Segmente entlang dieser Strecke."
+  ]));
+
+  if(state.loading.routeSegments){
+    card.appendChild(el("div", {class:"loading"}, ["Suche Segmente entlang der Strecke…"]));
+    return card;
+  }
+
+  const bucket = segmentBucket("route");
+  const list = bucket.list.slice(0, 12);
+  if(!list.length){
+    card.appendChild(el("div", {class:"muted"}, ["Keine bekannten Strava-Segmente entlang dieser Strecke gefunden."]));
+    return card;
+  }
+
+  list.forEach(seg => card.appendChild(renderSegmentRow(seg, bucket)));
   return card;
 }
 
