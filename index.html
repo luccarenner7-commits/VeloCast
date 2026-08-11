@@ -356,6 +356,22 @@ function fmtDuration(sec){
   const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = Math.floor(sec%60);
   return h > 0 ? `${h}:${pad2(m)}:${pad2(s)}` : `${m}:${pad2(s)}`;
 }
+// Inverse of fmtDuration(sec) — parses a "M:SS" or "H:MM:SS" duration string
+// (the shape Strava returns for detail.xoms.kom/.qom) back into total
+// seconds. Returns null — never throws, never NaN — for anything that isn't
+// cleanly 2 or 3 numeric, non-negative, colon-separated parts, so callers can
+// skip a delta computation instead of showing garbage.
+function parseDuration(str){
+  if(typeof str !== "string") return null;
+  const parts = str.trim().split(":");
+  if(parts.length !== 2 && parts.length !== 3) return null;
+  const nums = parts.map(p => p.trim() === "" ? NaN : Number(p));
+  if(nums.some(n => !Number.isFinite(n) || n < 0)) return null;
+  const sec = nums.length === 3
+    ? nums[0]*3600 + nums[1]*60 + nums[2]
+    : nums[0]*60 + nums[1];
+  return Number.isFinite(sec) ? sec : null;
+}
 
 const savedSettings = loadSettings();
 
@@ -2437,8 +2453,8 @@ function computeSegmentStatChips(seg, bucket){
     if(pr != null) stats.push({value: fmtDuration(pr), label:"PR"});
     const prWatts = bucket.prWatts[seg.id];
     if(prWatts) stats.push({value: `${prWatts.measured ? "" : "~"}${prWatts.watts}`, label:"Watt"});
-    if(detail.xoms && detail.xoms.kom) stats.push({value: `${detail.xoms.kom}`, label:"KOM"});
-    if(detail.xoms && detail.xoms.qom) stats.push({value: `${detail.xoms.qom}`, label:"QOM"});
+    if(detail.xoms && detail.xoms.kom) stats.push(buildXomChip(detail.xoms.kom, pr, "KOM"));
+    if(detail.xoms && detail.xoms.qom) stats.push(buildXomChip(detail.xoms.qom, pr, "QOM"));
     if(detail.total_elevation_gain != null) stats.push({value: `${Math.round(detail.total_elevation_gain)}`, label:"Hm"});
     const effortCount = detail.athlete_segment_stats && detail.athlete_segment_stats.effort_count;
     if(effortCount) stats.push({value: `${effortCount}`, label:"× gefahren"});
@@ -2446,17 +2462,43 @@ function computeSegmentStatChips(seg, bucket){
   return stats;
 }
 
+// Builds the KOM/QOM stat chip: the record time stays the hero value (.v,
+// unchanged — the primary number this chip exists to show), with the
+// athlete's delta-to-record folded into the label (.l) whenever it can be
+// computed, e.g. "KOM +0:47" ("this far behind the record"), so the chip's
+// existing value/label structure and width stay intact. Falls back to the
+// plain "KOM"/"QOM" label — exactly today's rendering — when xomTime is
+// missing/unparseable or prSeconds (the athlete's all-time PR,
+// detail.athlete_segment_stats.pr_elapsed_time in both callers — same field
+// used for the "PR" chip, not a ride-specific effort time) is unavailable.
+// A PR that is <= the KOM/QOM time (should not normally happen — the athlete
+// would then *be* the record holder — but can occur with a stale/cached
+// xoms value) shows a distinct "on par" label instead of a negative delta.
+// Shared by computeSegmentStatChips() (starred bucket) and
+// computeRideEffortStatChips() (ride-completed bucket) so the parsing/delta
+// logic lives in one place and the two lists can't drift out of sync.
+function buildXomChip(xomTime, prSeconds, label){
+  const xomSeconds = parseDuration(xomTime);
+  let chipLabel = label;
+  if(xomSeconds != null && prSeconds != null){
+    const deltaSeconds = prSeconds - xomSeconds;
+    chipLabel = deltaSeconds > 0 ? `${label} +${fmtDuration(deltaSeconds)}` : `${label} GLEICHAUF`;
+  }
+  return {value: `${xomTime}`, label: chipLabel};
+}
+
 // This ride's own time/watts on the segment, plus a PR/KOM badge when this
 // effort actually was one — pulled straight from the activity's
 // segment_efforts (see ensureRideSegments()), no extra fetches. Ride-specific
 // stats lead (that's the "how did I do on this ride" framing this card
 // exists for), then the same all-time detail-derived stats the starred list
-// shows (all-time PR, KOM/QOM holder, elevation gain, effort count) are
+// shows (all-time PR, KOM/QOM time, elevation gain, effort count) are
 // appended from `detail` — the same bucket.details[seg.id] shape/fetch
 // computeSegmentStatChips() reads from for starred segments, just not read
 // here before. Note effort.kom_rank ("was this specific effort itself in the
 // segment's all-time top 10") and detail.xoms.kom (the segment's current KOM
-// holder's name) are different things and both are shown, not merged.
+// time, e.g. "3:23" — confirmed against the live app, not just docs) are
+// different things and both are shown, not merged.
 // `detail` can be missing (e.g. a failed detail fetch) same as in the
 // starred branch, so every detail-derived chip below is guarded.
 function computeRideEffortStatChips(effort, prWatts, detail){
@@ -2469,8 +2511,8 @@ function computeRideEffortStatChips(effort, prWatts, detail){
   if(detail){
     const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
     if(pr != null) stats.push({value: fmtDuration(pr), label:"PR"});
-    if(detail.xoms && detail.xoms.kom) stats.push({value: `${detail.xoms.kom}`, label:"KOM"});
-    if(detail.xoms && detail.xoms.qom) stats.push({value: `${detail.xoms.qom}`, label:"QOM"});
+    if(detail.xoms && detail.xoms.kom) stats.push(buildXomChip(detail.xoms.kom, pr, "KOM"));
+    if(detail.xoms && detail.xoms.qom) stats.push(buildXomChip(detail.xoms.qom, pr, "QOM"));
     if(detail.total_elevation_gain != null) stats.push({value: `${Math.round(detail.total_elevation_gain)}`, label:"Hm"});
     const effortCount = detail.athlete_segment_stats && detail.athlete_segment_stats.effort_count;
     if(effortCount) stats.push({value: `${effortCount}`, label:"× gefahren"});
