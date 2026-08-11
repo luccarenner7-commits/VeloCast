@@ -1777,21 +1777,31 @@ async function ensureSegmentPrWatts(seg, bucket){
 // routes) and surface segments that are just "somewhere in that rectangle",
 // nowhere near the actual path. So the route gets sliced into several
 // smaller bboxes along its length instead (one explore call each, capped),
-// results are deduped by id, then filtered down to segments whose start
-// point is genuinely close to the route.
-const ROUTE_SEGMENT_CHUNK_KM = 8;      // target route-length per bbox chunk (short routes)
-const ROUTE_SEGMENT_MAX_CALLS = 8;     // hard cap on explore API calls per route
+// results are deduped by id, then filtered down to segments whose actual
+// path (not just its start point) genuinely runs close to the route.
+//
+// CHUNK_KM/MAX_CALLS were tightened from 8km/8 calls to 4km/15 calls: the
+// ~10-result cap on each explore call means a segment-dense chunk (a popular
+// climbing region, a city) can silently drop segments beyond the cap, and
+// since this whole fetch is on-demand (behind the "Segmente laden" button,
+// never automatic) there's headroom to trade a few more seconds of load time
+// for denser sampling — see computeRouteExploreBboxes()'s comment for the
+// contiguous-coverage math at these new numbers.
+const ROUTE_SEGMENT_CHUNK_KM = 4;      // target route-length per bbox chunk (short routes)
+const ROUTE_SEGMENT_MAX_CALLS = 15;    // hard cap on explore API calls per route
 const ROUTE_SEGMENT_BBOX_PAD_DEG = 0.01; // ~1.1km padding so segments right at a chunk's edge aren't missed
-const ROUTE_SEGMENT_BUFFER_KM = 0.3;   // proximity buffer (~300m) to state.fullRouteCoords for the final path-relevance filter
+const ROUTE_SEGMENT_BUFFER_KM = 0.3;   // proximity buffer (~300m) to the route's path for the final path-relevance filter
 
 // Splits the route into up to ROUTE_SEGMENT_MAX_CALLS bounding boxes along
-// its length. Short routes (<= ROUTE_SEGMENT_MAX_CALLS * ROUTE_SEGMENT_CHUNK_KM)
-// get one ~ROUTE_SEGMENT_CHUNK_KM-wide, fine-grained chunk every CHUNK_KM.
-// Long routes are capped at ROUTE_SEGMENT_MAX_CALLS chunks, but each chunk is
-// WIDENED to totalKm / chunkCount so the capped number of bboxes still
-// together span the FULL route length with (approximately) contiguous, gapless
-// coverage — e.g. a 150km route gets 8 bboxes of ~18.75km each covering all
-// 150km, not 8 narrow 8km windows with big unqueried gaps between them.
+// its length. Short routes (<= ROUTE_SEGMENT_MAX_CALLS * ROUTE_SEGMENT_CHUNK_KM,
+// i.e. <= 60km at the current 4km/15-call settings) get one ~ROUTE_SEGMENT_
+// CHUNK_KM-wide, fine-grained chunk every CHUNK_KM. Longer routes are capped
+// at ROUTE_SEGMENT_MAX_CALLS chunks, but each chunk is WIDENED to totalKm /
+// chunkCount so the capped number of bboxes still together span the FULL
+// route length with (approximately) contiguous, gapless coverage — e.g. a
+// 150km route gets 15 bboxes of exactly 10km each covering all 150km, not 15
+// narrow 4km windows with big unqueried gaps between them. A short ~20km
+// route stays at the full 4km density (5 chunks, no widening needed).
 function computeRouteExploreBboxes(coords){
   if(coords.length < 2) return [];
   const cumDist = buildCumulativeDistances(coords);
@@ -1824,6 +1834,95 @@ function computeRouteExploreBboxes(coords){
     });
   }
   return bboxes;
+}
+
+// Walks route coordinates by cumulative distance, emitting one coordinate
+// every stepKm — same walking pattern as pickRoutePoints() above, but
+// deliberately NOT calling it: pickRoutePoints() has its own internal
+// `Math.max(1, stepKm)` floor, which is correct for its other caller (the
+// weather-sampling "Punktabstand" point selection, minimum 5km) but would
+// silently clamp the sub-1km step this proximity sampler needs down to 1km.
+// This is a small standalone copy of the walk instead, with its own floor
+// (0.001km) that only guards against a zero/negative stepKm, not a real
+// minimum-spacing floor. Only used by sampleRouteCoordsForProximity() below;
+// pickRoutePoints() itself and its other call sites are untouched.
+function sampleCoordsByDistance(coords, cumDist, stepKm){
+  if(coords.length < 2) return coords.slice();
+  const step = Math.max(0.001, stepKm);
+  const totalDistance = cumDist[cumDist.length - 1] || 0;
+  const points = [];
+  let targetDistance = 0;
+  let idx = 0;
+  let lastDist = -1;
+  while(targetDistance <= totalDistance + 1e-9){
+    while(idx < cumDist.length - 1 && cumDist[idx] < targetDistance) idx++;
+    points.push(coords[idx]);
+    lastDist = cumDist[idx];
+    targetDistance += step;
+  }
+  if(lastDist < totalDistance - 1e-6){
+    points.push(coords[coords.length - 1]);
+  }
+  return points;
+}
+
+// Builds a reasonably dense, but bounded, sample of the route's coordinates
+// for the path-vs-path proximity check in segmentMatchesRoute() below.
+// state.routePoints (used for weather sampling) defaults to one point every
+// 10km+ and is user-configurable even sparser — nowhere near dense enough for
+// a ~300m buffer check, so this builds its own sample instead, via
+// sampleCoordsByDistance() (see its comment for why this can't just reuse
+// pickRoutePoints()). Step size is at least 150m (well under the 300m
+// buffer, so no real gap in coverage for typical routes), but grows for very
+// long routes so the total sample count stays capped around ~800 points
+// regardless of route length — e.g. a 120km route samples every 150m (~800
+// points), a 240km route every ~300m (still ~800 points), keeping the
+// proximity check below bounded no matter how long or how many raw GPS
+// points the route has.
+function sampleRouteCoordsForProximity(coords){
+  if(coords.length < 2) return coords.slice();
+  const cumDist = buildCumulativeDistances(coords);
+  const totalKm = cumDist[cumDist.length - 1] || 0;
+  if(totalKm <= 0) return coords.slice(0, 1);
+  const stepKm = Math.max(0.15, totalKm / 800);
+  return sampleCoordsByDistance(coords, cumDist, stepKm);
+}
+
+// Path-relevance check for one candidate segment against the (sampled) route
+// coordinates: true if ANY point along the segment's actual path is within
+// ROUTE_SEGMENT_BUFFER_KM of ANY sampled route point — a real path-vs-path
+// check, not just "does the segment's start point sit near the route".
+// segments/explore returns a `points` encoded polyline per segment (same
+// format decodePolyline() already handles for activity/route polylines), so
+// most segments get the full path check. The segment's own polyline is also
+// downsampled (every few points, capped around 40 samples) — a segment's
+// polyline can run to hundreds of points for a long climb, and checking
+// every single one against every sampled route point isn't needed for a
+// 300m buffer to still catch a real match; this mirrors the same
+// "reduced/sampled points are good enough at this buffer size" approximation
+// used for weather sampling and wind-tag classification elsewhere in this
+// file. The segment's last point is always checked too (even if the stride
+// would otherwise skip past it) so a segment that only touches the route
+// right at its very end isn't missed.
+// Falls back to start_latlng/end_latlng proximity (the old behavior) if
+// `points` is missing or fails to decode, rather than dropping the segment
+// or throwing.
+function segmentMatchesRoute(segment, routeSampleCoords){
+  let segCoords = null;
+  if(segment.points){
+    try{ segCoords = decodePolyline(segment.points); }catch(e){ segCoords = null; }
+  }
+  if(segCoords && segCoords.length){
+    const stride = Math.max(1, Math.ceil(segCoords.length / 40));
+    for(let i = 0; i < segCoords.length; i += stride){
+      if(routeSampleCoords.some(c => haversineKm(c, segCoords[i]) <= ROUTE_SEGMENT_BUFFER_KM)) return true;
+    }
+    const last = segCoords[segCoords.length - 1];
+    if(routeSampleCoords.some(c => haversineKm(c, last) <= ROUTE_SEGMENT_BUFFER_KM)) return true;
+    return false;
+  }
+  const fallbackPoints = [segment.start_latlng, segment.end_latlng].filter(Boolean);
+  return fallbackPoints.some(pt => routeSampleCoords.some(c => haversineKm(c, pt) <= ROUTE_SEGMENT_BUFFER_KM));
 }
 
 // Bumped by resetRouteSegments() every time the underlying route identity
@@ -1897,13 +1996,15 @@ async function ensureRouteSegments(){
       render();
     }
     if(myGeneration !== routeSegmentsGeneration) return;
-    // Path-relevance filter: keep only segments whose start point is close
+    // Path-relevance filter: keep only segments whose actual path runs close
     // to SOME point on the actual route, not merely inside one of the
-    // (rectangular, path-agnostic) bboxes above — same level of
-    // approximation the per-list-item wind tag already uses elsewhere in
-    // this file (checking against the route's start point only).
+    // (rectangular, path-agnostic) bboxes above. See segmentMatchesRoute()
+    // for the path-vs-path check (falls back to start/end-point proximity if
+    // a segment has no usable `points` polyline) and
+    // sampleRouteCoordsForProximity() for how the route side is sampled.
+    const routeSampleCoords = sampleRouteCoordsForProximity(state.fullRouteCoords);
     const near = [...seen.values()].filter(s =>
-      s.start_latlng && state.fullRouteCoords.some(c => haversineKm(c, s.start_latlng) <= ROUTE_SEGMENT_BUFFER_KM)
+      segmentMatchesRoute(s, routeSampleCoords)
     ).map(s => ({
       // segments/explore returns `avg_grade`, while the starred-segments /
       // segment-detail endpoints use `average_grade` — normalize here so
