@@ -2422,11 +2422,14 @@ function mountFullRouteView(map, layers, isNewRoute){
 // the detail/PR-lookup fetches since it has no single ride to read numbers
 // off of. For the ride-completed-segments bucket (bucket.efforts set, see
 // ensureRideSegments()), computeRideEffortStatChips() below is used instead
-// — richer, ride-specific stats that are already on hand, no extra lookups
-// needed. Takes a bucket (see segmentBucket()) so callers don't need to know
-// which shape applies.
+// — it leads with richer, ride-specific stats that are already on hand, no
+// extra lookups needed, then appends the same all-time detail-derived stats
+// built here (bucket.details[seg.id] is fetched for both buckets by
+// loadSegmentExtras(), so no new fetch is needed for the ride case either).
+// Takes a bucket (see segmentBucket()) so callers don't need to know which
+// shape applies.
 function computeSegmentStatChips(seg, bucket){
-  if(bucket.efforts) return computeRideEffortStatChips(bucket.efforts[seg.id], bucket.prWatts[seg.id]);
+  if(bucket.efforts) return computeRideEffortStatChips(bucket.efforts[seg.id], bucket.prWatts[seg.id], bucket.details[seg.id]);
   const detail = bucket.details[seg.id];
   const stats = [];
   if(detail){
@@ -2445,17 +2448,33 @@ function computeSegmentStatChips(seg, bucket){
 
 // This ride's own time/watts on the segment, plus a PR/KOM badge when this
 // effort actually was one — pulled straight from the activity's
-// segment_efforts (see ensureRideSegments()), no extra fetches. Deliberately
-// a separate, parallel builder rather than force-fitting effort data through
-// computeSegmentStatChips()'s all-time-PR-lookup shape above, since the two
-// data shapes don't line up (this one already has everything it needs).
-function computeRideEffortStatChips(effort, prWatts){
+// segment_efforts (see ensureRideSegments()), no extra fetches. Ride-specific
+// stats lead (that's the "how did I do on this ride" framing this card
+// exists for), then the same all-time detail-derived stats the starred list
+// shows (all-time PR, KOM/QOM holder, elevation gain, effort count) are
+// appended from `detail` — the same bucket.details[seg.id] shape/fetch
+// computeSegmentStatChips() reads from for starred segments, just not read
+// here before. Note effort.kom_rank ("was this specific effort itself in the
+// segment's all-time top 10") and detail.xoms.kom (the segment's current KOM
+// holder's name) are different things and both are shown, not merged.
+// `detail` can be missing (e.g. a failed detail fetch) same as in the
+// starred branch, so every detail-derived chip below is guarded.
+function computeRideEffortStatChips(effort, prWatts, detail){
   const stats = [];
   if(!effort) return stats;
   if(effort.elapsed_time != null) stats.push({value: fmtDuration(effort.elapsed_time), label:"Zeit"});
   if(prWatts) stats.push({value: `${prWatts.measured ? "" : "~"}${prWatts.watts}`, label:"Watt"});
   if(effort.pr_rank === 1) stats.push({value:"PR!", label:"Bestzeit", style:"color:var(--tail); background:var(--tail-bg);"});
   if(effort.kom_rank) stats.push({value:`${effort.kom_rank}.`, label:"KOM/QOM"});
+  if(detail){
+    const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
+    if(pr != null) stats.push({value: fmtDuration(pr), label:"PR"});
+    if(detail.xoms && detail.xoms.kom) stats.push({value: `${detail.xoms.kom}`, label:"KOM"});
+    if(detail.xoms && detail.xoms.qom) stats.push({value: `${detail.xoms.qom}`, label:"QOM"});
+    if(detail.total_elevation_gain != null) stats.push({value: `${Math.round(detail.total_elevation_gain)}`, label:"Hm"});
+    const effortCount = detail.athlete_segment_stats && detail.athlete_segment_stats.effort_count;
+    if(effortCount) stats.push({value: `${effortCount}`, label:"× gefahren"});
+  }
   return stats;
 }
 
