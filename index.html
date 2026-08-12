@@ -462,6 +462,16 @@ let state = {
   // have them from the single activity-detail fetch. See
   // ensureRideSegments().
   routeSegmentEfforts: {},
+  // Independent sort selection for the "Abgeschlossene Segmente" card —
+  // deliberately its own field rather than reusing state.segmentSortBy
+  // below, so changing the sort order on one page (route vs. starred)
+  // never touches the other page's dropdown/state, even though both are
+  // driven by the same shared sortSegmentsBy() switch (see
+  // sortedVisibleSegments()/sortedRouteSegments() further down). NOT reset
+  // by resetRouteSegments() — a chosen sort persists across
+  // activity/route/GPX selection changes, same as segmentSortBy already
+  // persists globally on "Meine Segmente".
+  routeSegmentSortBy: "default",
   // True once a "Segmente laden" fetch has completed for the CURRENTLY
   // selected activity (success — even a genuine "no segments on this ride"
   // empty result — or failure) — gates whether renderRouteSegmentsCard()
@@ -2668,21 +2678,80 @@ function segmentTailwindDiff(seg, bucket){
   return windRelative(bearing, w.windDir).diff;
 }
 
-// Sorting UI only exists on the "Meine Segmente" (starred) page today, so
-// this stays keyed off the shared state.segmentSortBy — but it's still
-// bucket-parameterized like everything else here in case a future nav entry
-// wants sorting over a different bucket.
-function sortedVisibleSegments(bucket){
-  const list = bucket.list.slice(0, 12);
+// How close `seg`'s all-time PR is to its current KOM/QOM, as a fraction of
+// the record time — the exact same delta/closeness math buildXomChip() uses
+// for the chip's tint tiers (deltaSeconds / xomSeconds, negative/on-par
+// deltas clamped to 0 so "tied or ahead of the record" reads as maximally
+// close rather than sorting as if it were far away). Kept separate from
+// buildXomChip() itself since that function's job is building a display chip
+// (value/label/style), not returning a bare sortable number — but the two
+// must never compute the delta differently, hence the shared parseDuration()
+// + pr-minus-xom subtraction. Returns null (not sortable / "no data") when
+// detail, the PR, the xom time, or a parseable duration is missing, so
+// sortSegmentsBy()'s "kom"/"qom" cases can push those segments to the end
+// regardless of sort direction.
+function segmentXomCloseness(seg, bucket, xomKey){
+  const detail = bucket.details[seg.id];
+  if(!detail) return null;
+  const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
+  if(pr == null) return null;
+  const xomTime = detail.xoms && detail.xoms[xomKey];
+  if(!xomTime) return null;
+  const xomSeconds = parseDuration(xomTime);
+  if(xomSeconds == null) return null;
+  const deltaSeconds = pr - xomSeconds;
+  return Math.max(0, deltaSeconds) / xomSeconds;
+}
+
+// Ascending comparator for the "Nähe zum KOM/QOM" sorts where null means "no
+// closeness could be computed" (see segmentXomCloseness()) rather than
+// "zero/closest" — nulls always sort after every real number, on both ends
+// of the list, so segments with no PR/xom data don't masquerade as the
+// closest-to-the-record entries.
+function compareClosenessNullsLast(a, b){
+  if(a == null && b == null) return 0;
+  if(a == null) return 1;
+  if(b == null) return -1;
+  return a - b;
+}
+
+// Shared sort logic for both segment lists (starred "Meine Segmente" and
+// ride-completed "Abgeschlossene Segmente") — takes the already-sliced list
+// to sort plus the bucket (for detail/weather lookups) and a sortBy key, so
+// the two pages' sort dropdowns (state.segmentSortBy / state.
+// routeSegmentSortBy — deliberately separate state, see state.
+// routeSegmentSortBy's declaration) can each drive this one switch without
+// duplicating it. See sortedVisibleSegments()/sortedRouteSegments() below
+// for the two thin per-page wrappers.
+function sortSegmentsBy(list, bucket, sortBy){
   const effortCount = seg => (bucket.details[seg.id] && bucket.details[seg.id].athlete_segment_stats && bucket.details[seg.id].athlete_segment_stats.effort_count) || 0;
-  switch(state.segmentSortBy){
+  switch(sortBy){
     case "effort": return list.slice().sort((a,b) => effortCount(b) - effortCount(a));
     case "shortest": return list.slice().sort((a,b) => a.distance - b.distance);
     case "longest": return list.slice().sort((a,b) => b.distance - a.distance);
     case "steepest": return list.slice().sort((a,b) => b.average_grade - a.average_grade);
     case "tailwind": return list.slice().sort((a,b) => segmentTailwindDiff(a, bucket) - segmentTailwindDiff(b, bucket));
+    // Closest-to-record first (ascending fraction), no-data segments pushed
+    // to the end — see segmentXomCloseness()/compareClosenessNullsLast().
+    case "kom": return list.slice().sort((a,b) => compareClosenessNullsLast(segmentXomCloseness(a, bucket, "kom"), segmentXomCloseness(b, bucket, "kom")));
+    case "qom": return list.slice().sort((a,b) => compareClosenessNullsLast(segmentXomCloseness(a, bucket, "qom"), segmentXomCloseness(b, bucket, "qom")));
     default: return list;
   }
+}
+
+// Sorting UI has existed on the "Meine Segmente" (starred) page for a while,
+// keyed off state.segmentSortBy — the 12-item cap here is unrelated to
+// sorting itself (it predates the sort dropdown) and is preserved as-is.
+function sortedVisibleSegments(bucket){
+  return sortSegmentsBy(bucket.list.slice(0, 12), bucket, state.segmentSortBy);
+}
+
+// Same sorting, no cap — used by "Abgeschlossene Segmente" (see
+// renderRouteSegmentsCard()), which intentionally shows every completed
+// segment on the ride regardless of sort order. Keyed off its own
+// state.routeSegmentSortBy so the two pages' sort choices can't collide.
+function sortedRouteSegments(bucket){
+  return sortSegmentsBy(bucket.list, bucket, state.routeSegmentSortBy);
 }
 
 // Whether `seg` is currently starred on Strava, for the star button's
@@ -2847,6 +2916,29 @@ const segmentSortSelect = el("select", {
   el("option", {value:"steepest"}, ["Steilste zuerst"])
 ]);
 
+// Same persistent-node pattern and same reason as segmentSortSelect just
+// above (Safari crash from a live <select> being torn down and rebuilt from
+// under an open picker) — this is "Abgeschlossene Segmente"'s own sort
+// select, kept as a fully separate node/state field (state.
+// routeSegmentSortBy) so its dropdown selection can never leak into or be
+// clobbered by segmentSortSelect's, and vice versa. Same option set as
+// segmentSortSelect plus the two KOM/QOM-closeness options, which only make
+// sense here (and would work fine on "Meine Segmente" too, but weren't asked
+// for there).
+const routeSegmentSortSelect = el("select", {
+  style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:var(--r-sm); padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
+  onchange:(e)=>{ state.routeSegmentSortBy = e.target.value; render(); }
+}, [
+  el("option", {value:"default"}, ["Standard"]),
+  el("option", {value:"tailwind"}, ["Bester Rückenwind zuerst"]),
+  el("option", {value:"effort"}, ["Am häufigsten gefahren"]),
+  el("option", {value:"shortest"}, ["Länge: kurz → lang"]),
+  el("option", {value:"longest"}, ["Länge: lang → kurz"]),
+  el("option", {value:"steepest"}, ["Steilste zuerst"]),
+  el("option", {value:"kom"}, ["Nähe zum KOM (%)"]),
+  el("option", {value:"qom"}, ["Nähe zum QOM (%)"])
+]);
+
 // The plain starred-segments list (sort dropdown + rows) — content/behavior
 // unchanged from before Task 2, just now rendered from renderSegmentsPage()
 // on the "Meine Segmente" nav page instead of inline below the route card.
@@ -2978,20 +3070,27 @@ function renderRouteSegmentsCard(){
   }
 
   const bucket = segmentBucket("route");
-  // No cap here (unlike sortedVisibleSegments()'s starred-only slice(0,12)):
-  // ensureRideSegments()/loadSegmentExtras() above now fetch every completed
-  // segment for this ride, so the card must show all of them too — that's
-  // the whole point of "Abgeschlossene Segmente".
-  const list = bucket.list;
-  if(!list.length){
+  if(!bucket.list.length){
     // Reached only when routeSegmentsFetched is true, i.e. the fetch
     // genuinely completed — never on failure, which returns above instead.
     // A truly empty result here is a normal outcome (a short/flat ride with
-    // no segments on it), not an error.
+    // no segments on it), not an error. No sort dropdown either — nothing to
+    // sort.
     card.appendChild(el("div", {class:"muted"}, ["Auf dieser Fahrt wurden keine Segmente abgeschlossen."]));
     return card;
   }
 
+  syncPersistentInputValue(routeSegmentSortSelect, state.routeSegmentSortBy);
+  card.appendChild(el("div", {style:"margin-bottom:14px;"}, [
+    el("label", {}, ["Sortierung"]),
+    routeSegmentSortSelect
+  ]));
+
+  // No cap here (unlike sortedVisibleSegments()'s starred-only slice(0,12)):
+  // ensureRideSegments()/loadSegmentExtras() above now fetch every completed
+  // segment for this ride, so the card must show all of them too — that's
+  // the whole point of "Abgeschlossene Segmente".
+  const list = sortedRouteSegments(bucket);
   list.forEach(seg => card.appendChild(renderSegmentRow(seg, bucket)));
   return card;
 }
