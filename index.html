@@ -1518,11 +1518,27 @@ function render(){
   }
 
   app.appendChild(renderFootnote());
-  // Called unconditionally (not just on the route page) so navigating away
-  // from a page that had the Leaflet map mounted still tears it down
-  // properly — mountRouteMap() already no-ops/cleans up when #route-map
-  // isn't present in the freshly rebuilt tree.
-  requestAnimationFrame(mountRouteMap);
+  requestAnimationFrame(()=>{
+    // Called unconditionally (not just on the route page) so navigating away
+    // from a page that had the Leaflet map mounted still tears it down
+    // properly — mountRouteMap() already no-ops/cleans up when #route-map
+    // isn't present in the freshly rebuilt tree.
+    mountRouteMap();
+    // Mac Safari (user-reported) can leave a persistent <select>/<input> that
+    // was just detached+reattached by the app.innerHTML="" rebuild above in a
+    // stale native-rendering state — e.g. routeSegmentSortSelect showing an
+    // incomplete/wrong-looking dropdown even though its .options/.value are
+    // already objectively correct in the DOM at this point. Not reproducible
+    // in Chromium, so this is presumed to be a WebKit quirk rather than a
+    // data/logic bug. The only fix found so far was incidental: navigating
+    // away and back happens to force a full Leaflet teardown/rebuild, which
+    // reflows the whole page and seems to clear the stale state as a side
+    // effect. This forces that same kind of reflow directly, on every
+    // render, as a general (but unverified-on-real-Safari) attempt to fix it
+    // without depending on unrelated map churn — needs live Safari
+    // confirmation from the user before trusting it actually resolves this.
+    document.querySelectorAll('#app select, #app input').forEach(elx => void elx.offsetHeight);
+  });
 }
 
 function renderBrand(){
