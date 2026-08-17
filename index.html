@@ -194,6 +194,26 @@
   }
   .nav-item:hover{ border-color:var(--route); color:var(--chalk); }
   .nav-item.active{ background:var(--asphalt-3); border-color:var(--chalk); color:var(--chalk); }
+  /* Divider above the drawer's bottom-of-list, connected-only utility
+     actions (logout, external Strava-settings link) — visually separates
+     them from the page-nav items above so they don't read as a third
+     destination tab. */
+  .nav-drawer-divider{ height:1px; background:var(--line); margin:8px 4px; flex-shrink:0; }
+  /* Same padding/radius rhythm as .nav-item so it lines up in the list, but
+     deliberately muted (chalk-dim, no .active-style highlight state) since
+     these are one-shot actions/an external doorway, not a "currently on this
+     page" destination — reusing .nav-item.active here would wrongly imply
+     that. Shared by both the <button> (logout) and <a> (external link)
+     variants. */
+  .nav-action{
+    display:block; width:100%; box-sizing:border-box; text-align:left;
+    padding:12px 14px; border-radius:var(--r-md); cursor:pointer;
+    font-family:'Space Grotesk', sans-serif; font-weight:600; font-size:13px;
+    color:var(--chalk-dim); border:1px solid transparent; background:none;
+    text-decoration:none;
+  }
+  .nav-action:hover{ border-color:var(--route); color:var(--chalk); }
+  .nav-action:disabled{ opacity:0.5; cursor:default; }
   /* Connection status is a UI on/off state, not a wind-favorability judgment
      — deliberately neutral (chalk-dim/route) rather than red/green so it
      can't be misread as "bad wind / good wind". */
@@ -1487,11 +1507,104 @@ function renderNavDrawer(){
     class: "nav-item" + (state.activePage === item.id ? " active" : ""),
     onclick: ()=>{ state.activePage = item.id; close(); }
   }, [item.label]));
+  // Bottom-of-drawer utility actions — only meaningful while connected
+  // (nothing to log out of / no app permissions to review otherwise), so
+  // they're appended conditionally after the page-nav items rather than
+  // living in NAV_ITEMS (which drives page tabs, not one-shot actions).
+  const connectedActions = state.connected ? [
+    el("div", {class:"nav-drawer-divider"}),
+    el("a", {
+      class:"nav-action",
+      href:"https://www.strava.com/settings/apps",
+      target:"_blank",
+      rel:"noopener noreferrer"
+    }, ["Strava-Berechtigungen verwalten"]),
+    el("button", {
+      class:"nav-action",
+      type:"button",
+      disabled: state.loading.disconnect ? "disabled" : null,
+      onclick: disconnectFromStrava
+    }, [state.loading.disconnect ? "Trenne…" : "Von Strava abmelden"])
+  ] : [];
   const drawer = el("div", {class: "nav-drawer" + (state.navOpen ? " open" : "")}, [
     el("div", {class:"nav-drawer-title"}, ["Velo", el("span",{},["Cast"])]),
-    ...items
+    ...items,
+    ...connectedActions
   ]);
   return [backdrop, drawer];
+}
+
+// Logs out of Strava: best-effort revoke on Strava's side, then unconditional
+// full local session teardown. These are two independent concerns — the
+// revoke can fail for reasons that have nothing to do with whether the local
+// logout should proceed (see try/catch below) — but "Von Strava abmelden" is
+// a single user-facing action, so both live in one function.
+async function disconnectFromStrava(){
+  if(state.loading.disconnect) return; // guards a double-click from firing this twice
+  state.loading.disconnect = true; render();
+
+  // Best-effort revoke: this actually revokes VeloCast's Strava access
+  // (not just a local logout), which is why it's worth attempting at all.
+  // The access token can already be stale/expired or the network can be
+  // down though, and neither of those should leave the user stuck "logged
+  // in" locally — so failures here are swallowed (just a quiet console.warn)
+  // rather than blocking the local teardown that follows. Only the access
+  // token is needed as a query param; no client_id/secret involved, so this
+  // is called directly from the frontend without the Cloudflare Worker.
+  try{
+    await fetch(`https://www.strava.com/oauth/deauthorize?access_token=${state.accessToken}`, { method:"POST" });
+  }catch(e){
+    console.warn("Strava deauthorize call failed (logging out locally anyway):", e);
+  }
+
+  // Unconditional local teardown, regardless of whether the revoke above
+  // succeeded — see loadStoredToken()/saveToken() above for why this is the
+  // exact key name Strava-related tokens are stored under.
+  try{ localStorage.removeItem("strava_refresh_token"); }catch(e){}
+  resetConnectionState();
+  state.loading.disconnect = false;
+  state.navOpen = false;
+  state.activePage = "route"; // land back on the connect screen, not a page that requires a connection
+  render();
+}
+
+// Resets every Strava-derived field back to its pristine `let state = {...}`
+// initial value (see the top of this file). Deliberately leaves untouched:
+// avgSpeedKmh/routePointDistanceKm (persisted rider prefs, unrelated to the
+// Strava connection), startTime (recomputed fresh on next visit anyway), and
+// segmentSortBy/routeSegmentSortBy (UI prefs, not connection-derived data).
+function resetConnectionState(){
+  state.connected = false;
+  state.athlete = null;
+  state.accessToken = null;
+  state.activities = [];
+  state.selectedActivity = null;
+  state.routePoints = [];
+  state.fullRouteCoords = [];
+  state.weatherAtRoute = [];
+  state.segments = [];
+  state.segmentWeather = {};
+  state.segmentDetails = {};
+  state.segmentPrWatts = {};
+  state.selectedSegmentId = null;
+  state.selectedSegmentSource = null;
+  state.routeSegments = [];
+  state.routeSegmentWeather = {};
+  state.routeSegmentDetails = {};
+  state.routeSegmentPrWatts = {};
+  state.routeSegmentEfforts = {};
+  state.routeSegmentsFetched = false;
+  state.routeSegmentsError = null;
+  state.stravaRoutes = [];
+  state.elevationProfile = null;
+  state.windFieldPoints = null;
+  state.windFieldEnabled = false;
+  state.segmentStars = {};
+  state.routeWindCache = {};
+  // A fetch failure from while the user was still connected (e.g.
+  // loadActivitiesAndSegments()'s catch) would otherwise survive logout and
+  // render as a stale error banner on the very next-shown connect screen.
+  state.error = null;
 }
 
 // ---------- render ----------
