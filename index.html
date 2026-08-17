@@ -157,6 +157,13 @@
   .star-btn:disabled{ opacity:0.5; cursor:default; }
   .star-btn svg{ display:block; }
 
+  /* "Nicht relevant" toggle — same .star-btn icon-button shape/sizing, but
+     its .on tint uses --head (the app's existing red, otherwise only used
+     for headwind/warnings) instead of --route, so a marked-irrelevant
+     segment's button can never be mistaken for the star button's on-state
+     at a glance (see renderIrrelevantButton()/hideIconSvg()). */
+  .hide-btn.on{ border-color:var(--head); background:var(--head-bg); }
+
   /* Left slide-in nav drawer + backdrop. Both are plain el()-built nodes
      recreated on every render() like the rest of the tree (unlike
      routeMapContainer/the settings inputs, neither holds any mid-interaction
@@ -455,6 +462,21 @@ let state = {
   startTime: defaultStartTime(),
   avgSpeedKmh: savedSettings.avgSpeedKmh || 25,
   routePointDistanceKm: savedSettings.routePointDistanceKm || 10,
+  // Shared "nicht relevant" curation, same category as avgSpeedKmh/
+  // routePointDistanceKm above (a local rider preference, not Strava-derived
+  // data) — see loadSettings()/saveSettings() for the persistence and
+  // isSegmentIrrelevant()/toggleSegmentIrrelevant() for the read/write API.
+  // `!= null` (not `||`) so an explicit saved `false` survives a reload
+  // instead of being coerced back to the true default.
+  hideIrrelevantSegments: savedSettings.hideIrrelevantSegments != null ? savedSettings.hideIrrelevantSegments : true,
+  // id -> true map, mirroring state.segmentStars' id-keyed-object shape for
+  // O(1) lookup. Rebuilt from the plain id array saveSettings() persists
+  // (see loadSettings()'s JSON round-trip note there). ONE global set, not
+  // one per segment list: the same Strava segment id is the same real-world
+  // segment whether it's showing on "Meine Segmente" or "Abgeschlossene
+  // Segmente", so marking it irrelevant from either page must hide it on
+  // both (see visibleSegmentList()).
+  irrelevantSegmentIds: (savedSettings.irrelevantSegmentIds || []).reduce((acc, id) => { acc[id] = true; return acc; }, {}),
   segments: [],
   segmentWeather: {}, // id -> weather
   segmentDetails: {}, // id -> detailed segment (PR, KOM/QOM, elevation, effort count)
@@ -1306,7 +1328,12 @@ function saveSettings(){
   try{
     localStorage.setItem("velocast_settings", JSON.stringify({
       avgSpeedKmh: state.avgSpeedKmh,
-      routePointDistanceKm: state.routePointDistanceKm
+      routePointDistanceKm: state.routePointDistanceKm,
+      hideIrrelevantSegments: state.hideIrrelevantSegments,
+      // Serialized as a plain array (JSON has no id-map type) and rebuilt
+      // back into a {[id]: true} object on load — see state.
+      // irrelevantSegmentIds' declaration above.
+      irrelevantSegmentIds: Object.keys(state.irrelevantSegmentIds)
     }));
   }catch(e){}
 }
@@ -1495,6 +1522,24 @@ function starIconSvg(filled){
   return filled
     ? `<svg width="14" height="14" viewBox="0 0 24 24"><path d="${path}" fill="var(--route)" stroke="var(--route)" stroke-width="1.3" stroke-linejoin="round"/></svg>`
     : `<svg width="14" height="14" viewBox="0 0 24 24"><path d="${path}" fill="none" stroke="var(--chalk-dim)" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
+}
+
+// Icon for the "als nicht relevant markieren" button (see
+// renderIrrelevantButton()) — an eye that gains a diagonal slash once the
+// segment is marked irrelevant, the standard "hide/dismiss" glyph. Same
+// two-state-function shape as starIconSvg() above (plain markup string built
+// from CSS custom properties, no hardcoded colors), deliberately a different
+// silhouette AND a different "on" color (--head, not --route) so it never
+// reads as a second star button at this small size.
+function hideIconSvg(hidden){
+  const eye = "M1.5 12 C4 7.2 8 4.8 12 4.8 C16 4.8 20 7.2 22.5 12 C20 16.8 16 19.2 12 19.2 C8 19.2 4 16.8 1.5 12 Z";
+  const color = hidden ? "var(--head)" : "var(--chalk-dim)";
+  const slash = hidden ? `<line x1="3" y1="4" x2="21" y2="20" stroke-linecap="round"/>` : "";
+  return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="1.6" stroke-linejoin="round">
+    <path d="${eye}"/>
+    <circle cx="12" cy="12" r="3" fill="${hidden ? "none" : color}"/>
+    ${slash}
+  </svg>`;
 }
 
 function renderNavDrawer(){
@@ -2868,11 +2913,43 @@ function sortSegmentsBy(list, bucket, sortBy){
   }
 }
 
+// Whether `seg` has been locally marked "nicht relevant" — see
+// state.irrelevantSegmentIds' declaration for why this is one global,
+// id-keyed set shared by both segment lists rather than per-page state.
+function isSegmentIrrelevant(seg){
+  return !!state.irrelevantSegmentIds[seg.id];
+}
+
+// Flips `seg`'s membership in state.irrelevantSegmentIds and persists it.
+// Purely local curation — unlike toggleSegmentStar() above, there is no
+// Strava API call here (Strava has no concept of "relevance"), so this can
+// flip synchronously with no pending/error state to track.
+function toggleSegmentIrrelevant(seg){
+  if(state.irrelevantSegmentIds[seg.id]) delete state.irrelevantSegmentIds[seg.id];
+  else state.irrelevantSegmentIds[seg.id] = true;
+  saveSettings();
+  render();
+}
+
+// Shared filter step for both sorted*Segments() functions below: drops
+// segments marked irrelevant when state.hideIrrelevantSegments is on. Kept
+// as its own function (rather than inlined twice) so the starred and
+// ride-completed lists can never disagree about which segments are
+// currently hidden — both read the exact same state.hideIrrelevantSegments
+// field, which is the whole point of it being one shared switch (see the
+// toggle in renderSegmentsCard()/renderRouteSegmentsCard()).
+function visibleSegmentList(list){
+  return list.filter(seg => !(state.hideIrrelevantSegments && isSegmentIrrelevant(seg)));
+}
+
 // Sorting UI has existed on the "Meine Segmente" (starred) page for a while,
 // keyed off state.segmentSortBy — the 12-item cap here is unrelated to
 // sorting itself (it predates the sort dropdown) and is preserved as-is.
+// Irrelevant segments are filtered out BEFORE the cap (not after), so a
+// hidden segment never occupies one of the 12 slots at the expense of a
+// still-relevant one further down the list.
 function sortedVisibleSegments(bucket){
-  return sortSegmentsBy(bucket.list.slice(0, 12), bucket, state.segmentSortBy);
+  return sortSegmentsBy(visibleSegmentList(bucket.list).slice(0, 12), bucket, state.segmentSortBy);
 }
 
 // Same sorting, no cap — used by "Abgeschlossene Segmente" (see
@@ -2880,7 +2957,7 @@ function sortedVisibleSegments(bucket){
 // segment on the ride regardless of sort order. Keyed off its own
 // state.routeSegmentSortBy so the two pages' sort choices can't collide.
 function sortedRouteSegments(bucket){
-  return sortSegmentsBy(bucket.list, bucket, state.routeSegmentSortBy);
+  return sortSegmentsBy(visibleSegmentList(bucket.list), bucket, state.routeSegmentSortBy);
 }
 
 // Whether `seg` is currently starred on Strava, for the star button's
@@ -2952,6 +3029,38 @@ function renderStarButton(seg, bucket){
   }, [el("span", {html: starIconSvg(starred)})]);
 }
 
+// "Nicht relevant" toggle button for renderSegmentRow(), placed inline right
+// next to the star button in the same stat-chips row — same icon-button
+// idiom (ev.stopPropagation() so it doesn't also trigger the row's own
+// onclick into the segment's map detail view), but synchronous: this is pure
+// local state (see toggleSegmentIrrelevant()), no network round-trip to wait
+// on, so there's no `pending`/`disabled` case to render.
+function renderIrrelevantButton(seg){
+  const hidden = isSegmentIrrelevant(seg);
+  return el("button", {
+    class: "star-btn hide-btn" + (hidden ? " on" : ""),
+    type: "button",
+    "aria-label": hidden ? "Markierung als nicht relevant aufheben" : "Segment als nicht relevant markieren",
+    onclick: (ev)=>{ ev.stopPropagation(); toggleSegmentIrrelevant(seg); }
+  }, [el("span", {html: hideIconSvg(hidden)})]);
+}
+
+// Reusable pill-track + circular-thumb toggle switch, visually identical to
+// the "Windfeld der Umgebung anzeigen" switch on the route page (see
+// renderRouteCard()) — reproduced as a shared helper here (rather than
+// inlined again) because THIS switch has two verbatim call sites ("Meine
+// Segmente" and "Abgeschlossene Segmente") that must look and behave
+// identically, both reading/writing the same state.hideIrrelevantSegments
+// field so the two pages' switches always agree with each other.
+function renderToggleSwitch(checked, label, onToggle){
+  return el("div", {style:"display:flex; align-items:center; gap:8px; margin-bottom:14px; cursor:pointer;", onclick:onToggle}, [
+    el("div", {style:`width:34px; height:20px; border-radius:var(--r-full); flex-shrink:0; background:${checked ? "var(--route)" : "var(--asphalt-3)"}; position:relative; transition:background 0.15s;`}, [
+      el("div", {style:`width:16px; height:16px; border-radius:50%; background:#fff; position:absolute; top:2px; left:${checked ? "16px" : "2px"}; transition:left 0.15s;`})
+    ]),
+    el("span", {class:"muted", style:"font-size:12px;"}, [label])
+  ]);
+}
+
 // Renders a single segment "card" (icon, name, distance/grade, wind tag,
 // stat chips) — shared between both segment lists (starred + ride-completed)
 // and the segment map view, so all three look identical. `bucket` supplies
@@ -3004,6 +3113,7 @@ function renderSegmentRow(seg, bucket, opts){
   const chips = el("div", {class:"stat-chips"});
   stats.hero.forEach(s => chips.appendChild(statChip(s.value, s.label, s.style)));
   chips.appendChild(renderStarButton(seg, bucket));
+  chips.appendChild(renderIrrelevantButton(seg));
   row.appendChild(chips);
   if(stats.secondary.length){
     row.appendChild(el("div", {class:"stat-secondary"}, [stats.secondary.join(" · ")]));
@@ -3089,6 +3199,15 @@ function renderSegmentsCard(){
     el("label", {}, ["Sortierung"]),
     segmentSortSelect
   ]));
+
+  // state.hideIrrelevantSegments is shared with "Abgeschlossene Segmente"
+  // (see renderToggleSwitch()'s comment) — toggling it here also changes
+  // what that page's list shows, by design.
+  card.appendChild(renderToggleSwitch(
+    state.hideIrrelevantSegments,
+    "Nicht relevante Segmente ausblenden",
+    ()=>{ state.hideIrrelevantSegments = !state.hideIrrelevantSegments; saveSettings(); render(); }
+  ));
 
   const bucket = segmentBucket("starred");
   sortedVisibleSegments(bucket).forEach(seg=>{
@@ -3214,6 +3333,15 @@ function renderRouteSegmentsCard(){
     el("label", {}, ["Sortierung"]),
     routeSegmentSortSelect
   ]));
+
+  // Same shared state.hideIrrelevantSegments field as "Meine Segmente"'s
+  // switch (see renderToggleSwitch()'s comment) — a segment marked
+  // irrelevant from either page disappears from both.
+  card.appendChild(renderToggleSwitch(
+    state.hideIrrelevantSegments,
+    "Nicht relevante Segmente ausblenden",
+    ()=>{ state.hideIrrelevantSegments = !state.hideIrrelevantSegments; saveSettings(); render(); }
+  ));
 
   // No cap here (unlike sortedVisibleSegments()'s starred-only slice(0,12)):
   // ensureRideSegments()/loadSegmentExtras() above now fetch every completed
