@@ -372,6 +372,26 @@
   }
   .loading{ color: var(--chalk-dim); font-size:13px; font-family:'IBM Plex Mono', monospace; }
 
+  /* Segment Top-10 leaderboard (renderSegmentLeaderboard()) — the app's only
+     table-like layout, deliberately dense/compact rather than another stack
+     of .segment-style card rows: fixed grid columns (not manual flex gaps)
+     so rank/time/watts/HR line up as an aligned table despite being built
+     from el() divs, small mono type + tight padding for a scannable ranked
+     list of 10 rows, alternating-row tint instead of per-row borders/cards. */
+  .leaderboard{ font-family:'IBM Plex Mono', monospace; font-size:11px; }
+  .leaderboard-row{
+    display:grid; grid-template-columns: 20px 1fr 50px 48px 52px; gap:8px;
+    align-items:center; padding:5px 6px; border-radius:var(--r-xs);
+  }
+  .leaderboard-row:nth-child(even){ background:var(--asphalt-3); }
+  .leaderboard-head{
+    color:var(--chalk-dim); font-size:9px; font-weight:600; text-transform:uppercase;
+    letter-spacing:0.05em; background:none !important; border-bottom:1px solid var(--line);
+    border-radius:0; margin-bottom:2px; padding-bottom:6px;
+  }
+  .lb-name{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+  .lb-num{ text-align:right; color:var(--chalk-dim); white-space:nowrap; }
+
   .footnote{ font-size:11px; color: var(--chalk-dim); margin-top:26px; line-height:1.6; }
   a{ color: var(--route); }
 
@@ -481,6 +501,15 @@ let state = {
   segmentWeather: {}, // id -> weather
   segmentDetails: {}, // id -> detailed segment (PR, KOM/QOM, elevation, effort count)
   segmentPrWatts: {}, // id -> {watts, measured} for the PR effort, fetched lazily on click
+  // id -> {loading, entries, error} for a segment's Top-10 leaderboard (see
+  // fetchSegmentLeaderboard()/ensureSegmentLeaderboard()). Same transient,
+  // NOT-persisted-to-localStorage session cache as segmentPrWatts/
+  // routeSegmentDetails above (id-keyed regardless of which bucket the
+  // segment belongs to, since the leaderboard is a property of the segment
+  // itself, not of "starred" vs. "route"). Lazily fetched on demand — see
+  // renderSegmentLeaderboard()'s "Top 10 anzeigen" button — never eagerly,
+  // to avoid burning an extra Strava API call per segment shown.
+  segmentLeaderboards: {},
   segmentSortBy: "default",
   selectedSegmentId: null, // when set, the map shows this segment instead of the full route
   selectedSegmentSource: null, // "starred" | "route" - which of the two segment buckets selectedSegmentId belongs to
@@ -1462,6 +1491,25 @@ async function fetchActivityDetail(activityId, token){
   return res.json();
 }
 
+// Segment Top-10 leaderboard (see ensureSegmentLeaderboard()/
+// renderSegmentLeaderboard()). Strava has restricted third-party access to
+// this endpoint in the past — it may come back 401/403 (or 404/410) purely
+// due to this app's access level, independent of anything wrong here. `err.
+// status` is attached the same way starSegment() does it, so the caller can
+// tell "not permitted for this app" apart from a generic failure and show an
+// honest message instead of a silent/misleading one either way.
+async function fetchSegmentLeaderboard(id, token){
+  const res = await fetch(`https://www.strava.com/api/v3/segments/${id}/leaderboard?per_page=10`, {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok){
+    const err = new Error("Bestenliste nicht verfügbar (" + res.status + ")");
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
 // ---------- Open-Meteo ----------
 async function fetchWeather(lat, lon, targetDate){
   targetDate = targetDate || new Date();
@@ -1631,6 +1679,10 @@ function resetConnectionState(){
   state.segmentWeather = {};
   state.segmentDetails = {};
   state.segmentPrWatts = {};
+  // Fetched-from-Strava data tied to the now-invalidated access token, same
+  // category as segmentDetails/routeSegments above — a leaderboard fetched
+  // under one account/token has no business surviving into the next login.
+  state.segmentLeaderboards = {};
   state.selectedSegmentId = null;
   state.selectedSegmentSource = null;
   state.routeSegments = [];
@@ -2070,6 +2122,41 @@ async function ensureSegmentPrWatts(seg, bucket){
   render();
 }
 
+// Segment Top-10 leaderboard — lazy/manual only, same "extra Strava API
+// call, don't burn it eagerly" discipline as ensureRideSegments()'s
+// "Segmente laden" button (see renderSegmentLeaderboard()'s "Top 10
+// anzeigen" button, the only call site). Id-keyed rather than bucket-keyed
+// (see state.segmentLeaderboards) since the leaderboard is the same real
+// Strava data regardless of whether the segment is shown via the "starred"
+// or "route" bucket.
+async function ensureSegmentLeaderboard(seg){
+  const existing = state.segmentLeaderboards[seg.id];
+  // Already loaded or a fetch is already in flight — do nothing. Note this
+  // deliberately does NOT skip on a stored `error`, so calling this again
+  // after a failure (the render function's "Erneut versuchen" button) is a
+  // real retry rather than a permanent stuck state.
+  if(existing && (existing.loading || existing.entries)) return;
+  state.segmentLeaderboards[seg.id] = { loading: true, entries: null, error: null };
+  render();
+  try{
+    const data = await fetchSegmentLeaderboard(seg.id, state.accessToken);
+    state.segmentLeaderboards[seg.id] = { loading: false, entries: data.entries || [], error: null };
+  }catch(e){
+    // 401/403 most likely means Strava hasn't granted this app leaderboard
+    // access at all (see fetchSegmentLeaderboard()'s comment) rather than
+    // anything the user can fix by retrying, so it gets its own more honest
+    // message instead of the generic one.
+    const restricted = e.status === 401 || e.status === 403;
+    state.segmentLeaderboards[seg.id] = {
+      loading: false, entries: null,
+      error: restricted
+        ? "Bestenliste konnte nicht geladen werden (evtl. von Strava für diese App eingeschränkt)."
+        : "Bestenliste konnte nicht geladen werden. Bitte erneut versuchen."
+    };
+  }
+  render();
+}
+
 // ---------- "Abgeschlossene Segmente": segments actually ridden on the
 // currently selected Strava ACTIVITY, read from that activity's own
 // segment_efforts ----------
@@ -2230,9 +2317,23 @@ function renderRouteCard(){
     } else {
       card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
         el("h2", {style:"margin:0;"}, ["Segment"]),
-        el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{ state.selectedSegmentId = null; state.selectedSegmentSource = null; render(); }}, ["Zur Strecke"])
+        el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{
+          // Capture BEFORE clearing selectedSegmentId/Source below — reading
+          // them after would already be null. Mirrors selectSegment()'s own
+          // open-path scroll idiom (requestAnimationFrame + scrollIntoView),
+          // just pointed at the list row instead of the map, so closing the
+          // tall map+detail view lands the user back where they were instead
+          // of at whatever raw pixel offset the page reflowed to.
+          const segId = seg.id, source = "route";
+          state.selectedSegmentId = null; state.selectedSegmentSource = null;
+          render();
+          requestAnimationFrame(()=>{
+            document.getElementById(`segment-row-${source}-${segId}`)?.scrollIntoView({behavior:"smooth", block:"center"});
+          });
+        }}, ["Zur Strecke"])
       ]));
       card.appendChild(renderSegmentRow(seg, bucket, {clickable:false}));
+      card.appendChild(renderSegmentLeaderboard(seg));
       card.appendChild(routeMapContainer);
       return card;
     }
@@ -3079,7 +3180,18 @@ function renderSegmentRow(seg, bucket, opts){
   const isSelected = state.selectedSegmentId === seg.id && state.selectedSegmentSource === source;
   const clickable = opts.clickable !== false;
   const rowClass = "segment" + (isSelected ? " selected" : "") + (clickable ? "" : " static");
-  const row = el("div", clickable ? {class:rowClass, onclick:()=>selectSegment(seg, source)} : {class:rowClass});
+  // Stable id so the detail view's back button can scroll back to this exact
+  // row on close (see renderRouteCard()/renderSegmentsPage()'s back-button
+  // handlers). ONLY on the clickable list-context row, never on the static
+  // `{clickable:false}` copy rendered inside the detail view's own shell —
+  // renderRouteSegmentsCard() renders unconditionally even while a route
+  // segment's detail view is open elsewhere on the same page, so the static
+  // detail copy and the still-rendered clickable list copy of the SAME
+  // segment can coexist in the DOM simultaneously; giving both the same id
+  // would be a duplicate-id collision.
+  const row = el("div", clickable
+    ? {class:rowClass, id:`segment-row-${source}-${seg.id}`, onclick:()=>selectSegment(seg, source)}
+    : {class:rowClass});
 
   let badgeColor = "var(--chalk-dim)", tagClass = "", tagText = "k.A.", arrowHtml = "";
   if(w && bearing !== null){
@@ -3124,6 +3236,71 @@ function renderSegmentRow(seg, bucket, opts){
   }
 
   return row;
+}
+
+// Segment Top-10 leaderboard — factored into ONE shared function called from
+// both segment-detail-view branches (renderRouteCard()'s "Zur Strecke" shell
+// and renderSegmentsPage()'s "Zurück zur Liste" shell), which are otherwise
+// structurally identical, rather than duplicating this across both. Reads
+// state.segmentLeaderboards[seg.id], written only by ensureSegmentLeaderboard()
+// (lazy/manual — see its comment for why).
+function renderSegmentLeaderboard(seg){
+  const lb = state.segmentLeaderboards[seg.id];
+  const wrap = el("div", {style:"margin-top:14px;"});
+
+  if(!lb || (!lb.loading && !lb.entries && !lb.error)){
+    wrap.appendChild(el("button", {
+      class:"btn secondary", style:"padding:8px 14px; font-size:12px;",
+      onclick: ()=>ensureSegmentLeaderboard(seg)
+    }, ["Top 10 anzeigen"]));
+    return wrap;
+  }
+
+  if(lb.loading){
+    wrap.appendChild(el("div", {class:"loading"}, ["Lade Bestenliste…"]));
+    return wrap;
+  }
+
+  if(lb.error){
+    wrap.appendChild(el("div", {class:"error"}, [lb.error]));
+    // ensureSegmentLeaderboard()'s guard only skips on loading/entries
+    // truthy, so calling it again here after an error is a genuine retry,
+    // not a no-op.
+    wrap.appendChild(el("button", {
+      class:"btn secondary", style:"margin-top:8px; padding:8px 14px; font-size:12px;",
+      onclick: ()=>ensureSegmentLeaderboard(seg)
+    }, ["Erneut versuchen"]));
+    return wrap;
+  }
+
+  // lb.entries is present — dense table-like list, deliberately NOT another
+  // stack of big .segment-style card rows (this app's only table-like
+  // treatment anywhere): rank/name/time/watts/HR as fixed CSS-grid columns
+  // per row, small mono type, tight padding, alternating-row tint instead of
+  // per-row borders/cards. See .leaderboard/.leaderboard-row CSS.
+  wrap.appendChild(el("div", {class:"muted", style:"font-size:11px; margin-bottom:6px;"}, ["Top " + lb.entries.length]));
+  const list = el("div", {class:"leaderboard"});
+  list.appendChild(el("div", {class:"leaderboard-row leaderboard-head"}, [
+    el("div", {}, ["#"]),
+    el("div", {}, ["Fahrer"]),
+    el("div", {class:"lb-num"}, ["Zeit"]),
+    el("div", {class:"lb-num"}, ["Watt"]),
+    el("div", {class:"lb-num"}, ["Puls"])
+  ]));
+  lb.entries.forEach(entry=>{
+    // average_watts/average_hr are absent on many entries (not every device
+    // reports them) — omitted per-row rather than shown as an empty/
+    // placeholder cell, per el()'s own convention of dropping null children.
+    list.appendChild(el("div", {class:"leaderboard-row"}, [
+      el("div", {}, [String(entry.rank)]),
+      el("div", {class:"lb-name"}, [entry.athlete_name || "?"]),
+      el("div", {class:"lb-num"}, [fmtDuration(entry.elapsed_time) || "–"]),
+      el("div", {class:"lb-num"}, [entry.average_watts ? `${Math.round(entry.average_watts)} W` : ""]),
+      el("div", {class:"lb-num"}, [entry.average_hr ? `${Math.round(entry.average_hr)} bpm` : ""])
+    ]));
+  });
+  wrap.appendChild(list);
+  return wrap;
 }
 
 function selectSegment(seg, source){
@@ -3253,9 +3430,19 @@ function renderSegmentsPage(){
       const card = el("div", {class:"card"});
       card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
         el("h2", {style:"margin:0;"}, ["Segment"]),
-        el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{ state.selectedSegmentId = null; state.selectedSegmentSource = null; render(); }}, ["Zurück zur Liste"])
+        el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{
+          // Same capture-before-clear + scroll-back idiom as renderRouteCard()'s
+          // equivalent back button above — see its comment for why.
+          const segId = seg.id, source = "starred";
+          state.selectedSegmentId = null; state.selectedSegmentSource = null;
+          render();
+          requestAnimationFrame(()=>{
+            document.getElementById(`segment-row-${source}-${segId}`)?.scrollIntoView({behavior:"smooth", block:"center"});
+          });
+        }}, ["Zurück zur Liste"])
       ]));
       card.appendChild(renderSegmentRow(seg, bucket, {clickable:false}));
+      card.appendChild(renderSegmentLeaderboard(seg));
       card.appendChild(routeMapContainer);
       return card;
     }
