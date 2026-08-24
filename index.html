@@ -3630,7 +3630,7 @@ function renderRouteCard(){
     ])
   ]);
   card.appendChild(settingsRow);
-  card.appendChild(el("div", {class:"muted", style:"margin-bottom:12px; font-size:12px;"}, ["Wetterwerte werden jeweils für den erwarteten Ankunftszeitpunkt an diesem Punkt berechnet."]));
+  card.appendChild(el("div", {style:"margin-bottom:12px;"}, [infoButton("Wetterwerte werden jeweils für den erwarteten Ankunftszeitpunkt an diesem Punkt berechnet.")]));
 
   {
     const tabs = [];
@@ -3765,15 +3765,11 @@ function renderRouteCard(){
         el("div", {style:`width:34px; height:20px; border-radius:var(--r-full); flex-shrink:0; background:${state.windFieldEnabled ? "var(--route)" : "var(--asphalt-3)"}; position:relative; transition:background 0.15s;`}, [
           el("div", {style:`width:16px; height:16px; border-radius:50%; background:#fff; position:absolute; top:2px; left:${state.windFieldEnabled ? "16px" : "2px"}; transition:left 0.15s;`})
         ]),
-        el("span", {class:"muted", style:"font-size:12px;"}, [
-          "Windfeld der Umgebung anzeigen" + (state.windFieldEnabled && state.loading.windField ? " (lädt…)" : "")
+        el("span", {class:"muted", style:"font-size:12px; display:flex; align-items:center; gap:6px;"}, [
+          "Windfeld der Umgebung anzeigen" + (state.windFieldEnabled && state.loading.windField ? " (lädt…)" : ""),
+          state.windFieldEnabled ? infoButton("Windstärke: helles Blau <15 · Blau <30 · dunkleres Blau <45 · dunkelblau ≥45 km/h") : ""
         ])
       ]));
-      if(state.windFieldEnabled){
-        card.appendChild(el("div", {class:"muted", style:"font-size:10.5px; margin-top:4px;"}, [
-          "Windstärke: helles Blau <15 · Blau <30 · dunkleres Blau <45 · dunkelblau ≥45 km/h"
-        ]));
-      }
     }
 
     card.appendChild(routeMapContainer);
@@ -5031,6 +5027,12 @@ function calloutBox(cls, title, body){
     el("div", {class:"callout-body"}, [body])
   ]);
 }
+// Ersetzt calloutBox() an Stellen, die komplett hinter (i) verschwinden --
+// bündelt Titel+Text einmal konsistent für infoButton(), statt an jeder
+// Call-Site denselben Node-Aufbau zu wiederholen.
+function collapsedResult(title, body){
+  return infoButton([el('div', {style:'font-weight:600; margin-bottom:4px;'}, [title]), el('div', {}, [body])]);
+}
 function barRow(label, pct, color, numText){
   return el("div", {class:"bar-row"}, [
     el("span", {class:"bar-label"}, [label]),
@@ -5160,7 +5162,6 @@ function renderProfilFtpSection(frag){
   frag.appendChild(chartCard);
 
   const interpCard = el("div", {class:"card"});
-  interpCard.appendChild(el("h2", {}, ["Einordnung"]));
   const paras = ["FTP ist ein Maximalwert: Trend & Prognose zeigen die rollierende 42-Tage-Bestleistung (höchster bestätigter Schätzwert der letzten 6 Wochen, aus 5-/10-/20-Min-Bestleistungen, per HF-Zeitfenster bestätigt)."];
   if(a && a.weeklySlope!=null) paras.push(a.weeklySlope>0 ? `Trend: +${a.weeklySlope.toFixed(1)} W/Woche.` : (a.weeklySlope<0 ? `Trend: −${Math.abs(a.weeklySlope).toFixed(1)} W/Woche.` : "Bestwert stabil."));
   if(fl>0) paras.push(`⚠ ${fl} Aktivität${fl===1?'':'en'} unbestätigt, aus Trend ausgeschlossen.`);
@@ -5170,7 +5171,7 @@ function renderProfilFtpSection(frag){
       : (gap>0 ? `Gesetzter FTP liegt ${gap} W über dem Modell.` : `Gesetzter FTP liegt ${Math.abs(gap)} W unter dem Modell.`));
   }
   if(a && a.forecast8!=null) paras.push(`Prognose: ca. ${a.forecast8} W in 8 Wochen (4 Wo.: ${a.forecast4} W, 12 Wo.: ${a.forecast12} W), lineare Extrapolation.`);
-  paras.forEach(p => interpCard.appendChild(el("div", {class:"muted", style:"margin-bottom:8px;"}, [p])));
+  interpCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Einordnung", infoButton(paras.map(p => el('div',{style:'margin-bottom:6px;'},[p])))]));
   frag.appendChild(interpCard);
 
   const actCard = el("div", {class:"card"});
@@ -5218,10 +5219,9 @@ function renderProfilFormSection(frag){
 
   const meaningCard = el("div", {class:"card"});
   meaningCard.appendChild(el("h2", {}, ["Was das bedeutet"]));
-  meaningCard.appendChild(calloutBox(L.formClass, L.formVerdict, L.formWhy));
-  if(L.rampWeekly>7) meaningCard.appendChild(el("div", {style:"margin-top:10px;"}, [
-    calloutBox("warn", "Steiler Formaufbau", `Deine Fitness steigt um ${L.rampWeekly.toFixed(1)} CTL-Punkte pro Woche. Über 5–7 pro Woche gilt als aggressiv – nachhaltig ist das nur mit konsequenten Entlastungswochen.`)
-  ]));
+  const formResults = [collapsedResult(L.formVerdict, L.formWhy)];
+  if(L.rampWeekly>7) formResults.push(collapsedResult("Steiler Formaufbau", `Deine Fitness steigt um ${L.rampWeekly.toFixed(1)} CTL-Punkte pro Woche. Über 5–7 pro Woche gilt als aggressiv – nachhaltig ist das nur mit konsequenten Entlastungswochen.`));
+  meaningCard.appendChild(el("div", {style:"display:flex; flex-wrap:wrap; gap:8px;"}, formResults));
   frag.appendChild(meaningCard);
 
   if(Z && Z.weeks.length){
@@ -5248,7 +5248,7 @@ function renderProfilFormSection(frag){
       polCard.appendChild(barRow("Grauzone (Z3–Z4)", Z.pct.grey, cc.cross, Z.pct.grey.toFixed(1)+"%"));
       polCard.appendChild(barRow("Hart (Z5+)", Z.pct.high, cc.head, Z.pct.high.toFixed(1)+"%"));
     }
-    polCard.appendChild(el("div", {style:"margin-top:12px;"}, [calloutBox(Z.verdictClass, Z.verdict, Z.why)]));
+    polCard.appendChild(el("div", {style:"margin-top:12px;"}, [collapsedResult(Z.verdict, Z.why)]));
     frag.appendChild(polCard);
   }
 }
@@ -5300,15 +5300,15 @@ function renderProfilKernSection(frag){
     const efCard = el("div", {class:"card"});
     efCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Effizienz & aerobe Entkopplung", infoButton("Blau: Watt/Herzschlag – steigt mit aerober Fitness. Amber: Entkopplung, Leistungs-Puls-Verhältnis 2. Fahrthälfte vs. 1. Nur Fahrten über 30 Min.")]));
     efCard.appendChild(el("div", {class:"chart-box short"}, [el("canvas", {id:"velocastEfChart"})]));
-    efCard.appendChild(el("div", {style:"margin-top:12px;"}, [calloutBox(E.verdictClass, E.verdict, E.why)]));
-    if(E.weeklyEfSlope!=null) efCard.appendChild(el("div", {class:"legend-note"}, [`Effizienz-Trend: ${E.weeklyEfSlope>0?'+':''}${(E.weeklyEfSlope*1000).toFixed(2)} mW/Schlag pro Woche.`]));
+    efCard.appendChild(el("div", {style:"margin-top:12px;"}, [collapsedResult(E.verdict, E.why)]));
+    if(E.weeklyEfSlope!=null) efCard.appendChild(el("div", {style:"margin-top:6px;"}, [infoButton(`Effizienz-Trend: ${E.weeklyEfSlope>0?'+':''}${(E.weeklyEfSlope*1000).toFixed(2)} mW/Schlag pro Woche.`)]));
     frag.appendChild(efCard);
   }
 
   if(D){
     const durCard = el("div", {class:"card"});
     durCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Ermüdungsresistenz", infoButton(`Beste 10-Min-Leistung im letzten Drittel ÷ beste 10-Min-Leistung der ganzen Fahrt, aus ${D.rides.length} Fahrten über 90 Min. 100% = Fahrtdauer kostet nichts.`)]));
-    durCard.appendChild(calloutBox(D.verdictClass, D.verdict, D.why));
+    durCard.appendChild(collapsedResult(D.verdict, D.why));
     frag.appendChild(durCard);
   }
 
@@ -5334,10 +5334,10 @@ function renderProfilKernSection(frag){
   if(W && W.items.length){
     const wCard = el("div", {class:"card"});
     wCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Trainingsschwerpunkt (aus deinen Daten)", infoButton("Balken = Rückstand zu Referenzwerten, nicht absolutes Niveau – zeigt, wo am meisten Luft nach oben ist.")]));
-    wCard.appendChild(el("div", {style:"margin-bottom:10px;"}, [calloutBox("warn", "Größter Hebel: "+W.headline, W.reason)]));
+    wCard.appendChild(el("div", {style:"margin-bottom:10px;"}, [collapsedResult("Größter Hebel: "+W.headline, W.reason)]));
     W.items.slice(0,5).forEach((it,i) => {
       wCard.appendChild(barRow(it.area, it.score, i===0?"var(--cross)":"var(--chalk-dim)", ""));
-      wCard.appendChild(el("div", {class:"legend-note", style:"margin-top:-4px; margin-bottom:8px;"}, [it.why]));
+      wCard.appendChild(el("div", {style:"margin-top:-4px; margin-bottom:8px;"}, [infoButton(it.why)]));
     });
     frag.appendChild(wCard);
   }
@@ -7585,17 +7585,16 @@ function renderTrainerGoalBar(chosen, W, rp){
   });
   field.appendChild(select);
   card.appendChild(field);
-  card.appendChild(el('div', {class:'legend-note', style:'margin-top:8px;'}, [
-    `Aus deinen letzten ${rp.sampleSize} Fahrten.` + (chosen==='auto' && W ? ` 🎯 Größter Hebel: ${W.headline} (Details im Profil-Tab).` : '')
+  card.appendChild(el('div', {class:'legend-note', style:'margin-top:8px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;'}, [
+    `Aus deinen letzten ${rp.sampleSize} Fahrten.`,
+    chosen==='auto' && W ? collapsedResult(`🎯 Größter Hebel: ${W.headline}`, 'Details im Profil-Tab.') : ''
   ]));
   return card;
 }
 function renderTrainerDecisionDashboard(trainingState, weaknessData, opportunity){
   const card = el('div', {class:'card'});
   card.appendChild(el('h2',{},['Trainings-Dashboard']));
-  if(weaknessData) card.appendChild(el('div',{class:'legend-note', style:'margin-bottom:10px;'},[
-    `Größter Hebel: ${weaknessData.headline}. ${weaknessData.reason}`
-  ]));
+  if(weaknessData) card.appendChild(el('div',{style:'margin-bottom:10px;'},[collapsedResult(`Größter Hebel: ${weaknessData.headline}`, weaknessData.reason)]));
   card.appendChild(el('div',{style:'margin-bottom:6px; font-weight:600; font-size:13px;'},['Prioritäten & Wochenbudgets']));
   TRAINING_CLASSES.filter(c=>c.priorityEligible).forEach(c=>{
     const tier = trainingState.priorities[c.key] || 'MAINTENANCE';
@@ -7617,11 +7616,11 @@ function renderTrainerDecisionDashboard(trainingState, weaknessData, opportunity
     if(opportunity.suitable){
       const suitText = opportunity.suitability ? ` Streckeneignung: ${opportunity.suitability.score}/100.` : '';
       const safetyText = opportunity.forceRecovery ? ' Sicherheitsnetz aktiv: Belastung/Ermüdung überschreiben die normale Priorität.' : '';
-      card.appendChild(el('div',{style:'margin-top:10px;'},[calloutBox('good', `Warum ${opportunity.className} heute?`,
+      card.appendChild(el('div',{style:'margin-top:10px;'},[collapsedResult(`Warum ${opportunity.className} heute?`,
         (opportunity.forceRecovery?'Sicherheitsnetz':`Priorität ${(PRIORITY_BADGE[opportunity.priority]||{}).label||opportunity.priority}`) + '.' + suitText + safetyText)]));
     } else {
       const reasons = (opportunity.suitability && opportunity.suitability.reasons) || [];
-      card.appendChild(el('div',{style:'margin-top:10px;'},[calloutBox('danger', `Route ungeeignet für ${opportunity.className}`,
+      card.appendChild(el('div',{style:'margin-top:10px;'},[collapsedResult(`Route ungeeignet für ${opportunity.className}`,
         `Streckeneignung: ${opportunity.suitability?opportunity.suitability.score:0}/100. ${reasons.join(' ')}`)]));
     }
   }
@@ -7669,7 +7668,7 @@ function renderTrainerRouteCard(tp, selectedClassObj, todayRoute){
     }}, ['Route entfernen']));
   } else {
     card.appendChild(el('div', {class:'legend-note'}, [
-      'Optional: Lade eine GPX-Route hoch oder wähle eine gespeicherte Strava-Route, damit die Vorschau ans Gelände angepasst und geografisch platziert wird. Ohne Route wird ein zeitbasiertes Workout erzeugt.'
+      infoButton('Optional: Lade eine GPX-Route hoch oder wähle eine gespeicherte Strava-Route, damit die Vorschau ans Gelände angepasst und geografisch platziert wird. Ohne Route wird ein zeitbasiertes Workout erzeugt.')
     ]));
     card.appendChild(el('div', {class:'source-tabs', style:'margin-top:10px;'}, [
       el('div', {class:'source-tab' + (tp.routeSource==='gpx'?' active':''), onclick:()=>{ tp.routeSource='gpx'; render(); }}, ['GPX-Datei']),
@@ -7734,7 +7733,11 @@ function renderTrainerWorkoutPreview(tp, ctx){
   if(!workoutExists){
     body.appendChild(el('div',{class:'legend-note'},['Keine Vorschau verfügbar.']));
   } else {
-    warnRationale.forEach(r => body.appendChild(el('div',{style:'margin-bottom:10px;'},[calloutBox(r.type, r.title, r.text)])));
+    if(warnRationale.length){
+      const warnRow = el('div', {style:'display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px;'});
+      warnRationale.forEach(r => warnRow.appendChild(collapsedResult(r.title, r.text)));
+      body.appendChild(warnRow);
+    }
     if(!hasWorkout){
       details.appendChild(body);
       card.appendChild(details);
@@ -7774,7 +7777,7 @@ function renderTrainerWorkoutPreview(tp, ctx){
     } else {
       body.appendChild(el('div', {style:'margin:-4px 0 10px;'}, [infoButton('Zwei Dateien: das Workout (Schritte/Ziele) und die Strecke (GPS-Track) separat – auf dem Gerät beide zusammen für die Fahrt auswählen, genau wie bei Hammerhead/Garmin/Wahoo üblich.')]));
     }
-    if(goodRationale.length) body.appendChild(el('div',{class:'legend-note', style:'margin-bottom:10px;'},[goodRationale.map(r=>r.text).join(' ')]));
+    if(goodRationale.length) body.appendChild(el('div',{style:'margin-bottom:10px;'},[infoButton(goodRationale.map(r=>r.text).join(' '))]));
     body.appendChild(el('div',{class:'chart-box tall'},[el('canvas',{id:'velocastTrainerChart'})]));
     if(!routeBased){
       body.appendChild(el('div', {style:'margin-top:-4px; margin-bottom:8px;'}, [infoButton(ZONES.map(z=>legendDot(z.color, z.name)).concat([legendDot('#fc4c02','FTP-Linie')]))]));
@@ -7833,15 +7836,15 @@ function renderClassComplianceNoteEl(cc){
   const label = cls ? cls.label : cc.classKey;
   const rangeText = cc.range ? ` (Zielbereich ${Math.round(cc.range.min*100)}–${Math.round(cc.range.max*100)}% FTP)` : '';
   return el('div',{class:'legend-note', style:'margin-top:10px;'},[
-    `${label}-Budget aus dieser Fahrt: ${cc.inRangeMin}/${cc.plannedMin} min im Zielbereich${rangeText}, ${cc.remainingMin} min außerhalb.`
+    infoButton(`${label}-Budget aus dieser Fahrt: ${cc.inRangeMin}/${cc.plannedMin} min im Zielbereich${rangeText}, ${cc.remainingMin} min außerhalb.`)
   ]);
 }
 function appendEvaluationResult(box, ev){
   if(ev.mismatchPct!=null && ev.mismatchPct>15){
-    box.appendChild(calloutBox('warn', `${ev.isRoute?'Streckenlänge':'Dauer'} weicht ab`,
+    box.appendChild(collapsedResult(`${ev.isRoute?'Streckenlänge':'Dauer'} weicht ab`,
       `Die Aktivität ist ${ev.mismatchPct.toFixed(0)}% ${ev.isRoute?'länger/kürzer als die hochgeladene Route':'länger/kürzer als das geplante Workout'} – der Abgleich kann dadurch ungenau sein.`));
   }
-  box.appendChild(calloutBox(ev.verdictClass, ev.verdict, ev.why));
+  box.appendChild(collapsedResult(ev.verdict, ev.why));
   const rows = ev.perStep.filter(s=>s.kind==='interval');
   if(rows.length){
     box.appendChild(el('div',{style:'margin-top:10px;'},[dataTableNode(
