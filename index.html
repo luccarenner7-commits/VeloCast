@@ -332,6 +332,14 @@
   }
   .stat-chip .v{ font-family:'Space Grotesk', sans-serif; font-size:19px; font-weight:700; line-height:1.1; letter-spacing:-0.01em; color:inherit; }
   .stat-chip .l{ font-family:'IBM Plex Mono', monospace; font-size:9px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:inherit; opacity:0.75; margin-top:2px; }
+  /* Neutral variant for chips that aren't a semantic route-blue "info" stat
+     (e.g. an editable settings value) — same asphalt-3/line/chalk vocabulary
+     .btn.secondary/.nav-item.active/.source-tab.active already use for
+     "neutral interactive surface", instead of borrowing the route-blue that
+     would misread as the wind/PR-style info chips elsewhere. */
+  .stat-chip.neutral{ color:var(--chalk); background:var(--asphalt-3); border:1px solid var(--line); }
+  button.stat-chip{ border:none; font:inherit; cursor:pointer; text-align:left; -webkit-appearance:none; appearance:none; }
+  button.stat-chip:hover{ border-color:var(--route); }
   /* Demoted/secondary segment stats (Watt, all-time PR, Hm, × gefahren,
      effort rank) — one quiet compact line instead of equally-loud hero
      chips, so only the 1-2 stats computeSegmentStatChips()/
@@ -478,6 +486,32 @@
   .legend-note{ font-family:'IBM Plex Mono', monospace; font-size:10.5px; color:var(--chalk-dim); line-height:1.6; margin-top:8px; }
   .empty-state{ color:var(--chalk-dim); font-size:13px; line-height:1.6; padding:6px 0; }
 
+  /* Click-to-reveal info button (see infoButton()) — sitewide replacement for
+     a chunk of the always-visible .legend-note captions above: the label/
+     heading/chart itself stays visible, the explanatory prose collapses
+     behind this small (i) glyph until tapped. Deliberately plain/monoline,
+     same "outline glyph, no fill/shadow/gradient" restraint as
+     hamburgerIconSvg()/starIconSvg() rather than a colorful badge. */
+  .info-wrap{ position:relative; display:inline-flex; vertical-align:middle; }
+  .info-btn{
+    display:inline-flex; align-items:center; justify-content:center;
+    width:15px; height:15px; flex-shrink:0; border-radius:50%; padding:0;
+    background:none; border:1px solid var(--chalk-dim); color:var(--chalk-dim);
+    font-family:'IBM Plex Mono', monospace; font-size:9.5px; font-weight:600; line-height:1;
+    cursor:pointer;
+  }
+  .info-btn:hover, .info-btn.open{ border-color:var(--chalk); color:var(--chalk); }
+  .info-popover{
+    display:none; position:absolute; z-index:20; top:20px; left:0;
+    width:max-content; max-width:min(240px, calc(100vw - 56px));
+    background:var(--asphalt-3); border:1px solid var(--line); border-radius:var(--r-sm);
+    padding:8px 10px; font-family:'IBM Plex Mono', monospace; font-size:10.5px;
+    color:var(--chalk-dim); line-height:1.55; text-transform:none; letter-spacing:normal; font-weight:400;
+  }
+  .info-popover.open{ display:block; }
+  .info-popover.flip-x{ left:auto; right:0; }
+  .info-popover.flip-y{ top:auto; bottom:20px; }
+
   /* ---------- Trainer page ---------- */
   /* Taller variant of .chart-box for the workout-preview chart (route
      elevation+power or time+power), which needs more vertical room than the
@@ -535,8 +569,19 @@
   .tsettings-input-wrap{ display:flex; align-items:center; gap:5px; flex:none; }
   .tsettings-input-wrap input[type="number"]{ width:80px; margin-bottom:0; }
   .tsettings-unit{ font-size:11px; color:var(--chalk-dim); min-width:30px; }
-  .tsettings-row .legend-note{ margin-top:3px; }
   .tsettings-saved-note{ font-size:11.5px; color:var(--tail); opacity:0; transition:opacity .3s; }
+  /* Grouped per-class constraint chips (see settingsFieldChip()/
+     buildClassSettingsSection()) — a named .tsettings-group per sub-section
+     (Steigung/Intervall-Struktur/Wochenbudget/Streckenlänge), each holding a
+     row of .stat-chip.neutral chips that expand into their real input in
+     place on click, same direct-DOM-toggle approach as flashSettingsSaved()
+     above rather than a full render(). */
+  .tsettings-group{ margin-top:12px; }
+  .tsettings-group:first-child{ margin-top:0; }
+  .tsettings-group-title{ font-family:'Space Grotesk', sans-serif; font-size:12px; font-weight:600; color:var(--chalk-dim); margin:0 0 8px; }
+  .tsettings-chip-item{ display:inline-flex; align-items:center; gap:6px; }
+  .tsettings-chip-input{ display:inline-flex; align-items:center; gap:5px; }
+  .tsettings-chip-input .tsettings-unit{ min-width:0; }
   .tsettings-switch{ position:relative; display:inline-block; width:34px; height:19px; flex-shrink:0; }
   .tsettings-switch input{ opacity:0; width:0; height:0; }
   .tsettings-switch .tsettings-slider{ position:absolute; cursor:pointer; inset:0; background:var(--asphalt-3); border-radius:var(--r-full); transition:.15s; }
@@ -1290,6 +1335,43 @@ function statChip(value, label, style){
     el("div", {class:"v"}, [value]),
     el("div", {class:"l"}, [label])
   ]);
+}
+
+// ---------- Click-to-reveal info button (sitewide, see Part A) ----------
+// Small (i) icon + popover that replaces an always-visible explanatory
+// caption: the label/heading/chart next to it stays visible, the prose only
+// shows once tapped. `content` is either a string or an array of el() nodes
+// (e.g. a row of legendDot() chart-color keys). Toggling is done by directly
+// flipping a class on the popover node itself, deliberately NOT via
+// state+render() -- same reasoning as flashSettingsSaved() above: a full
+// render() would collapse any open <details> the rider is currently in and
+// scroll-jump the page just to open a tooltip.
+let openInfoPopover = null;
+document.addEventListener('click', ()=>{
+  if(openInfoPopover){ openInfoPopover.classList.remove('open'); openInfoPopover = null; }
+});
+function infoButton(content){
+  const popover = el('div', {class:'info-popover'}, Array.isArray(content) ? content : [content]);
+  const btn = el('button', {type:'button', class:'info-btn', 'aria-label':'Erklärung anzeigen', onclick:(e)=>{
+    e.stopPropagation();
+    const willOpen = !popover.classList.contains('open');
+    if(openInfoPopover && openInfoPopover !== popover) openInfoPopover.classList.remove('open');
+    popover.classList.remove('flip-x','flip-y');
+    if(willOpen){
+      popover.classList.add('open');
+      openInfoPopover = popover;
+      // clamp to the viewport -- important on a narrow phone screen (this is
+      // a phone-first PWA), flip left/up instead of overflowing the edge
+      const r = popover.getBoundingClientRect();
+      if(r.right > window.innerWidth - 8) popover.classList.add('flip-x');
+      if(r.bottom > window.innerHeight - 8) popover.classList.add('flip-y');
+    } else {
+      popover.classList.remove('open');
+      openInfoPopover = null;
+    }
+  }}, ['i']);
+  popover.addEventListener('click', e => e.stopPropagation());
+  return el('span', {class:'info-wrap'}, [btn, popover]);
 }
 
 function renderElevationChart(){
@@ -5069,13 +5151,12 @@ function renderProfilFtpSection(frag){
   ]));
 
   const chartCard = el("div", {class:"card"});
-  chartCard.appendChild(el("h2", {}, ["FTP-Verlauf & Prognose"]));
-  chartCard.appendChild(el("div", {class:"chart-box"}, [el("canvas", {id:"velocastFtpChart"})]));
   const c = profilColors();
-  chartCard.appendChild(el("div", {class:"legend-note", style:"display:flex; flex-wrap:wrap;"}, [
+  chartCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["FTP-Verlauf & Prognose", infoButton([
     legendDot(c.grade4,"Hoch (20-Min)"), legendDot(c.grade3,"Mittel (10-Min)"), legendDot(c.grade2,"Niedrig (5-Min)"),
     legendDot(c.head,"Unbestätigt"), legendDot(c.tail,"42-Tage-Bestwert"), legendDot(c.chalkDim,"Trend"), legendDot(c.strava,"Strava-FTP")
-  ]));
+  ])]));
+  chartCard.appendChild(el("div", {class:"chart-box"}, [el("canvas", {id:"velocastFtpChart"})]));
   frag.appendChild(chartCard);
 
   const interpCard = el("div", {class:"card"});
@@ -5093,7 +5174,8 @@ function renderProfilFtpSection(frag){
   frag.appendChild(interpCard);
 
   const actCard = el("div", {class:"card"});
-  actCard.appendChild(el("h2", {}, [`Ausgewertete Aktivitäten (${results.length}${pp.stats?` von ${pp.stats.candidates} geprüften`:''})`]));
+  const actH2 = el("h2", {style:"display:flex; align-items:center; gap:8px; flex-wrap:wrap;"}, [`Ausgewertete Aktivitäten (${results.length}${pp.stats?` von ${pp.stats.candidates} geprüften`:''})`]);
+  actCard.appendChild(actH2);
   results.slice().reverse().slice(0,30).forEach(r => {
     actCard.appendChild(el("div", {class:"activity"}, [
       el("div", {}, [
@@ -5103,9 +5185,9 @@ function renderProfilFtpSection(frag){
       el("div", {class:"stat-chip"}, [ el("div", {class:"v"}, [`${r.estFtp} W`]), el("div", {class:"l"}, ["FTP-Schätzung"]) ])
     ]));
   });
-  if(pp.stats) actCard.appendChild(el("div", {class:"legend-note"}, [
+  if(pp.stats) actH2.appendChild(infoButton(
     `${pp.stats.cached} aus dem lokalen Cache, ${pp.stats.fetched} neu von Strava geladen. ${pp.stats.skippedNoWatts} ohne Leistungsmesser, ${pp.stats.skippedNoBestEffort} ohne 5/10/20-Min-Bestleistung${pp.stats.skippedApiError?`, ${pp.stats.skippedApiError} wegen API-Fehlern übersprungen`:''}.`
-  ]));
+  ));
   frag.appendChild(actCard);
 }
 
@@ -5130,9 +5212,8 @@ function renderProfilFormSection(frag){
   ]));
 
   const chartCard = el("div", {class:"card"});
-  chartCard.appendChild(el("h2", {}, ["Formkurve (Fitness / Ermüdung / Form)"]));
+  chartCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Formkurve (Fitness / Ermüdung / Form)", infoButton("TSS aus Normalized Power (nicht Stravas HF-Relative-Effort). CTL = 42-Tage-Schnitt (Fitness), ATL = 7-Tage-Schnitt (Ermüdung), TSB = CTL − ATL (Form). Die ersten Wochen sind ein Einschwing-Artefakt.")]));
   chartCard.appendChild(el("div", {class:"chart-box"}, [el("canvas", {id:"velocastFormChart"})]));
-  chartCard.appendChild(el("div", {class:"legend-note"}, ["TSS aus Normalized Power (nicht Stravas HF-Relative-Effort). CTL = 42-Tage-Schnitt (Fitness), ATL = 7-Tage-Schnitt (Ermüdung), TSB = CTL − ATL (Form). Die ersten Wochen sind ein Einschwing-Artefakt."]));
   frag.appendChild(chartCard);
 
   const meaningCard = el("div", {class:"card"});
@@ -5145,21 +5226,22 @@ function renderProfilFormSection(frag){
 
   if(Z && Z.weeks.length){
     const zoneCard = el("div", {class:"card"});
-    zoneCard.appendChild(el("h2", {}, ["Zonenverteilung pro Woche"]));
+    const zoneH2 = el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Zonenverteilung pro Woche"]);
+    zoneCard.appendChild(zoneH2);
     if(Z.pct){
       // Z.pct is only non-null when total zone time > 0 — without power zones
       // configured in Strava (e.g. no premium), every ride's zoneTimes stays an
       // all-zero array, weeks.length is still non-empty, and the chart would
       // otherwise render as an all-zero stacked bar instead of an empty state.
+      zoneH2.appendChild(infoButton("Zeit in Stunden je Leistungszone, aus den Wattdaten jeder Fahrt. Zonengrenzen aus deinem Strava-Profil."));
       zoneCard.appendChild(el("div", {class:"chart-box"}, [el("canvas", {id:"velocastZoneChart"})]));
-      zoneCard.appendChild(el("div", {class:"legend-note"}, ["Zeit in Stunden je Leistungszone, aus den Wattdaten jeder Fahrt. Zonengrenzen aus deinem Strava-Profil."]));
     } else {
       zoneCard.appendChild(el("div", {class:"empty-state"}, ["Keine Leistungszonen in deinem Strava-Profil hinterlegt. Zonenverteilung kann so nicht berechnet werden."]));
     }
     frag.appendChild(zoneCard);
 
     const polCard = el("div", {class:"card"});
-    polCard.appendChild(el("h2", {}, ["Polarisierung (letzte 8 Wochen)"]));
+    polCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Polarisierung (letzte 8 Wochen)", infoButton("Als Orientierung gilt das polarisierte Modell: rund 80% der Zeit klar locker, der Rest wirklich hart, und möglichst wenig dazwischen.")]));
     if(Z.pct){
       const cc = profilColors();
       polCard.appendChild(barRow("Locker (Z1–Z2)", Z.pct.low, cc.route, Z.pct.low.toFixed(1)+"%"));
@@ -5167,7 +5249,6 @@ function renderProfilFormSection(frag){
       polCard.appendChild(barRow("Hart (Z5+)", Z.pct.high, cc.head, Z.pct.high.toFixed(1)+"%"));
     }
     polCard.appendChild(el("div", {style:"margin-top:12px;"}, [calloutBox(Z.verdictClass, Z.verdict, Z.why)]));
-    polCard.appendChild(el("div", {class:"legend-note"}, ["Als Orientierung gilt das polarisierte Modell: rund 80% der Zeit klar locker, der Rest wirklich hart, und möglichst wenig dazwischen."]));
     frag.appendChild(polCard);
   }
 }
@@ -5197,9 +5278,8 @@ function renderProfilKernSection(frag){
   ]));
 
   const pdCard = el("div", {class:"card"});
-  pdCard.appendChild(el("h2", {}, ["Leistungs-Dauer-Kurve"]));
+  pdCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Leistungs-Dauer-Kurve", infoButton(`Höchste Durchschnittsleistung je Dauer (Mean Maximal Power), aus ${cur.rides} Fahrten der letzten 90 Tage${prev.rides>0?` (Vorjahr: ${prev.rides} Fahrten)`:' (kein Vorjahres-Vergleich – lade mehr Fahrten)'}. Logarithmische Zeitachse.`)]));
   pdCard.appendChild(el("div", {class:"chart-box"}, [el("canvas", {id:"velocastPdChart"})]));
-  pdCard.appendChild(el("div", {class:"legend-note"}, [`Höchste Durchschnittsleistung je Dauer (Mean Maximal Power), aus ${cur.rides} Fahrten der letzten 90 Tage${prev.rides>0?` (Vorjahr: ${prev.rides} Fahrten)`:' (kein Vorjahres-Vergleich – lade mehr Fahrten)'}. Logarithmische Zeitachse.`]));
   frag.appendChild(pdCard);
 
   const tableCard = el("div", {class:"card"});
@@ -5218,9 +5298,8 @@ function renderProfilKernSection(frag){
 
   if(E){
     const efCard = el("div", {class:"card"});
-    efCard.appendChild(el("h2", {}, ["Effizienz & aerobe Entkopplung"]));
+    efCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Effizienz & aerobe Entkopplung", infoButton("Blau: Watt/Herzschlag – steigt mit aerober Fitness. Amber: Entkopplung, Leistungs-Puls-Verhältnis 2. Fahrthälfte vs. 1. Nur Fahrten über 30 Min.")]));
     efCard.appendChild(el("div", {class:"chart-box short"}, [el("canvas", {id:"velocastEfChart"})]));
-    efCard.appendChild(el("div", {class:"legend-note"}, ["Blau: Watt/Herzschlag – steigt mit aerober Fitness. Amber: Entkopplung, Leistungs-Puls-Verhältnis 2. Fahrthälfte vs. 1. Nur Fahrten über 30 Min."]));
     efCard.appendChild(el("div", {style:"margin-top:12px;"}, [calloutBox(E.verdictClass, E.verdict, E.why)]));
     if(E.weeklyEfSlope!=null) efCard.appendChild(el("div", {class:"legend-note"}, [`Effizienz-Trend: ${E.weeklyEfSlope>0?'+':''}${(E.weeklyEfSlope*1000).toFixed(2)} mW/Schlag pro Woche.`]));
     frag.appendChild(efCard);
@@ -5228,19 +5307,17 @@ function renderProfilKernSection(frag){
 
   if(D){
     const durCard = el("div", {class:"card"});
-    durCard.appendChild(el("h2", {}, ["Ermüdungsresistenz"]));
+    durCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Ermüdungsresistenz", infoButton(`Beste 10-Min-Leistung im letzten Drittel ÷ beste 10-Min-Leistung der ganzen Fahrt, aus ${D.rides.length} Fahrten über 90 Min. 100% = Fahrtdauer kostet nichts.`)]));
     durCard.appendChild(calloutBox(D.verdictClass, D.verdict, D.why));
-    durCard.appendChild(el("div", {class:"legend-note"}, [`Beste 10-Min-Leistung im letzten Drittel ÷ beste 10-Min-Leistung der ganzen Fahrt, aus ${D.rides.length} Fahrten über 90 Min. 100% = Fahrtdauer kostet nichts.`]));
     frag.appendChild(durCard);
   }
 
   if(C){
     const climbCard = el("div", {class:"card"});
-    climbCard.appendChild(el("h2", {}, ["Kletterleistung"]));
-    climbCard.appendChild(el("div", {class:"chart-box short"}, [el("canvas", {id:"velocastClimbChart"})]));
-    climbCard.appendChild(el("div", {class:"legend-note"}, [
+    climbCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Kletterleistung", infoButton(
       `W/kg auf Anstiegen ≥3% Steigung, über 4 Min.${C.weeklySlope!=null?` Trend: ${C.weeklySlope>0?'+':''}${C.weeklySlope.toFixed(3)} W/kg/Woche.`:''} Anstiege werden aus Höhen- und Leistungsdaten erkannt (keine Strava-Segmentnamen).`
-    ]));
+    )]));
+    climbCard.appendChild(el("div", {class:"chart-box short"}, [el("canvas", {id:"velocastClimbChart"})]));
     climbCard.appendChild(el("div", {style:"margin-top:12px;"}, [dataTableNode(
       ["Steigung","Dauer","Watt","W/kg","Datum"],
       C.best.slice(0,10).map(cl => [
@@ -5256,20 +5333,19 @@ function renderProfilKernSection(frag){
 
   if(W && W.items.length){
     const wCard = el("div", {class:"card"});
-    wCard.appendChild(el("h2", {}, ["Trainingsschwerpunkt (aus deinen Daten)"]));
+    wCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Trainingsschwerpunkt (aus deinen Daten)", infoButton("Balken = Rückstand zu Referenzwerten, nicht absolutes Niveau – zeigt, wo am meisten Luft nach oben ist.")]));
     wCard.appendChild(el("div", {style:"margin-bottom:10px;"}, [calloutBox("warn", "Größter Hebel: "+W.headline, W.reason)]));
     W.items.slice(0,5).forEach((it,i) => {
       wCard.appendChild(barRow(it.area, it.score, i===0?"var(--cross)":"var(--chalk-dim)", ""));
       wCard.appendChild(el("div", {class:"legend-note", style:"margin-top:-4px; margin-bottom:8px;"}, [it.why]));
     });
-    wCard.appendChild(el("div", {class:"legend-note"}, ["Balken = Rückstand zu Referenzwerten, nicht absolutes Niveau – zeigt, wo am meisten Luft nach oben ist."]));
     frag.appendChild(wCard);
   }
 
   if(pp.gear.length){
     const gearResets = loadGearResets();
     const gearCard = el("div", {class:"card"});
-    gearCard.appendChild(el("h2", {}, ["Ausrüstung"]));
+    gearCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Ausrüstung", infoButton('Richtwerte für Verschleißintervalle (Kette 3000 km, Kassette 9000 km, Bremsbeläge 5000 km, Reifen hinten 4000 km) – abhängig von Fahrstil, Wetter und Material, nur eine grobe Orientierung. Strava kennt kein Wechseldatum für Verschleißteile; „Zurückgesetzt" beim tatsächlichen Teiletausch klicken, um ab da neu zu zählen.')]));
     pp.gear.forEach((g,gi) => {
       const gid = g.id ? String(g.id) : String(gi);
       const totalKm = (g.distance||0)/1000;
@@ -5309,7 +5385,6 @@ function renderProfilKernSection(frag){
       }
       gearCard.appendChild(itemWrap);
     });
-    gearCard.appendChild(el("div", {class:"legend-note"}, ['Richtwerte für Verschleißintervalle (Kette 3000 km, Kassette 9000 km, Bremsbeläge 5000 km, Reifen hinten 4000 km) – abhängig von Fahrstil, Wetter und Material, nur eine grobe Orientierung. Strava kennt kein Wechseldatum für Verschleißteile; „Zurückgesetzt" beim tatsächlichen Teiletausch klicken, um ab da neu zu zählen.']));
     frag.appendChild(gearCard);
   }
 }
@@ -7543,10 +7618,7 @@ function renderTrainerDecisionDashboard(trainingState, weaknessData, opportunity
 }
 function renderTrainerClassPicker(tp, trainingState, recommendedClassKey){
   const card = el('div', {class:'card'});
-  card.appendChild(el('h2', {}, ['Workout wählen']));
-  card.appendChild(el('div', {class:'legend-note', style:'margin:-6px 0 12px;'}, [
-    'Wähle die Trainingsart, die du fahren willst. „Empfohlen" markiert, was laut Priorität und Wochenbudget aktuell am meisten bringt.'
-  ]));
+  card.appendChild(el('h2', {style:'display:flex; align-items:center; gap:8px;'}, ['Workout wählen', infoButton('Wähle die Trainingsart, die du fahren willst. „Empfohlen" markiert, was laut Priorität und Wochenbudget aktuell am meisten bringt.')]));
   const grid = el('div', {class:'class-picker'});
   TRAINING_CLASSES.forEach(c => {
     const tier = trainingState.priorities[c.key] || 'MAINTENANCE';
@@ -7626,7 +7698,11 @@ function renderTrainerRouteCard(tp, selectedClassObj, todayRoute){
 }
 function renderHammerheadHint(fileName, distanceMode){
   const box = el('div', {class:'callout good', style:'margin-top:12px;'});
-  box.appendChild(el('div',{class:'callout-title'},[`✅ ${fileName} heruntergeladen`]));
+  box.appendChild(el('div',{class:'callout-title', style:'display:flex; align-items:center; gap:6px;'},[
+    `✅ ${fileName} heruntergeladen`,
+    infoButton('Die .FIT-Datei funktioniert genauso auf Garmin- und Wahoo-Geräten.'
+      + (distanceMode ? ' Distanz-getriggerte Schritte sind auf Head-Units seltener im Einsatz als zeitbasierte – prüfe die ersten paar Kilometer testweise, bevor du dich für eine lange Ausfahrt darauf verlässt.' : ''))
+  ]));
   const body = el('div', {class:'callout-body'});
   body.appendChild(document.createTextNode('So kommt es auf den Karoo/das Gerät:'));
   const ol = el('ol', {style:'margin:6px 0 0 18px; padding:0; line-height:1.6;'});
@@ -7634,10 +7710,6 @@ function renderHammerheadHint(fileName, distanceMode){
   ol.appendChild(el('li',{},['Die gerade geladene Datei importieren (das Gerät akzeptiert .FIT' + (distanceMode?'':' und .ZWO') + ')']));
   ol.appendChild(el('li',{},['Sobald das Gerät das nächste Mal online ist, synchronisiert es das Workout automatisch']));
   body.appendChild(ol);
-  body.appendChild(el('div',{class:'legend-note', style:'margin-top:8px;'},[
-    'Die .FIT-Datei funktioniert genauso auf Garmin- und Wahoo-Geräten.'
-    + (distanceMode ? ' Distanz-getriggerte Schritte sind auf Head-Units seltener im Einsatz als zeitbasierte – prüfe die ersten paar Kilometer testweise, bevor du dich für eine lange Ausfahrt darauf verlässt.' : '')
-  ]));
   box.appendChild(body);
   return box;
 }
@@ -7689,15 +7761,12 @@ function renderTrainerWorkoutPreview(tp, ctx){
       toggleLabel.appendChild(document.createTextNode('Schritte in km statt Minuten planen (nur .FIT – Garmin/Wahoo/Hammerhead-Geräte lösen dann per zurückgelegter Strecke statt Zeit aus)'));
       body.appendChild(toggleLabel);
     } else {
-      body.appendChild(el('div',{class:'legend-note', style:'margin:-4px 0 10px;'},['Zwei Dateien: das Workout (Schritte/Ziele) und die Strecke (GPS-Track) separat – auf dem Gerät beide zusammen für die Fahrt auswählen, genau wie bei Hammerhead/Garmin/Wahoo üblich.']));
+      body.appendChild(el('div', {style:'margin:-4px 0 10px;'}, [infoButton('Zwei Dateien: das Workout (Schritte/Ziele) und die Strecke (GPS-Track) separat – auf dem Gerät beide zusammen für die Fahrt auswählen, genau wie bei Hammerhead/Garmin/Wahoo üblich.')]));
     }
     if(goodRationale.length) body.appendChild(el('div',{class:'legend-note', style:'margin-bottom:10px;'},[goodRationale.map(r=>r.text).join(' ')]));
     body.appendChild(el('div',{class:'chart-box tall'},[el('canvas',{id:'velocastTrainerChart'})]));
     if(!routeBased){
-      const legend = el('div', {class:'legend-note', style:'display:flex; flex-wrap:wrap;'});
-      ZONES.forEach(z=>legend.appendChild(legendDot(z.color, z.name)));
-      legend.appendChild(legendDot('#fc4c02','FTP-Linie'));
-      body.appendChild(legend);
+      body.appendChild(el('div', {style:'margin-top:-4px; margin-bottom:8px;'}, [infoButton(ZONES.map(z=>legendDot(z.color, z.name)).concat([legendDot('#fc4c02','FTP-Linie')]))]));
     }
     if(tp.hammerheadHint) body.appendChild(renderHammerheadHint(tp.hammerheadHint, routeBased||tp.exportDistanceMode));
     const cards = [];
@@ -7713,9 +7782,9 @@ function renderTrainerWorkoutPreview(tp, ctx){
     if(routeBased && specificity!=null){
       const idealBand = GOAL_IDEAL_GRADIENT[workoutGoalKey];
       body.appendChild(barRow('Terrain-Match', specificity, specificity>=70?'var(--tail)':specificity>=45?'var(--cross)':'var(--head)', specificity+'%'));
-      body.appendChild(el('div',{class:'legend-note', style:'margin-top:4px;'},[
+      body.appendChild(el('div', {style:'margin-top:-4px;'}, [infoButton(
         `Anteil der harten Trainingszeit auf einer für „${goalLabel(workoutGoalKey)}" passenden Steigung${idealBand?` (ideal ${idealBand.min}–${idealBand.max}%)`:''}. Kein Fitnessgewinn-Wert, nur ein Gelände-Abgleich.`
-      ]));
+      )]));
     }
   }
   details.appendChild(body);
@@ -7732,16 +7801,17 @@ function renderTrainerZonesCard(hasWorkout, zoneBreakdown, routeBased, actualWee
   const card = el('div', {class:'card'});
   card.appendChild(el('h2', {}, ['Zonen']));
   if(hasWorkout){
-    card.appendChild(el('div', {style:'font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:2px 0 4px;'}, ['Ausgewähltes Workout']));
+    card.appendChild(el('div', {style:'display:flex; align-items:center; gap:6px; font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:2px 0 4px;'}, [
+      'Ausgewähltes Workout', infoButton(routeBased?'Geschätzt aus dem Streckenprofil.':'Aus der Zielleistung jedes Abschnitts.')
+    ]));
     appendZoneBars(card, zoneBreakdown);
-    card.appendChild(el('div',{class:'legend-note', style:'margin:6px 0 16px;'},[routeBased?'Geschätzt aus dem Streckenprofil.':'Aus der Zielleistung jedes Abschnitts.']));
   }
-  card.appendChild(el('div', {style:'font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:2px 0 4px;'}, ['Diese Woche, gefahren']));
+  card.appendChild(el('div', {style:'display:flex; align-items:center; gap:6px; font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:16px 0 4px;'}, [
+    'Diese Woche, gefahren',
+    actualWeekZones.rides>0 ? infoButton(`${actualWeekZones.rides} Fahrt${actualWeekZones.rides===1?'':'en'} seit Montag, aus deinen echten Aktivitäten (Stravas 7 Zonen statt der 6 App-Zonen oben).`) : ''
+  ]));
   if(actualWeekZones.rides>0){
     appendZoneBars(card, actualWeekZones);
-    card.appendChild(el('div',{class:'legend-note', style:'margin-top:6px;'},[
-      `${actualWeekZones.rides} Fahrt${actualWeekZones.rides===1?'':'en'} seit Montag, aus deinen echten Aktivitäten (Stravas 7 Zonen statt der 6 App-Zonen oben).`
-    ]));
   } else {
     card.appendChild(el('div',{class:'legend-note'},['Noch keine Fahrten diese Woche.']));
   }
@@ -7801,9 +7871,7 @@ function appendLearningDetail(box, learning){
     goalsBox.appendChild(row);
   });
   box.appendChild(goalsBox);
-  box.appendChild(el('div',{class:'legend-note', style:'margin:8px 0;'},[
-    'Anpassungsfaktor je Ziel aus den letzten bis zu 8 ausgewerteten Einheiten – über 100% heißt du hast im Schnitt mehr geleistet als vorgegeben (Vorgabe wird angehoben), unter 100% weniger (Vorgabe wird abgesenkt).'
-  ]));
+  box.appendChild(el('div', {style:'margin:6px 0;'}, [infoButton('Anpassungsfaktor je Ziel aus den letzten bis zu 8 ausgewerteten Einheiten – über 100% heißt du hast im Schnitt mehr geleistet als vorgegeben (Vorgabe wird angehoben), unter 100% weniger (Vorgabe wird abgesenkt).')]));
   const recent = learning.history.slice(-8).slice().reverse();
   const details = el('details', {style:'margin-top:2px;'});
   details.appendChild(el('summary',{style:'cursor:pointer; font-size:11.5px; color:var(--chalk-dim);'},[`Letzte ${recent.length} ausgewertete Einheit${recent.length===1?'':'en'}`]));
@@ -7844,12 +7912,12 @@ function renderTrainerAblaufCard(tp, ctx){
   learnSection.appendChild(learnBox);
   body.appendChild(learnSection);
 
-  const evalSection = el('div', {style:'margin-top:18px; padding-top:14px; border-top:1px solid var(--line);'});
-  evalSection.appendChild(el('h3',{style:'margin:0 0 8px; font-size:13px;'},['Workout auswerten']));
+  const evalH3 = el('h3',{style:'margin:0 0 8px; font-size:13px; display:flex; align-items:center; gap:8px;'},['Workout auswerten']);
+  const evalSection = el('div', {style:'margin-top:18px; padding-top:14px; border-top:1px solid var(--line);'}, [evalH3]);
   if(!hasWorkout){
     evalSection.appendChild(el('div',{class:'legend-note'},['Wähle zuerst eine Workout-Art, um eine Vorschau zum Auswerten zu haben.']));
   } else {
-    evalSection.appendChild(el('div',{class:'legend-note'},['Vergleiche eine absolvierte Aktivität mit dieser Vorschau – Ist- gegen Soll-Leistung je Abschnitt (Ø-Leistung pro Intervall).']));
+    evalH3.appendChild(infoButton('Vergleiche eine absolvierte Aktivität mit dieser Vorschau – Ist- gegen Soll-Leistung je Abschnitt (Ø-Leistung pro Intervall).'));
     const row = el('div', {style:'display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:10px 0;'});
     const select = el('select', {style:'width:auto; min-width:220px; margin-bottom:0;'});
     select.appendChild(el('option',{value:''},['Aktivität wählen…']));
@@ -8040,6 +8108,16 @@ const CLASS_SETTINGS_FIELDS = [
     example:'Sinnvoll aktiviert bei intensiven Klassen wie VO2max/Sprint, die Erholung brauchen.' },
 ];
 
+// Groups CLASS_SETTINGS_FIELDS into the 4 named sub-sections each class card
+// renders (see buildClassSettingsSection()) -- purely a presentation grouping,
+// doesn't change which keys exist or how they're read from TRAINING_CONFIG.
+const CLASS_SETTINGS_GROUPS = [
+  { title:'Steigung', keys:['gradient.idealMin','gradient.idealMax','gradient.acceptableMin','gradient.acceptableMax'] },
+  { title:'Intervall-Struktur', keys:['minIntervalMin','maxIntervalMin','minRecoveryMin','maxIntervalsPerSession'] },
+  { title:'Wochenbudget', keys:['maxSessionsPerWeek','noConsecutiveDays'] },
+  { title:'Streckenlänge', keys:['minRouteKm','minWorkableKm'] },
+];
+
 const COMMON_SETTINGS_FIELDS = [
   { path:'suitability.minAcceptable', label:'Mindest-Streckeneignung', unit:'/100', step:1,
     help:'Unterhalb dieses Scores gilt eine Strecke als ungeeignet für die gewählte Klasse – es erscheint ein expliziter Fehlzustand statt stillschweigend eine leichtere Einheit zu erzeugen.',
@@ -8126,10 +8204,12 @@ function flashSettingsSaved(){
   einstellungenSavedTimer = setTimeout(()=>{ note.style.opacity = '0'; }, 1500);
 }
 
-function settingsFieldRow(path, def){
-  const val = getByPath(TRAINING_CONFIG, path);
+// Shared by settingsFieldRow() and settingsFieldChip() -- one field's help
+// text (what it does + directional effect + example + current default),
+// which now lives inside an infoButton() popover instead of an always-visible
+// paragraph (see Part A).
+function fieldHelpText(path, def){
   const dflt = getByPath(TRAINING_CONFIG_DEFAULTS, path);
-  const id = 'sf-' + path.replace(/\./g, '-');
   const dfltText = def.bool ? (dflt ? 'an' : 'aus') : (dflt + (def.unit ? ' ' + def.unit : ''));
   let effectText = '';
   if(def.inert){
@@ -8139,7 +8219,12 @@ function settingsFieldRow(path, def){
   } else {
     effectText = ` Höher: ${def.up} Niedriger: ${def.down}`;
   }
-  const helpText = `${def.help}${effectText} Beispiel: ${def.example} Standard: ${dfltText}.`;
+  return `${def.help}${effectText} Beispiel: ${def.example} Standard: ${dfltText}.`;
+}
+
+function settingsFieldRow(path, def){
+  const val = getByPath(TRAINING_CONFIG, path);
+  const id = 'sf-' + path.replace(/\./g, '-');
 
   let inputEl;
   if(def.bool){
@@ -8163,8 +8248,63 @@ function settingsFieldRow(path, def){
     inputEl = el('span', {class:'tsettings-input-wrap'}, wrapChildren);
   }
 
-  const main = el('div', {class:'tsettings-row-main'}, [el('label', {for:id}, [def.label]), inputEl]);
-  return el('div', {class:'tsettings-row'}, [main, el('div', {class:'legend-note'}, [helpText])]);
+  const label = el('label', {for:id, style:'display:flex; align-items:center; gap:6px;'}, [def.label, infoButton(fieldHelpText(path, def))]);
+  const main = el('div', {class:'tsettings-row-main'}, [label, inputEl]);
+  return el('div', {class:'tsettings-row'}, [main]);
+}
+
+// Chip form of settingsFieldRow() used for the per-class constraint fields
+// (see buildClassSettingsSection()): a compact read-only .stat-chip by
+// default, expanding in place into the same real <input>/toggle
+// settingsFieldRow() uses once tapped -- same setConfigOverride/setByPath/
+// flashSettingsSaved wiring, only the presentation differs. Toggling chip vs.
+// input is a direct DOM swap (no render()), same reasoning as infoButton().
+function settingsFieldChip(path, def){
+  const val = getByPath(TRAINING_CONFIG, path);
+  const id = 'sf-' + path.replace(/\./g, '-');
+  const chipText = v => def.bool ? (v ? 'an' : 'aus') : (v + (def.unit ? ' ' + def.unit : ''));
+
+  const chipV = el('div', {class:'v'}, [chipText(val)]);
+  const chip = el('button', {type:'button', class:'stat-chip neutral', title:'Bearbeiten'}, [chipV, el('div', {class:'l'}, [def.label])]);
+
+  let inputEl, currentInput;
+  const collapse = ()=>{
+    chipV.textContent = chipText(def.bool ? currentInput.checked : parseFloat(currentInput.value));
+    inputWrap.style.display = 'none';
+    chip.style.display = '';
+  };
+  if(def.bool){
+    currentInput = el('input', {type:'checkbox', id, onchange:(e)=>{
+      setByPath(TRAINING_CONFIG, path, e.target.checked);
+      setConfigOverride(path, e.target.checked);
+      flashSettingsSaved();
+      collapse();
+    }});
+    if(val) currentInput.checked = true;
+    inputEl = el('label', {class:'tsettings-switch'}, [currentInput, el('span', {class:'tsettings-slider'})]);
+  } else {
+    currentInput = el('input', {type:'number', id, step:def.step||1, value:val, style:'width:76px; margin-bottom:0;', onchange:(e)=>{
+      let value = parseFloat(e.target.value);
+      if(!isFinite(value)){ value = getByPath(TRAINING_CONFIG_DEFAULTS, path); e.target.value = value; }
+      setByPath(TRAINING_CONFIG, path, value);
+      setConfigOverride(path, value);
+      flashSettingsSaved();
+      collapse();
+    }});
+    const wrapChildren = [currentInput];
+    if(def.unit) wrapChildren.push(el('span', {class:'tsettings-unit'}, [def.unit]));
+    inputEl = el('span', {class:'tsettings-input-wrap'}, wrapChildren);
+  }
+  currentInput.addEventListener('blur', collapse);
+
+  const inputWrap = el('span', {class:'tsettings-chip-input', style:'display:none;'}, [inputEl]);
+  chip.addEventListener('click', ()=>{
+    chip.style.display = 'none';
+    inputWrap.style.display = 'inline-flex';
+    currentInput.focus();
+  });
+
+  return el('span', {class:'tsettings-chip-item'}, [chip, inputWrap, infoButton(fieldHelpText(path, def))]);
 }
 
 function buildClassSettingsSection(c){
@@ -8172,10 +8312,21 @@ function buildClassSettingsSection(c){
   const exempt = SUITABILITY_EXEMPT_CLASSES.includes(c.key);
   const body = el('div', {style:'margin-top:10px;'});
   if(exempt){
-    body.appendChild(el('div', {class:'legend-note', style:'margin-bottom:8px;'}, ['Diese Klasse ist terrainfolgend über die ganze Strecke geplant (kein Intervall-Placement) – die Steigungsfelder unten fließen aktuell nicht in ihre Eignungsprüfung ein, bleiben aber editierbar für spätere Nutzung.']));
+    body.appendChild(el('div', {style:'margin-bottom:10px; display:flex; align-items:center; gap:6px;'}, [
+      el('span', {class:'legend-note', style:'margin:0;'}, ['Terrainfolgende Klasse']),
+      infoButton('Diese Klasse ist terrainfolgend über die ganze Strecke geplant (kein Intervall-Placement) – die Steigungsfelder unten fließen aktuell nicht in ihre Eignungsprüfung ein, bleiben aber editierbar für spätere Nutzung.')
+    ]));
   }
-  CLASS_SETTINGS_FIELDS.forEach(def => body.appendChild(settingsFieldRow(`${basePath}.${def.key}`, def)));
-  body.appendChild(el('button', {class:'btn secondary', style:'margin-top:8px;', onclick: ()=>{ resetConfigSlice(basePath); render(); }}, ['Diese Klasse auf Standard zurücksetzen']));
+  const fieldByKey = {};
+  CLASS_SETTINGS_FIELDS.forEach(def => fieldByKey[def.key] = def);
+  CLASS_SETTINGS_GROUPS.forEach(group => {
+    const chips = el('div', {class:'stat-chips'}, group.keys.map(key => settingsFieldChip(`${basePath}.${key}`, fieldByKey[key])));
+    body.appendChild(el('div', {class:'tsettings-group'}, [
+      el('h3', {class:'tsettings-group-title'}, [group.title]),
+      chips
+    ]));
+  });
+  body.appendChild(el('button', {class:'btn secondary', style:'margin-top:12px;', onclick: ()=>{ resetConfigSlice(basePath); render(); }}, ['Diese Klasse auf Standard zurücksetzen']));
   const summary = el('summary', {}, [el('h3', {style:'display:inline; font-size:13px; margin:0;'}, [c.label])]);
   return el('details', {class:'tt-collapse tsettings-class'}, [summary, body]);
 }
@@ -8203,21 +8354,18 @@ function renderEinstellungenPage(){
 
   const headerCard = el('div', {class:'card'});
   headerCard.appendChild(el('div', {style:'display:flex; align-items:center; justify-content:space-between; gap:10px;'}, [
-    el('h2', {style:'margin:0;'}, ['Einstellungen']),
+    el('h2', {style:'margin:0; display:flex; align-items:center; gap:8px;'}, ['Einstellungen', infoButton('Alle Werte, die die Trainingsempfehlung und die Streckenanalyse steuern. Änderungen wirken sofort und werden lokal in diesem Browser gespeichert – kein Server, kein Sync über Geräte hinweg. „Standard" zeigt den ursprünglichen Wert, unabhängig davon, was gerade eingestellt ist.')]),
     el('span', {id:'settingsSavedNote', class:'tsettings-saved-note'}, ['Gespeichert ✓']),
   ]));
-  headerCard.appendChild(el('div', {class:'legend-note'}, ['Alle Werte, die die Trainingsempfehlung und die Streckenanalyse steuern. Änderungen wirken sofort und werden lokal in diesem Browser gespeichert – kein Server, kein Sync über Geräte hinweg. „Standard" zeigt den ursprünglichen Wert, unabhängig davon, was gerade eingestellt ist.']));
   frag.appendChild(headerCard);
 
   const classCard = el('div', {class:'card'});
-  classCard.appendChild(el('h2', {}, ['Trainingsklassen-Constraints']));
-  classCard.appendChild(el('div', {class:'legend-note', style:'margin-bottom:6px;'}, ['Pro Klasse: welche Steigung als ideal/akzeptabel gilt, wie lang Intervalle und Pausen sein dürfen, und wie viel Strecke mindestens nötig ist.']));
+  classCard.appendChild(el('h2', {style:'display:flex; align-items:center; gap:8px;'}, ['Trainingsklassen-Constraints', infoButton('Pro Klasse: welche Steigung als ideal/akzeptabel gilt, wie lang Intervalle und Pausen sein dürfen, und wie viel Strecke mindestens nötig ist.')]));
   TRAINING_CLASSES.forEach(c => classCard.appendChild(buildClassSettingsSection(c)));
   frag.appendChild(classCard);
 
   const commonCard = el('div', {class:'card'});
-  commonCard.appendChild(el('h2', {}, ['Allgemeine Strecken-Constraints']));
-  commonCard.appendChild(el('div', {class:'legend-note', style:'margin-bottom:6px;'}, ['Gelten für alle Klassen gleichermaßen: Kreuzungs- und Kurvigkeits-Erkennung, Mindest-Eignungs-Score.']));
+  commonCard.appendChild(el('h2', {style:'display:flex; align-items:center; gap:8px;'}, ['Allgemeine Strecken-Constraints', infoButton('Gelten für alle Klassen gleichermaßen: Kreuzungs- und Kurvigkeits-Erkennung, Mindest-Eignungs-Score.')]));
   COMMON_SETTINGS_FIELDS.forEach(def => commonCard.appendChild(settingsFieldRow(def.path, def)));
   commonCard.appendChild(el('div', {style:'margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;'}, [
     el('button', {class:'btn secondary', onclick: ()=>{ resetConfigSlice('constraints.common'); render(); }}, ['Zurücksetzen']),
@@ -8226,13 +8374,12 @@ function renderEinstellungenPage(){
   frag.appendChild(commonCard);
 
   const routeGenCard = el('div', {class:'card'});
-  routeGenCard.appendChild(el('h2', {}, ['Streckengenerierung']));
-  routeGenCard.appendChild(el('div', {class:'legend-note', style:'margin-bottom:6px;'}, ['Wie aus den rohen GPX-Punkten Anstieg/Flach/Abfahrt-Segmente und die Kurvigkeit berechnet werden.']));
+  routeGenCard.appendChild(el('h2', {style:'display:flex; align-items:center; gap:8px;'}, ['Streckengenerierung', infoButton('Wie aus den rohen GPX-Punkten Anstieg/Flach/Abfahrt-Segmente und die Kurvigkeit berechnet werden.')]));
   ROUTE_GEN_SETTINGS_FIELDS.forEach(def => routeGenCard.appendChild(settingsFieldRow(def.path, def)));
   routeGenCard.appendChild(el('button', {class:'btn secondary', style:'margin-top:8px;', onclick: ()=>{ resetConfigSlice('routeGeneration'); render(); }}, ['Zurücksetzen']));
   frag.appendChild(routeGenCard);
 
-  frag.appendChild(el('div', {class:'legend-note'}, ['Diese Einstellungen betreffen ausschließlich die Trainer-Trainingsempfehlungen und Streckenanalyse — unabhängig von der Punktabstand-Einstellung im Strecke-Tab.']));
+  frag.appendChild(el('div', {style:'margin-top:4px;'}, [infoButton('Diese Einstellungen betreffen ausschließlich die Trainer-Trainingsempfehlungen und Streckenanalyse — unabhängig von der Punktabstand-Einstellung im Strecke-Tab.')]));
 
   return frag;
 }
