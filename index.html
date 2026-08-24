@@ -5898,11 +5898,22 @@ function trainingClass(key){ return TRAINING_CLASSES.find(c=>c.key===key) || nul
 // A manually chosen top-bar goal still maps onto one class and forces it to
 // HIGH priority — 'auto' and 'recovery' don't force anything.
 const GOAL_TO_CLASS = { ftp:'threshold', vo2max:'vo2max', endurance:'endurance', anaerobic:'anaerobic' };
+// Maps the 4 classes that used to share one weekly-quality-minutes value onto
+// their own TRAINING_CONFIG table name (see weeklyTempoMinutesByPriority etc.
+// below) -- used both by computeWeeklyBudgetTargets() and the Einstellungen
+// chip group.
+const WEEKLY_QUALITY_TABLE_BY_CLASS = { tempo:'weeklyTempoMinutesByPriority', threshold:'weeklyThresholdMinutesByPriority', vo2max:'weeklyVo2maxMinutesByPriority', anaerobic:'weeklyAnaerobicMinutesByPriority' };
 
 const TRAINING_CONFIG = {
   classBaselineScore: { recovery:0, endurance:20, tempo:12, threshold:15, vo2max:10, anaerobic:5, sprint:0, longdistance:10 },
   priority: { highMin:55, mediumMin:25, lowMin:8 },
-  weeklyQualityMinutesByPriority:   { HIGH:35,  MEDIUM:20,  LOW:10,  MAINTENANCE:0 },
+  // Split per class (was one shared value for all four) so each class's
+  // weekly quality-time target matches its actual research-backed session
+  // structure instead of a single compromise number -- see plan for sources.
+  weeklyTempoMinutesByPriority:     { HIGH:90, MEDIUM:60, LOW:30, MAINTENANCE:0 },
+  weeklyThresholdMinutesByPriority: { HIGH:80, MEDIUM:40, LOW:20, MAINTENANCE:0 },
+  weeklyVo2maxMinutesByPriority:    { HIGH:32, MEDIUM:16, LOW:8,  MAINTENANCE:0 },
+  weeklyAnaerobicMinutesByPriority: { HIGH:15, MEDIUM:10, LOW:5,  MAINTENANCE:0 },
   weeklyEnduranceMinutesByPriority: { HIGH:420, MEDIUM:300, LOW:180, MAINTENANCE:90 },
   weeklySprintEffortsByPriority:    { HIGH:8,   MEDIUM:6,   LOW:3,   MAINTENANCE:0 },
   weeklyLongRidesByPriority:        { HIGH:2,   MEDIUM:1,   LOW:1,   MAINTENANCE:0 },
@@ -6024,7 +6035,7 @@ function computeWeeklyBudgetTargets(priorities, config){
     else if(c.key === 'endurance') targets[c.key] = { unit:'minutes', amount: config.weeklyEnduranceMinutesByPriority[tier] };
     else if(c.key === 'sprint') targets[c.key] = { unit:'efforts', amount: config.weeklySprintEffortsByPriority[tier] };
     else if(c.key === 'longdistance') targets[c.key] = { unit:'rides', amount: config.weeklyLongRidesByPriority[tier] };
-    else targets[c.key] = { unit:'quality', amount: config.weeklyQualityMinutesByPriority[tier] };
+    else targets[c.key] = { unit:'quality', amount: config[WEEKLY_QUALITY_TABLE_BY_CLASS[c.key]][tier] };
   });
   return targets;
 }
@@ -8118,6 +8129,35 @@ const CLASS_SETTINGS_GROUPS = [
   { title:'Streckenlänge', keys:['minRouteKm','minWorkableKm'] },
 ];
 
+// Field defs for the 4 priority-tier chips appended to the "Wochenziel nach
+// Priorität" group in buildClassSettingsSection() -- only rendered for
+// classes present in WEEKLY_QUALITY_TABLE_BY_CLASS (tempo/threshold/vo2max/
+// anaerobic). Same {label,unit,step,help,up,down,example} schema as
+// CLASS_SETTINGS_FIELDS so fieldHelpText()/settingsFieldChip() need no
+// changes to consume them.
+const WEEKLY_QUALITY_TIER_FIELDS = [
+  { key:'HIGH', label:'Wochenziel bei Priorität Hoch', unit:'min', step:5,
+    help:'Wie viele Minuten Qualitätszeit (Zeit in den Intervallen dieser Klasse) pro Woche als Ziel gelten, wenn diese Klasse aktuell hohe Priorität hat.',
+    up:'Bei hoher Priorität wird mehr Zeit in dieser Zone empfohlen, bevor das Wochenbudget als erfüllt gilt.',
+    down:'Bei hoher Priorität reicht schon weniger Zeit in dieser Zone, damit das Wochenbudget als erfüllt gilt.',
+    example:'Von 80 auf 100 erhöht: bei hoher Priorität gilt das Budget erst nach 100 statt 80 Minuten als erfüllt.' },
+  { key:'MEDIUM', label:'Wochenziel bei Priorität Mittel', unit:'min', step:5,
+    help:'Wochenziel in Minuten, wenn diese Klasse aktuell mittlere Priorität hat.',
+    up:'Bei mittlerer Priorität wird mehr Zeit in dieser Zone empfohlen, bevor das Wochenbudget als erfüllt gilt.',
+    down:'Bei mittlerer Priorität reicht schon weniger Zeit in dieser Zone, damit das Wochenbudget als erfüllt gilt.',
+    example:'Von 40 auf 30 gesenkt: bei mittlerer Priorität gilt das Budget schon nach 30 statt 40 Minuten als erfüllt.' },
+  { key:'LOW', label:'Wochenziel bei Priorität Niedrig', unit:'min', step:5,
+    help:'Wochenziel in Minuten, wenn diese Klasse aktuell niedrige Priorität hat.',
+    up:'Bei niedriger Priorität wird mehr Zeit in dieser Zone empfohlen, bevor das Wochenbudget als erfüllt gilt.',
+    down:'Bei niedriger Priorität reicht schon weniger Zeit in dieser Zone, damit das Wochenbudget als erfüllt gilt.',
+    example:'Von 20 auf 10 gesenkt: bei niedriger Priorität gilt das Budget schon nach 10 statt 20 Minuten als erfüllt.' },
+  { key:'MAINTENANCE', label:'Wochenziel ohne Priorität (Egal)', unit:'min', step:5,
+    help:'Wochenziel in Minuten, wenn diese Klasse aktuell keine erkennbare Priorität hat (weder Schwäche noch manuelles Ziel).',
+    up:'Auch ohne erkennbare Priorität wird noch etwas Zeit in dieser Zone empfohlen.',
+    down:'Ohne erkennbare Priorität wird diese Klasse gar nicht mehr aktiv empfohlen.',
+    example:'Von 0 auf 5 erhöht: die Klasse taucht gelegentlich auch ohne konkreten Anlass in der Empfehlung auf.' },
+];
+
 const COMMON_SETTINGS_FIELDS = [
   { path:'suitability.minAcceptable', label:'Mindest-Streckeneignung', unit:'/100', step:1,
     help:'Unterhalb dieses Scores gilt eine Strecke als ungeeignet für die gewählte Klasse – es erscheint ein expliziter Fehlzustand statt stillschweigend eine leichtere Einheit zu erzeugen.',
@@ -8326,7 +8366,19 @@ function buildClassSettingsSection(c){
       chips
     ]));
   });
-  body.appendChild(el('button', {class:'btn secondary', style:'margin-top:12px;', onclick: ()=>{ resetConfigSlice(basePath); render(); }}, ['Diese Klasse auf Standard zurücksetzen']));
+  // Tempo/Schwelle/VO2max/Anaerob each got their own weekly-quality-minutes
+  // table (used to be one shared value for all four) -- expose it here as a
+  // 5th chip group, same pattern as above. Other classes have no entry in
+  // WEEKLY_QUALITY_TABLE_BY_CLASS and get nothing extra.
+  const budgetTable = WEEKLY_QUALITY_TABLE_BY_CLASS[c.key];
+  if(budgetTable){
+    const budgetChips = el('div', {class:'stat-chips'}, WEEKLY_QUALITY_TIER_FIELDS.map(def => settingsFieldChip(`${budgetTable}.${def.key}`, def)));
+    body.appendChild(el('div', {class:'tsettings-group'}, [
+      el('h3', {class:'tsettings-group-title'}, ['Wochenziel nach Priorität']),
+      budgetChips
+    ]));
+  }
+  body.appendChild(el('button', {class:'btn secondary', style:'margin-top:12px;', onclick: ()=>{ resetConfigSlice(basePath); if(budgetTable) resetConfigSlice(budgetTable); render(); }}, ['Diese Klasse auf Standard zurücksetzen']));
   const summary = el('summary', {}, [el('h3', {style:'display:inline; font-size:13px; margin:0;'}, [c.label])]);
   return el('details', {class:'tt-collapse tsettings-class'}, [summary, body]);
 }
