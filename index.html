@@ -620,6 +620,13 @@ const STRAVA_CLIENT_ID = "268232";
 // never ship to the browser. Replace with your deployed worker URL, e.g.
 // "https://rueckenwind-oauth.<subdomain>.workers.dev".
 const TOKEN_ENDPOINT = "https://rueckenwind-oauth.lucca-renner7.workers.dev";
+// Die Client ID ist nicht geheim (sie steht ohnehin öffentlich in der
+// OAuth-Redirect-URL) -- statt sie hier UND als Worker-Env-Var zu pflegen,
+// wird sie beim Verbinden vom Worker geholt (eine Quelle der Wahrheit,
+// siehe HAMMERHEAD_CLIENT_ID im Worker/Cloudflare-Dashboard).
+const HAMMERHEAD_CLIENT_ID_ENDPOINT = TOKEN_ENDPOINT + "/hammerhead/client-id";
+const HAMMERHEAD_TOKEN_ENDPOINT = TOKEN_ENDPOINT + "/hammerhead/token";
+const HAMMERHEAD_UPLOAD_ENDPOINT = TOKEN_ENDPOINT + "/hammerhead/upload";
 
 function pad2(n){ return String(n).padStart(2,'0'); }
 function toLocalInputValue(date){
@@ -670,6 +677,9 @@ let state = {
   connected: false,
   athlete: null,
   accessToken: null,
+  hammerheadConnected: false,
+  hammerheadAccessToken: null,
+  hammerheadExpiresAt: null, // epoch ms
   activities: [],
   selectedActivity: null,
   routePoints: [], // [{lat,lon,bearing,distanceKm,arrivalTime}] - sampled points used for wind markers
@@ -857,7 +867,7 @@ let state = {
     routeError: null,
     loadingRoute: false, // true while a saved-Strava-route attachment fetch is in flight
     exportDistanceMode: false, // "plan by km instead of minutes" toggle, FIT-only, non-route workouts only
-    hammerheadHint: null, // filename shown after "Send to Hammerhead", or null
+    hammerheadResult: null, // {ok, name} | {ok:false, message} after "Send to Hammerhead", or null
     evalActivityId: null,
     evalLoading: false,
     evalError: null,
@@ -1677,6 +1687,12 @@ async function loadStoredToken(){
 async function saveToken(refreshToken){
   try{ localStorage.setItem("strava_refresh_token", refreshToken); }catch(e){}
 }
+async function loadStoredHammerheadToken(){
+  try{ return localStorage.getItem("hammerhead_refresh_token"); }catch(e){ return null; }
+}
+async function saveHammerheadToken(refreshToken){
+  try{ localStorage.setItem("hammerhead_refresh_token", refreshToken); }catch(e){}
+}
 
 // Persisted across sessions: avg speed and point spacing, since those are
 // per-rider preferences. Startzeit is intentionally NOT persisted — it
@@ -1725,6 +1741,83 @@ async function refreshAccessToken(refreshToken){
   });
   if(!res.ok) throw new Error("Token-Erneuerung fehlgeschlagen (" + res.status + ")");
   return res.json();
+}
+
+// ---------- Hammerhead API ----------
+let cachedHammerheadClientId = null;
+async function fetchHammerheadClientId(){
+  if(cachedHammerheadClientId) return cachedHammerheadClientId;
+  const res = await fetch(HAMMERHEAD_CLIENT_ID_ENDPOINT);
+  if(!res.ok) throw new Error("Hammerhead-Konfiguration konnte nicht geladen werden (" + res.status + ")");
+  const data = await res.json();
+  cachedHammerheadClientId = data.client_id;
+  return cachedHammerheadClientId;
+}
+async function buildHammerheadAuthUrl(){
+  const clientId = await fetchHammerheadClientId();
+  const redirectUri = window.location.origin + window.location.pathname;
+  return `https://api.hammerhead.io/v1/auth/oauth/authorize?client_id=${encodeURIComponent(clientId)}&response_type=code&redirect_uri=${encodeURIComponent(redirectUri)}&scope=workout:write&state=hammerhead`;
+}
+
+async function exchangeHammerheadCode(code){
+  const redirectUri = window.location.origin + window.location.pathname;
+  const res = await fetch(HAMMERHEAD_TOKEN_ENDPOINT, {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ code, redirect_uri: redirectUri })
+  });
+  if(!res.ok) throw new Error("Hammerhead-Autorisierung fehlgeschlagen (" + res.status + ")");
+  return res.json();
+}
+
+async function refreshHammerheadToken(refreshToken){
+  const res = await fetch(HAMMERHEAD_TOKEN_ENDPOINT, {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ refresh_token: refreshToken })
+  });
+  if(!res.ok) throw new Error("Hammerhead-Token-Erneuerung fehlgeschlagen (" + res.status + ")");
+  return res.json();
+}
+
+// Strava refresht seinen Token unconditional bei jedem init() (siehe unten),
+// weil fast jede Seite davon abhängt. Der Hammerhead-Token wird nur vom
+// Send-Button gebraucht -- ein eager Refresh bei jedem Seitenaufruf würde für
+// alle, die Trainer nie öffnen, unnötig einen Request verbrauchen. Deshalb
+// hier ein echter Expiry-Check (aus Hammerheads expires_in) statt des
+// Strava-Musters.
+async function ensureHammerheadToken(){
+  const skewMs = 60000;
+  if(state.hammerheadAccessToken && state.hammerheadExpiresAt && Date.now() < state.hammerheadExpiresAt - skewMs){
+    return state.hammerheadAccessToken;
+  }
+  const stored = await loadStoredHammerheadToken();
+  if(!stored){ state.hammerheadConnected = false; return null; }
+  try{
+    const tokenData = await refreshHammerheadToken(stored);
+    state.hammerheadAccessToken = tokenData.access_token;
+    state.hammerheadExpiresAt = Date.now() + tokenData.expires_in*1000;
+    await saveHammerheadToken(tokenData.refresh_token);
+    state.hammerheadConnected = true;
+    return state.hammerheadAccessToken;
+  }catch(e){
+    state.hammerheadConnected = false;
+    try{ localStorage.removeItem("hammerhead_refresh_token"); }catch(_){}
+    return null;
+  }
+}
+
+async function connectWithHammerheadCode(code){
+  state.loading.hammerheadConnect = true; render();
+  try{
+    const tokenData = await exchangeHammerheadCode(code);
+    state.hammerheadAccessToken = tokenData.access_token;
+    state.hammerheadExpiresAt = Date.now() + tokenData.expires_in*1000;
+    await saveHammerheadToken(tokenData.refresh_token);
+    state.hammerheadConnected = true;
+  }catch(e){
+    state.trainerPage.hammerheadResult = { ok:false, message: e.message || "Verbindung zu Hammerhead fehlgeschlagen." };
+  }
+  state.loading.hammerheadConnect = false;
+  render();
 }
 
 async function fetchActivities(token){
@@ -3141,7 +3234,7 @@ function resetConnectionState(){
   state.trainerPage.workoutPreviewOpen = false;
   state.trainerPage.routeError = null;
   state.trainerPage.loadingRoute = false;
-  state.trainerPage.hammerheadHint = null;
+  state.trainerPage.hammerheadResult = null;
   state.trainerPage.evalActivityId = null;
   state.trainerPage.evalLoading = false;
   state.trainerPage.evalError = null;
@@ -6188,8 +6281,8 @@ const TRAINING_CONFIG = {
   constraints: {
     common: {
       maxInterruptionM: 100,
-      intersectionTurnDeg: 55,
-      intersectionGapM: 25,
+      intersectionTurnDeg: 135,
+      intersectionGapM: 7,
       curveDensityThresholdDegPerKm: 350,
     },
     routeConstraintDefaults: { ignoreCurveConstraints: false, ignoreIntersectionConstraints: false },
@@ -8581,6 +8674,29 @@ function downloadBlob(content, filename, mime){
   document.body.appendChild(a); a.click(); a.remove();
   URL.revokeObjectURL(url);
 }
+// Rohe Binärdaten statt Base64/JSON: buildFit() liefert bereits ein
+// Uint8Array, Workers lesen das nativ per request.arrayBuffer() zurück --
+// kein Encoding-Overhead.
+async function uploadWorkoutToHammerhead(fitBytes, fileName, accessToken){
+  const url = `${HAMMERHEAD_UPLOAD_ENDPOINT}?plannedDate=${encodeURIComponent(todayIsoKey())}&filename=${encodeURIComponent(fileName)}`;
+  const res = await fetch(url, {
+    method:"POST",
+    headers:{ "Content-Type":"application/octet-stream", "Authorization":"Bearer " + accessToken },
+    body: fitBytes
+  });
+  if(res.status === 401){
+    // Auch den (noch nicht abgelaufenen, aber von Hammerhead abgelehnten --
+    // z.B. Scope entzogen) Token verwerfen, sonst liefert der nächste Klick
+    // via ensureHammerheadToken()'s Cache denselben Token erneut aus und
+    // landet wieder in einem 401, ohne je den Verbinden-Redirect zu zeigen.
+    state.hammerheadConnected = false;
+    state.hammerheadAccessToken = null;
+    state.hammerheadExpiresAt = null;
+    throw new Error("Hammerhead-Verbindung abgelaufen — bitte erneut verbinden.");
+  }
+  if(!res.ok) throw new Error("Hammerhead-Upload fehlgeschlagen (" + res.status + ")");
+  return res.json();
+}
 function slugify(s){
   return String(s).toLowerCase()
     .replace(/[äöüß]/g, m=>({'ä':'ae','ö':'oe','ü':'ue','ß':'ss'}[m]))
@@ -8816,7 +8932,7 @@ function renderTrainerClassPicker(tp, trainingState, recommendedClassKey){
     const isSelected = c.key === tp.selectedClassKey;
     grid.appendChild(el('button', {
       type:'button', class:'class-pick-card' + (isSelected?' selected':''),
-      onclick: ()=>{ tp.selectedClassKey = c.key; tp.workoutPreviewOpen = true; tp.hammerheadHint = null; render(); }
+      onclick: ()=>{ tp.selectedClassKey = c.key; tp.workoutPreviewOpen = true; tp.hammerheadResult = null; render(); }
     }, [
       el('div', {class:'cpc-title'}, [
         el('span', {}, [c.label]),
@@ -8884,22 +9000,12 @@ function renderTrainerRouteCard(tp, selectedClassObj, todayRoute){
   if(tp.routeError) card.appendChild(el('div', {class:'error', style:'margin-top:10px;'}, [tp.routeError]));
   return card;
 }
-function renderHammerheadHint(fileName, distanceMode, usingHr){
-  const box = el('div', {class:'callout good', style:'margin-top:12px;'});
-  box.appendChild(el('div',{class:'callout-title', style:'display:flex; align-items:center; gap:var(--space-2);'},[
-    `✅ ${fileName} heruntergeladen`,
-    infoButton('Die .FIT-Datei funktioniert genauso auf Garmin- und Wahoo-Geräten.'
-      + (distanceMode ? ' Distanz-getriggerte Schritte sind auf Head-Units seltener im Einsatz als zeitbasierte – prüfe die ersten paar Kilometer testweise, bevor du dich für eine lange Ausfahrt darauf verlässt.' : ''))
-  ]));
-  const body = el('div', {class:'callout-body'});
-  body.appendChild(document.createTextNode('So kommt es auf den Karoo/das Gerät:'));
-  const ol = el('ol', {style:'margin:6px 0 0 18px; padding:0; line-height:1.6;'});
-  ol.appendChild(el('li',{},[ el('a',{href:'https://dashboard.hammerhead.io/workouts', target:'_blank', rel:'noopener noreferrer'},['dashboard.hammerhead.io/workouts']), ' öffnen' ]));
-  ol.appendChild(el('li',{},['Die gerade geladene Datei importieren (das Gerät akzeptiert .FIT' + (distanceMode||usingHr?'':' und .ZWO') + ')']));
-  ol.appendChild(el('li',{},['Sobald das Gerät das nächste Mal online ist, synchronisiert es das Workout automatisch']));
-  body.appendChild(ol);
-  box.appendChild(body);
-  return box;
+function renderHammerheadResult(result){
+  if(result.ok){
+    return calloutBox('good', '✅ An Hammerhead gesendet',
+      `„${result.name}" ist im Hammerhead-Dashboard geplant — sobald das Gerät online ist, synchronisiert es automatisch.`);
+  }
+  return calloutBox('warn', '⚠️ Hammerhead-Versand fehlgeschlagen', result.message);
 }
 function renderTrainerWorkoutPreview(tp, ctx){
   const { workout, workoutExists, hasWorkout, routeBased, rp, metrics, zoneBreakdown, specificity, workoutGoalKey, warnRationale, goodRationale } = ctx;
@@ -8928,11 +9034,35 @@ function renderTrainerWorkoutPreview(tp, ctx){
       const fitWorkout = distMode ? Object.assign({}, workout, { steps: stepsForDistanceExport(workout.steps) }) : workout;
       downloadBlob(buildFit(fitWorkout, rp), base + (distMode?'-km':'') + '.fit', 'application/octet-stream');
     };
-    actions.appendChild(el('button', {class:'btn', title:'Als .FIT herunterladen und im Hammerhead-Dashboard importieren', onclick:()=>{
-      doFit();
-      tp.hammerheadHint = base + ((routeBased||(!routeBased&&tp.exportDistanceMode))?'-km':'') + '.fit';
+    const sendToHammerhead = async ()=>{
+      if(state.loading.hammerheadUpload) return;
+      state.loading.hammerheadUpload = true;
+      tp.hammerheadResult = null;
       render();
-    }}, ['📲 Send to Hammerhead']));
+      try{
+        const token = await ensureHammerheadToken();
+        if(!token){
+          state.loading.hammerheadUpload = false;
+          window.location.href = await buildHammerheadAuthUrl();
+          return;
+        }
+        const distMode = !routeBased && !!tp.exportDistanceMode;
+        const fitWorkout = distMode ? Object.assign({}, workout, { steps: stepsForDistanceExport(workout.steps) }) : workout;
+        const fileName = base + (distMode?'-km':'') + '.fit';
+        const result = await uploadWorkoutToHammerhead(buildFit(fitWorkout, rp), fileName, token);
+        tp.hammerheadResult = { ok:true, name: result.name || fileName };
+      }catch(e){
+        tp.hammerheadResult = { ok:false, message: e.message || "Senden an Hammerhead fehlgeschlagen." };
+      }
+      state.loading.hammerheadUpload = false;
+      render();
+    };
+    actions.appendChild(el('button', {
+      class:'btn',
+      title: state.hammerheadConnected ? 'Direkt ins Hammerhead-Dashboard senden' : 'Mit Hammerhead verbinden und senden',
+      disabled: state.loading.hammerheadUpload ? 'disabled' : null,
+      onclick: sendToHammerhead
+    }, [ state.loading.hammerheadUpload ? 'Sende…' : (state.hammerheadConnected ? '📲 Send to Hammerhead' : '📲 Mit Hammerhead verbinden') ]));
     actions.appendChild(el('button', {class:'btn secondary', title:'Binäres .FIT (Garmin, Wahoo, Hammerhead)', onclick: doFit}, ['.FIT']));
     if(routeBased){
       actions.appendChild(el('button', {class:'btn secondary', title:'GPS-Strecke als separate .FIT-Kursdatei', onclick:()=>{
@@ -8973,7 +9103,7 @@ function renderTrainerWorkoutPreview(tp, ctx){
       const legendLineLabel = rp.usingHr ? 'LTHR-Linie' : 'FTP-Linie';
       body.appendChild(el('div', {style:'margin-top:-4px; margin-bottom:8px;'}, [infoButton(legendZones.map(z=>legendDot(z.color, z.name)).concat([legendDot('#fc4c02',legendLineLabel)]))]));
     }
-    if(tp.hammerheadHint) body.appendChild(renderHammerheadHint(tp.hammerheadHint, routeBased||tp.exportDistanceMode, rp.usingHr));
+    if(tp.hammerheadResult) body.appendChild(renderHammerheadResult(tp.hammerheadResult));
     const cards = [];
     if(routeBased){
       cards.push(metricCard('Distanz', `${metrics.totalDistanceKm.toFixed(1)} km`, `ca. ${Math.floor(metrics.totalMin/60)}:${String(metrics.totalMin%60).padStart(2,'0')} h geschätzt`));
@@ -9807,11 +9937,26 @@ function renderEinstellungenPage(){
 async function init(){
   render();
 
+  state.hammerheadConnected = !!(await loadStoredHammerheadToken());
+
   // Strava just redirected back to this page with ?code=...
   const params = new URLSearchParams(window.location.search);
   const codeParam = params.get("code");
+  const stateParam = params.get("state");
+  const errorParam = params.get("error");
   let justConnected = false;
-  if(codeParam){
+
+  if(codeParam && stateParam === "hammerhead"){
+    // buildHammerheadAuthUrl() setzt immer state=hammerhead; Stravas
+    // buildAuthUrl() schickt gar keinen state-Parameter -- eindeutig
+    // unterscheidbar auf derselben Landing-Page.
+    window.history.replaceState({}, document.title, window.location.pathname);
+    await connectWithHammerheadCode(codeParam);
+  } else if(errorParam && stateParam === "hammerhead"){
+    window.history.replaceState({}, document.title, window.location.pathname);
+    state.trainerPage.hammerheadResult = { ok:false, message:"Verbindung zu Hammerhead abgebrochen." };
+    render();
+  } else if(codeParam){
     window.history.replaceState({}, document.title, window.location.pathname);
     await connectWithCode(codeParam);
     justConnected = true;
