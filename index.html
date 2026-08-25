@@ -5153,12 +5153,22 @@ if(window.Chart){
   Chart.defaults.font.size = 11;
 }
 
+function dayOffsetLabel(first){
+  return off => new Date(first.getTime()+off*86400000).toLocaleDateString('de-DE',{day:'2-digit',month:'short'});
+}
+function tooltipTitleFromOffset(lbl){
+  return it => it.length ? lbl(it[0].parsed.x) : '';
+}
+function dayOffsetXAxis(lbl, c, maxTicksLimit){
+  return { type:'linear', grid:{color:c.line}, ticks:{color:c.chalkDim, callback:v=>lbl(v), maxTicksLimit} };
+}
+
 function buildFtpChart(){
   const pp = state.profilPage;
   const a = pp.ftpAnalysis;
   if(!a || !window.Chart) return;
   const results = pp.results, first = a.first, c = profilColors();
-  const lbl = off => new Date(first.getTime()+off*86400000).toLocaleDateString('de-DE',{day:'2-digit',month:'short'});
+  const lbl = dayOffsetLabel(first);
   const byConf = conf => results.filter(r=>r.confidence===conf).map(r=>({x:(r.date-first)/86400000, y:r.estFtp}));
   const fp = [];
   if(a.reg) for(let d=0; d<=84; d+=7){ const x=a.daysSinceFirst+d; fp.push({x, y:Math.round(a.reg.slope*x+a.reg.intercept)}); }
@@ -5179,8 +5189,8 @@ function buildFtpChart(){
       ...(currentFtp!=null ? [{ label:'Strava-FTP', data:[{x:todayOffset,y:currentFtp}], borderColor:c.strava, backgroundColor:c.strava, pointRadius:6, pointStyle:'rectRot', showLine:false }] : []),
     ]},
     options:{ responsive:true, maintainAspectRatio:false, interaction:{mode:'nearest',intersect:false},
-      plugins:{ legend:{display:false}, tooltip:{ callbacks:{ title:it=>it.length?lbl(it[0].parsed.x):'' } } },
-      scales:{ x:{type:'linear',grid:{color:c.line},ticks:{color:c.chalkDim,callback:v=>lbl(v),maxTicksLimit:8}},
+      plugins:{ legend:{display:false}, tooltip:{ callbacks:{ title: tooltipTitleFromOffset(lbl) } } },
+      scales:{ x: dayOffsetXAxis(lbl, c, 8),
                y:{title:{display:true,text:'Watt',color:c.chalkDim},grid:{color:c.line},ticks:{color:c.chalkDim}} } },
   });
 }
@@ -5192,7 +5202,7 @@ function buildFormCharts(){
   const L = pp.trainingLoad, Z = pp.zoneDist;
   if(L && L.series.length){
     const s = L.series, first = s[0].date;
-    const lbl = off => new Date(first.getTime()+off*86400000).toLocaleDateString('de-DE',{day:'2-digit',month:'short'});
+    const lbl = dayOffsetLabel(first);
     const x = d => (d-first)/86400000;
     mountChart('velocastFormChart', {
       type:'line',
@@ -5203,9 +5213,9 @@ function buildFormCharts(){
       ]},
       options:{ responsive:true, maintainAspectRatio:false, interaction:{mode:'index',intersect:false},
         plugins:{ legend:{display:true,labels:{color:c.chalkDim,boxWidth:12,font:{size:11}}},
-                  tooltip:{ callbacks:{ title:it=>it.length?lbl(it[0].parsed.x):'',
+                  tooltip:{ callbacks:{ title: tooltipTitleFromOffset(lbl),
                     label:i=>`${i.dataset.label}: ${i.parsed.y.toFixed(1)}` } } },
-        scales:{ x:{type:'linear',grid:{color:c.line},ticks:{color:c.chalkDim,callback:v=>lbl(v),maxTicksLimit:8}},
+        scales:{ x: dayOffsetXAxis(lbl, c, 8),
                  y:{title:{display:true,text:'CTL / ATL',color:c.chalkDim},grid:{color:c.line},ticks:{color:c.chalkDim}},
                  y2:{position:'right',title:{display:true,text:'TSB',color:c.chalkDim},grid:{display:false},ticks:{color:c.chalkDim}} } },
     });
@@ -5257,7 +5267,7 @@ function buildProfilKernCharts(){
   const E = pp.efficiency;
   if(E && E.points.length){
     const p = E.points, first = E.first;
-    const lbl = off => new Date(first.getTime()+off*86400000).toLocaleDateString('de-DE',{day:'2-digit',month:'short'});
+    const lbl = dayOffsetLabel(first);
     mountChart('velocastEfChart', {
       type:'line',
       data:{ datasets:[
@@ -5272,8 +5282,8 @@ function buildProfilKernCharts(){
       ]},
       options:{ responsive:true, maintainAspectRatio:false, interaction:{mode:'nearest',intersect:false},
         plugins:{ legend:{display:true,labels:{color:c.chalkDim,boxWidth:12,font:{size:11}}},
-          tooltip:{ callbacks:{ title:it=>it.length?lbl(it[0].parsed.x):'' } } },
-        scales:{ x:{type:'linear',grid:{color:c.line},ticks:{color:c.chalkDim,callback:v=>lbl(v),maxTicksLimit:7}},
+          tooltip:{ callbacks:{ title: tooltipTitleFromOffset(lbl) } } },
+        scales:{ x: dayOffsetXAxis(lbl, c, 7),
           y:{title:{display:true,text:'Watt pro Herzschlag',color:c.chalkDim},grid:{color:c.line},ticks:{color:c.chalkDim}},
           y2:{position:'right',title:{display:true,text:'Entkopplung %',color:c.chalkDim},grid:{display:false},ticks:{color:c.chalkDim}} } },
     });
@@ -5282,7 +5292,7 @@ function buildProfilKernCharts(){
   const C = pp.climbing;
   if(C && C.sustained.length){
     const cl = C.sustained, first = C.first;
-    const lbl = off => new Date(first.getTime()+off*86400000).toLocaleDateString('de-DE',{day:'2-digit',month:'short'});
+    const lbl = dayOffsetLabel(first);
     mountChart('velocastClimbChart', {
       type:'line',
       data:{ datasets:[
@@ -5293,8 +5303,8 @@ function buildProfilKernCharts(){
       ]},
       options:{ responsive:true, maintainAspectRatio:false, interaction:{mode:'nearest',intersect:false},
         plugins:{ legend:{display:false},
-          tooltip:{ callbacks:{ title:it=>it.length?lbl(it[0].parsed.x):'', label:i=>`${i.parsed.y.toFixed(2)} W/kg` } } },
-        scales:{ x:{type:'linear',grid:{color:c.line},ticks:{color:c.chalkDim,callback:v=>lbl(v),maxTicksLimit:7}},
+          tooltip:{ callbacks:{ title: tooltipTitleFromOffset(lbl), label:i=>`${i.parsed.y.toFixed(2)} W/kg` } } },
+        scales:{ x: dayOffsetXAxis(lbl, c, 7),
           y:{title:{display:true,text:'W/kg',color:c.chalkDim},grid:{color:c.line},ticks:{color:c.chalkDim}} } },
     });
   }
@@ -5362,6 +5372,10 @@ function legendDot(color, label){
   return el("span", {style:"display:inline-flex; align-items:center; margin-right:12px;"}, [
     el("span", {class:"dot", style:`background:${color};`}, []), label
   ]);
+}
+
+function h2WithInfo(title, infoContent){
+  return el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, [title, infoButton(infoContent)]);
 }
 
 function renderProfilLoadPromptCard(){
@@ -5451,10 +5465,10 @@ function renderProfilFtpSection(frag){
 
   const chartCard = el("div", {class:"card"});
   const c = profilColors();
-  chartCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["FTP-Verlauf & Prognose", infoButton([
+  chartCard.appendChild(h2WithInfo("FTP-Verlauf & Prognose", [
     legendDot(c.grade4,"Hoch (20-Min)"), legendDot(c.grade3,"Mittel (10-Min)"), legendDot(c.grade2,"Niedrig (5-Min)"),
     legendDot(c.head,"Unbestätigt"), legendDot(c.tail,"42-Tage-Bestwert"), legendDot(c.chalkDim,"Trend"), legendDot(c.strava,"Strava-FTP")
-  ])]));
+  ]));
   chartCard.appendChild(el("div", {class:"chart-box"}, [el("canvas", {id:"velocastFtpChart"})]));
   frag.appendChild(chartCard);
 
@@ -5468,7 +5482,7 @@ function renderProfilFtpSection(frag){
       : (gap>0 ? `Gesetzter FTP liegt ${gap} W über dem Modell.` : `Gesetzter FTP liegt ${Math.abs(gap)} W unter dem Modell.`));
   }
   if(a && a.forecast8!=null) paras.push(`Prognose: ca. ${a.forecast8} W in 8 Wochen (4 Wo.: ${a.forecast4} W, 12 Wo.: ${a.forecast12} W), lineare Extrapolation.`);
-  interpCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Einordnung", infoButton(paras.map(p => el('div',{style:'margin-bottom:6px;'},[p])))]));
+  interpCard.appendChild(h2WithInfo("Einordnung", paras.map(p => el('div',{style:'margin-bottom:6px;'},[p]))));
   frag.appendChild(interpCard);
 
   const actCard = el("div", {class:"card"});
@@ -5510,7 +5524,7 @@ function renderProfilFormSection(frag){
   ]));
 
   const chartCard = el("div", {class:"card"});
-  chartCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Formkurve (Fitness / Ermüdung / Form)", infoButton("TSS aus Normalized Power (nicht Stravas HF-Relative-Effort). CTL = 42-Tage-Schnitt (Fitness), ATL = 7-Tage-Schnitt (Ermüdung), TSB = CTL − ATL (Form). Die ersten Wochen sind ein Einschwing-Artefakt.")]));
+  chartCard.appendChild(h2WithInfo("Formkurve (Fitness / Ermüdung / Form)", "TSS aus Normalized Power (nicht Stravas HF-Relative-Effort). CTL = 42-Tage-Schnitt (Fitness), ATL = 7-Tage-Schnitt (Ermüdung), TSB = CTL − ATL (Form). Die ersten Wochen sind ein Einschwing-Artefakt."));
   chartCard.appendChild(el("div", {class:"chart-box"}, [el("canvas", {id:"velocastFormChart"})]));
   frag.appendChild(chartCard);
 
@@ -5538,7 +5552,7 @@ function renderProfilFormSection(frag){
     frag.appendChild(zoneCard);
 
     const polCard = el("div", {class:"card"});
-    polCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Polarisierung (letzte 8 Wochen)", infoButton("Als Orientierung gilt das polarisierte Modell: rund 80% der Zeit klar locker, der Rest wirklich hart, und möglichst wenig dazwischen.")]));
+    polCard.appendChild(h2WithInfo("Polarisierung (letzte 8 Wochen)", "Als Orientierung gilt das polarisierte Modell: rund 80% der Zeit klar locker, der Rest wirklich hart, und möglichst wenig dazwischen."));
     if(Z.pct){
       const cc = profilColors();
       polCard.appendChild(barRow("Locker (Z1–Z2)", Z.pct.low, cc.route, Z.pct.low.toFixed(1)+"%"));
@@ -5575,7 +5589,7 @@ function renderProfilKernSection(frag){
   ]));
 
   const pdCard = el("div", {class:"card"});
-  pdCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Leistungs-Dauer-Kurve", infoButton(`Höchste Durchschnittsleistung je Dauer (Mean Maximal Power), aus ${cur.rides} Fahrten der letzten 90 Tage${prev.rides>0?` (Vorjahr: ${prev.rides} Fahrten)`:' (kein Vorjahres-Vergleich – lade mehr Fahrten)'}. Logarithmische Zeitachse.`)]));
+  pdCard.appendChild(h2WithInfo("Leistungs-Dauer-Kurve", `Höchste Durchschnittsleistung je Dauer (Mean Maximal Power), aus ${cur.rides} Fahrten der letzten 90 Tage${prev.rides>0?` (Vorjahr: ${prev.rides} Fahrten)`:' (kein Vorjahres-Vergleich – lade mehr Fahrten)'}. Logarithmische Zeitachse.`));
   pdCard.appendChild(el("div", {class:"chart-box"}, [el("canvas", {id:"velocastPdChart"})]));
   frag.appendChild(pdCard);
 
@@ -5595,7 +5609,7 @@ function renderProfilKernSection(frag){
 
   if(E){
     const efCard = el("div", {class:"card"});
-    efCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Effizienz & aerobe Entkopplung", infoButton("Blau: Watt/Herzschlag – steigt mit aerober Fitness. Amber: Entkopplung, Leistungs-Puls-Verhältnis 2. Fahrthälfte vs. 1. Nur Fahrten über 30 Min.")]));
+    efCard.appendChild(h2WithInfo("Effizienz & aerobe Entkopplung", "Blau: Watt/Herzschlag – steigt mit aerober Fitness. Amber: Entkopplung, Leistungs-Puls-Verhältnis 2. Fahrthälfte vs. 1. Nur Fahrten über 30 Min."));
     efCard.appendChild(el("div", {class:"chart-box short"}, [el("canvas", {id:"velocastEfChart"})]));
     efCard.appendChild(el("div", {style:"margin-top:12px;"}, [collapsedResult(E.verdict, E.why)]));
     if(E.weeklyEfSlope!=null) efCard.appendChild(el("div", {style:"margin-top:6px;"}, [infoButton(`Effizienz-Trend: ${E.weeklyEfSlope>0?'+':''}${(E.weeklyEfSlope*1000).toFixed(2)} mW/Schlag pro Woche.`)]));
@@ -5604,16 +5618,16 @@ function renderProfilKernSection(frag){
 
   if(D){
     const durCard = el("div", {class:"card"});
-    durCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Ermüdungsresistenz", infoButton(`Beste 10-Min-Leistung im letzten Drittel ÷ beste 10-Min-Leistung der ganzen Fahrt, aus ${D.rides.length} Fahrten über 90 Min. 100% = Fahrtdauer kostet nichts.`)]));
+    durCard.appendChild(h2WithInfo("Ermüdungsresistenz", `Beste 10-Min-Leistung im letzten Drittel ÷ beste 10-Min-Leistung der ganzen Fahrt, aus ${D.rides.length} Fahrten über 90 Min. 100% = Fahrtdauer kostet nichts.`));
     durCard.appendChild(collapsedResult(D.verdict, D.why));
     frag.appendChild(durCard);
   }
 
   if(C){
     const climbCard = el("div", {class:"card"});
-    climbCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Kletterleistung", infoButton(
+    climbCard.appendChild(h2WithInfo("Kletterleistung",
       `W/kg auf Anstiegen ≥3% Steigung, über 4 Min.${C.weeklySlope!=null?` Trend: ${C.weeklySlope>0?'+':''}${C.weeklySlope.toFixed(3)} W/kg/Woche.`:''} Anstiege werden aus Höhen- und Leistungsdaten erkannt (keine Strava-Segmentnamen).`
-    )]));
+    ));
     climbCard.appendChild(el("div", {class:"chart-box short"}, [el("canvas", {id:"velocastClimbChart"})]));
     climbCard.appendChild(el("div", {style:"margin-top:12px;"}, [dataTableNode(
       ["Steigung","Dauer","Watt","W/kg","Datum"],
@@ -5630,7 +5644,7 @@ function renderProfilKernSection(frag){
 
   if(W && W.items.length){
     const wCard = el("div", {class:"card"});
-    wCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Trainingsschwerpunkt (aus deinen Daten)", infoButton("Balken = Rückstand zu Referenzwerten, nicht absolutes Niveau – zeigt, wo am meisten Luft nach oben ist.")]));
+    wCard.appendChild(h2WithInfo("Trainingsschwerpunkt (aus deinen Daten)", "Balken = Rückstand zu Referenzwerten, nicht absolutes Niveau – zeigt, wo am meisten Luft nach oben ist."));
     wCard.appendChild(el("div", {style:"margin-bottom:10px;"}, [collapsedResult("Größter Hebel: "+W.headline, W.reason)]));
     W.items.slice(0,5).forEach((it,i) => {
       wCard.appendChild(barRow(it.area, it.score, i===0?"var(--cross)":"var(--chalk-dim)", ""));
@@ -5642,7 +5656,7 @@ function renderProfilKernSection(frag){
   if(pp.gear.length){
     const gearResets = loadGearResets();
     const gearCard = el("div", {class:"card"});
-    gearCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Ausrüstung", infoButton('Richtwerte für Verschleißintervalle (Kette 3000 km, Kassette 9000 km, Bremsbeläge 5000 km, Reifen hinten 4000 km) – abhängig von Fahrstil, Wetter und Material, nur eine grobe Orientierung. Strava kennt kein Wechseldatum für Verschleißteile; „Zurückgesetzt" beim tatsächlichen Teiletausch klicken, um ab da neu zu zählen.')]));
+    gearCard.appendChild(h2WithInfo("Ausrüstung", 'Richtwerte für Verschleißintervalle (Kette 3000 km, Kassette 9000 km, Bremsbeläge 5000 km, Reifen hinten 4000 km) – abhängig von Fahrstil, Wetter und Material, nur eine grobe Orientierung. Strava kennt kein Wechseldatum für Verschleißteile; „Zurückgesetzt" beim tatsächlichen Teiletausch klicken, um ab da neu zu zählen.'));
     pp.gear.forEach((g,gi) => {
       const gid = g.id ? String(g.id) : String(gi);
       const totalKm = (g.distance||0)/1000;
