@@ -8912,8 +8912,8 @@ function renderTrainerWorkoutPreview(tp, ctx){
     body.appendChild(el('div',{class:'legend-note'},['Keine Vorschau verfügbar.']));
   } else {
     if(warnRationale.length){
-      const warnRow = el('div', {style:'display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px;'});
-      warnRationale.forEach(r => warnRow.appendChild(collapsedResult(r.title, r.text)));
+      const warnRow = el('div', {style:'display:flex; flex-direction:column; gap:8px; margin-bottom:10px;'});
+      warnRationale.forEach(r => warnRow.appendChild(calloutBox(r.type==='danger'?'danger':'warn', r.title, r.text)));
       body.appendChild(warnRow);
     }
     if(!hasWorkout){
