@@ -7450,6 +7450,13 @@ function estimateSpeedKmh(seg){
 function estimateDistanceForMinutes(minutes, gradient){
   return minutes*60 * (estimateSpeedKmh({ gradient })/3.6);
 }
+// Shared by placeIntervalsOnRoute() (initial step creation) and
+// extendCompressedIntervalsBackward() (re-labeling after a compressed
+// interval borrows distance from a preceding cruise step) so both places
+// stay in sync on the interval step's display name format.
+function intervalStepName(baseLabel, counter, distanceM, gradient){
+  return `${baseLabel} ${counter} (${(distanceM/1000).toFixed(2)} km, ${gradient.toFixed(1)}%)`;
+}
 // Converts a time-based step list into distance-based steps (flat-road
 // estimate) for devices that trigger workout steps by distance instead of
 // time. Steps that already carry distanceM (route-adaptive workouts) are
@@ -7712,11 +7719,20 @@ function placeIntervalsOnRoute(route, spec, adj, classKey, config, options){
       const end = cursor + b.blockDistM;
       if(b.kind === 'interval'){
         intervalCounter++;
-        const intervalStep = rseg(`${baseLabel} ${intervalCounter} (${(b.blockDistM/1000).toFixed(2)} km, ${s.avgGradient.toFixed(1)}%)`,
+        const intervalStep = rseg(intervalStepName(baseLabel, intervalCounter, b.blockDistM, s.avgGradient),
           cursor, end, b.pct, b.note, 'interval', s.type, s.avgGradient);
         // RPE (HF-mode VO2max/Anaerobic/Sprint) rides through the block queue
         // untouched from buildIntervalSpec()'s reps -- see RPE_TARGET_BY_CLASS.
         if(b.rpeLabel){ intervalStep.rpeTarget = b.rpeTarget; intervalStep.rpeLabel = b.rpeLabel; }
+        // Nominal (uncompressed) target distance for this interval, computed
+        // the same way packPass() does BEFORE its climb-stretch override
+        // (blockDist = capacity). Used by extendCompressedIntervalsBackward()
+        // below to detect and undo that compression by borrowing distance
+        // from a preceding, unused cruise step. Temporary -- deleted again
+        // once that pass has processed this step.
+        intervalStep.nominalDistM = estimateDistanceForMinutes(b.minutes, s.avgGradient);
+        intervalStep.baseLabel = baseLabel;
+        intervalStep.counter = intervalCounter;
         steps.push(intervalStep);
       } else {
         steps.push(rseg(b.label, cursor, end, b.pct, b.note, 'rest', s.type, s.avgGradient));
@@ -7730,9 +7746,82 @@ function placeIntervalsOnRoute(route, spec, adj, classKey, config, options){
     }
   });
 
+  extendCompressedIntervalsBackward(steps);
+
   if(cDist > 0.5) steps.push(rseg(spec.cooldown.label, totalDist-cDist, totalDist, spec.cooldown.pct, spec.cooldown.note, 'cooldown', 'flat', 0));
 
   return { steps, placedIntervalMin, targetIntervalMin, intervalCount: intervalCounter, targetCount: spec.reps.length, rejectedSegments };
+}
+
+// Undoes packPass()'s climb-stretch compression after the fact: when a
+// climb segment's capacity forced an interval's actual distanceM below its
+// nominal (uncompressed) target -- see nominalDistM, attached at step
+// creation time in placeIntervalsOnRoute() above -- walk backward through
+// the immediately preceding, still-unused 'cruise' step(s) and donate their
+// distance to the interval so it gets closer to its intended duration. The
+// interval's endDist (bordering unsuitable terrain ahead) never moves; only
+// startDist creeps earlier. Never triggers for EXPANDED intervals
+// (distanceM > nominalDistM) -- those are left completely untouched.
+// Best-effort: if there isn't enough preceding cruise budget to fully close
+// the gap, the interval ends up less short than before but is never dropped
+// or errored on.
+function extendCompressedIntervalsBackward(steps){
+  for(let i=0; i<steps.length; i++){
+    const step = steps[i];
+    if(step.kind !== 'interval' || step.nominalDistM == null) continue;
+    let shortfallM = step.nominalDistM - step.distanceM;
+    if(shortfallM <= 1){
+      delete step.nominalDistM;
+      delete step.baseLabel;
+      delete step.counter;
+      continue;
+    }
+    let borrowedDistM = 0, borrowedElevM = 0;
+    let j = i - 1;
+    while(shortfallM > 1 && j >= 0 && steps[j].kind === 'cruise'){
+      // Borrow physical route meters 1:1 against the shortfall -- this is
+      // what makes the extended interval's distanceM converge on
+      // nominalDistM (the acceptance bar for this fix), rather than a
+      // pace-weighted amount that would over- or under-shoot it depending
+      // on how different the cruise step's gradient is from the interval's.
+      const neededM = shortfallM;
+      if(neededM >= steps[j].distanceM){
+        // Consume the whole cruise step -- it's fully absorbed into the interval.
+        borrowedDistM += steps[j].distanceM;
+        borrowedElevM += (steps[j].gradient/100) * steps[j].distanceM;
+        shortfallM -= steps[j].distanceM;
+        steps.splice(j, 1);
+        // Splicing at j shifts everything after it -- including the interval,
+        // previously at j+1 -- down by one. Both i (the interval's index) and
+        // j must move together to keep the j === i-1 invariant, so the next
+        // while-check lands on the step now immediately preceding the
+        // interval, not on the interval itself.
+        i--;
+        j--;
+      } else {
+        // Enough left in this cruise step to fully close the gap -- trim its tail.
+        steps[j].endDist -= neededM;
+        steps[j].distanceM -= neededM;
+        borrowedDistM += neededM;
+        borrowedElevM += (steps[j].gradient/100) * neededM;
+        shortfallM = 0;
+      }
+    }
+    if(borrowedDistM > 0){
+      step.startDist -= borrowedDistM;
+      step.distanceM += borrowedDistM;
+      const originalGradientBeforeExtension = step.gradient;
+      const origPortionDistM = step.distanceM - borrowedDistM;
+      const origPortionElevM = (originalGradientBeforeExtension/100) * origPortionDistM;
+      step.gradient = step.distanceM > 0
+        ? (origPortionElevM + borrowedElevM) / step.distanceM * 100
+        : originalGradientBeforeExtension;
+      step.name = intervalStepName(step.baseLabel, step.counter, step.distanceM, step.gradient);
+    }
+    delete step.nominalDistM;
+    delete step.baseLabel;
+    delete step.counter;
+  }
 }
 
 function goalLabel(goal){
