@@ -50,6 +50,11 @@
     --cross: #e2b23e;
     --cross-bg: rgba(226,178,62,0.12);
     --accent: #4fb08c;
+    /* Text-auf-Akzent-Farbe: von jedem Element genutzt, das auf einer vollen
+       --accent-Fläche sitzt und dunklen statt hellen Text für Kontrast braucht
+       — primärer Button, Settings-Switch-Knopf, Wind-Pfeil-Icon im farbigen
+       Badge. War dreimal unabhängig als #0d1712-Literal vorhanden. */
+    --ink-on-accent: #0d1712;
     /* Neutral informational accent — hover/selected/active UI states, links,
        non-wind stat chips (PR time, distance, KOM…), the elevation chart
        line. Deliberately not part of the wind vocabulary above. */
@@ -109,6 +114,17 @@
     --r-md: 10px;  /* buttons, list rows, weather chips */
     --r-lg: 14px;  /* cards, map container */
     --r-full: 999px; /* pills */
+    /* Spacing-Skala: benannt nach den im File bereits dominanten Werten (siehe
+       Kommentar bei --r-xs für dieselbe Disziplin) — kein aspirationales 4/8-
+       Raster, daher ändert die Anwendung dieser Tokens nie einen bestehenden
+       Pixel-Wert. Nur an den konkret als inkonsistent identifizierten Stellen
+       angewendet, nicht flächendeckend über jedes margin/padding/gap im File. */
+    --space-1: 4px;
+    --space-2: 6px;
+    --space-3: 8px;
+    --space-4: 10px;
+    --space-5: 14px;
+    --space-6: 16px;
   }
   *{ box-sizing:border-box; }
   html,body{ margin:0; padding:0; background:transparent; color:var(--chalk); }
@@ -129,34 +145,27 @@
   .brand h1 span{ color: var(--accent); }
   .brand .status{ font-family:'IBM Plex Mono', monospace; font-size:11px; color: var(--chalk-dim); text-transform:uppercase; letter-spacing:0.08em; }
 
-  /* Hamburger nav trigger — plain icon button, same asphalt/line vocabulary
-     as .btn.secondary rather than a borderless glyph, so it reads as a
-     tappable control at a glance. */
-  .hamburger-btn{
+  /* Hamburger nav trigger and star/un-star-on-Strava action button share one
+     plain-icon-button recipe — asphalt-3 fill, line border, route border on
+     hover — so they read as a consistent icon-button pattern across the app
+     (see renderStarButton() for the star's .on/:disabled states). Same
+     "neutral surface + hover" recipe also repeats, with different box
+     models, in .info-btn, .source-tab, .weather-chip, button.stat-chip, and
+     .tsettings-class's <summary> hover — those are deliberately NOT merged
+     into a shared base class in this pass because their sizing/shape
+     diverges too much for a safe surgical change. */
+  .hamburger-btn, .star-btn{
     display:flex; align-items:center; justify-content:center;
-    width:32px; height:32px; flex-shrink:0; align-self:center;
+    flex-shrink:0; align-self:center;
     background: var(--asphalt-3); border:1px solid var(--line); border-radius:var(--r-sm);
     cursor:pointer; padding:0;
   }
-  .hamburger-btn:hover{ border-color:var(--route); }
-  .hamburger-btn svg{ display:block; }
-
-  /* Star/un-star-on-Strava action button — same plain-icon-button vocabulary
-     as .hamburger-btn (asphalt-3 fill, line border, route border on hover)
-     so it reads as a consistent icon-button pattern across the app, just
-     small enough to sit inline among the stat-chips row (see
-     renderStarButton()). .on = currently starred: border/background pick up
-     the same --route "active state" tint .nav-item.active/.dot.on use. */
-  .star-btn{
-    display:flex; align-items:center; justify-content:center;
-    width:30px; height:30px; flex-shrink:0; align-self:center;
-    background: var(--asphalt-3); border:1px solid var(--line); border-radius:var(--r-sm);
-    cursor:pointer; padding:0;
-  }
-  .star-btn:hover{ border-color:var(--route); }
+  .hamburger-btn{ width:32px; height:32px; }
+  .star-btn{ width:30px; height:30px; }
+  .hamburger-btn:hover, .star-btn:hover{ border-color:var(--route); }
   .star-btn.on{ border-color:var(--route); background:var(--route-bg); }
   .star-btn:disabled{ opacity:0.5; cursor:default; }
-  .star-btn svg{ display:block; }
+  .hamburger-btn svg, .star-btn svg{ display:block; }
 
   /* "Nicht relevant" toggle — same .star-btn icon-button shape/sizing, but
      its .on tint uses --head (the app's existing red, otherwise only used
@@ -183,7 +192,7 @@
     position:fixed; top:0; left:0; bottom:0; width:260px; max-width:80vw;
     background:var(--asphalt-2); border-right:1px solid var(--line);
     transform:translateX(-100%); transition:transform 0.22s ease;
-    z-index:41; padding:24px 16px; display:flex; flex-direction:column; gap:4px;
+    z-index:41; padding:24px 16px; display:flex; flex-direction:column; gap:var(--space-1);
     overflow-y:auto;
   }
   .nav-drawer.open{ transform:translateX(0); }
@@ -244,7 +253,7 @@
 
   .btn{
     font-family:'Space Grotesk', sans-serif; font-weight:600; font-size:14px;
-    background: var(--accent); color: #0d1712; border:none; border-radius:var(--r-md);
+    background: var(--accent); color: var(--ink-on-accent); border:none; border-radius:var(--r-md);
     padding: 12px 18px; cursor:pointer; letter-spacing:0.01em;
   }
   .btn:hover{ filter: brightness(1.08); }
@@ -265,7 +274,7 @@
   /* Route source tabs. "Active" is a UI-selection state, not a wind
      judgment — kept neutral (chalk on asphalt-3) rather than tail-green so
      it can't be misread as "this tab = good wind". */
-  .source-tabs{ display:flex; gap:6px; margin-bottom:14px; }
+  .source-tabs{ display:flex; gap:var(--space-2); margin-bottom:14px; }
   .source-tab{
     flex:1; text-align:center; padding:9px 8px; border-radius:var(--r-sm); border:1px solid var(--line);
     background:var(--asphalt); color:var(--chalk-dim); font-family:'IBM Plex Mono', monospace;
@@ -305,7 +314,7 @@
 
   /* Segments */
   .segment{
-    display:flex; flex-direction:column; gap:10px; cursor:pointer;
+    display:flex; flex-direction:column; gap:var(--space-4); cursor:pointer;
     padding:14px; border-radius:var(--r-md); margin-bottom:8px; border:1px solid var(--line);
   }
   .segment:hover{ border-color:var(--route); }
@@ -324,7 +333,7 @@
   /* Stat chips: hero-numeral pill — a bold, larger value line over a small
      uppercase label line, instead of one flat string, so the number (PR
      time, watts, climb length…) reads at a glance. */
-  .stat-chips{ display:flex; flex-wrap:wrap; gap:8px; }
+  .stat-chips{ display:flex; flex-wrap:wrap; gap:var(--space-3); }
   .stat-chip{
     display:inline-flex; flex-direction:column; align-items:flex-start; white-space:nowrap;
     color:var(--route); background:var(--route-bg);
@@ -357,7 +366,7 @@
   .tag.head{ background:var(--head-bg); color:var(--head); }
   .tag.cross{ background:var(--cross-bg); color:var(--cross); }
   .tag.mini{ padding:3px 6px; font-size:10px; }
-  .wind-mix-mini{ display:flex; gap:4px; flex-shrink:0; }
+  .wind-mix-mini{ display:flex; gap:var(--space-1); flex-shrink:0; }
 
   /* Weather chip: temperature is the hero numeral (principle: oversized
      primary metric, muted secondary text underneath). */
@@ -415,7 +424,7 @@
   /* Wind-mix breakdown: hero percentages above a thin pill-shaped bar,
      rather than small inline labels — same hero/secondary hierarchy as the
      weather chip, applied to the route's headline wind numbers. */
-  .wind-mix-stats{ display:flex; justify-content:space-between; gap:10px; margin-bottom:8px; }
+  .wind-mix-stats{ display:flex; justify-content:space-between; gap:var(--space-4); margin-bottom:8px; }
   .wind-mix-stat{ display:flex; flex-direction:column; flex:1; min-width:0; }
   .wind-mix-stat .v{ font-family:'Space Grotesk', sans-serif; font-size:22px; font-weight:700; line-height:1; letter-spacing:-0.01em; }
   .wind-mix-stat .l{ font-family:'IBM Plex Mono', monospace; font-size:10px; color:var(--chalk-dim); margin-top:4px; text-transform:uppercase; letter-spacing:0.04em; }
@@ -468,7 +477,7 @@
      .wind-mix-bar but a separate class since it's not tied to wind
      favorability: fill color is passed inline per use instead of coming
      from the tail/head/cross vocabulary. */
-  .bar-row{ display:flex; align-items:center; gap:8px; margin-bottom:8px; font-family:'IBM Plex Mono', monospace; font-size:11px; }
+  .bar-row{ display:flex; align-items:center; gap:var(--space-3); margin-bottom:8px; font-family:'IBM Plex Mono', monospace; font-size:11px; }
   .bar-row .bar-label{ flex:0 0 130px; color:var(--chalk-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .bar-row .bar-track{ flex:1; height:8px; border-radius:var(--r-full); overflow:hidden; background:var(--asphalt-3); }
   .bar-row .bar-val{ display:block; height:100%; border-radius:var(--r-full); }
@@ -535,12 +544,12 @@
   .cpc-title > span:first-child{ flex:1 1 auto; min-width:0; }
   .cpc-rec{ flex:0 0 auto; font-family:'IBM Plex Mono', monospace; font-size:9.5px; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:var(--tail); white-space:nowrap; }
   .cpc-meta{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:8px; }
-  .cpc-badge{ font-family:'IBM Plex Mono', monospace; font-size:10px; font-weight:600; padding:2px 7px; border-radius:10px; }
+  .cpc-badge{ font-family:'IBM Plex Mono', monospace; font-size:10px; font-weight:600; padding:2px 7px; border-radius:var(--r-full); }
   .cpc-budget{ font-family:'IBM Plex Mono', monospace; font-size:10.5px; color:var(--chalk-dim); }
 
   /* Generated-workout step list ("Ablauf & Analyse"), one row per step,
      left-border tinted by that step's %FTP zone (see zoneFor()). */
-  .workout-steps{ display:flex; flex-direction:column; gap:6px; }
+  .workout-steps{ display:flex; flex-direction:column; gap:var(--space-2); }
   .step{
     border-left:3px solid var(--line); padding:6px 10px; display:flex; justify-content:space-between;
     gap:10px; flex-wrap:wrap; background:var(--asphalt); border-radius:0 var(--r-sm) var(--r-sm) 0;
@@ -564,7 +573,7 @@
   .tsettings-class:hover{ border-color:var(--route); }
   .tsettings-row{ padding:7px 0; border-top:1px solid var(--line); }
   .tsettings-row:first-of-type{ border-top:none; }
-  .tsettings-row-main{ display:flex; align-items:center; gap:10px; }
+  .tsettings-row-main{ display:flex; align-items:center; gap:var(--space-4); }
   .tsettings-row-main label{ flex:1; font-size:12.5px; margin-bottom:0; color:var(--chalk); }
   .tsettings-input-wrap{ display:flex; align-items:center; gap:5px; flex:none; }
   .tsettings-input-wrap input[type="number"]{ width:80px; margin-bottom:0; }
@@ -579,7 +588,7 @@
   .tsettings-group{ margin-top:12px; }
   .tsettings-group:first-child{ margin-top:0; }
   .tsettings-group-title{ font-family:'Space Grotesk', sans-serif; font-size:12px; font-weight:600; color:var(--chalk-dim); margin:0 0 8px; }
-  .tsettings-chip-item{ display:inline-flex; align-items:center; gap:6px; }
+  .tsettings-chip-item{ display:inline-flex; align-items:center; gap:var(--space-2); }
   .tsettings-chip-input{ display:inline-flex; align-items:center; gap:5px; }
   .tsettings-chip-input .tsettings-unit{ min-width:0; }
   .tsettings-switch{ position:relative; display:inline-block; width:34px; height:19px; flex-shrink:0; }
@@ -587,11 +596,11 @@
   .tsettings-switch .tsettings-slider{ position:absolute; cursor:pointer; inset:0; background:var(--asphalt-3); border-radius:var(--r-full); transition:.15s; }
   .tsettings-switch .tsettings-slider::before{ content:""; position:absolute; height:14px; width:14px; left:2.5px; top:2.5px; background:var(--chalk); border-radius:50%; transition:.15s; }
   .tsettings-switch input:checked + .tsettings-slider{ background:var(--accent); }
-  .tsettings-switch input:checked + .tsettings-slider::before{ transform:translateX(15px); background:#0d1712; }
+  .tsettings-switch input:checked + .tsettings-slider::before{ transform:translateX(15px); background:var(--ink-on-accent); }
 
   /* Per-goal adaptive-learning rows ("Lern-Anpassung aus deinen Auswertungen"). */
-  .learn-goals{ display:flex; flex-direction:column; gap:8px; }
-  .learn-goal-row{ display:flex; align-items:center; gap:8px; font-family:'IBM Plex Mono', monospace; font-size:11px; }
+  .learn-goals{ display:flex; flex-direction:column; gap:var(--space-3); }
+  .learn-goal-row{ display:flex; align-items:center; gap:var(--space-3); font-family:'IBM Plex Mono', monospace; font-size:11px; }
   .learn-goal-label{ flex:0 0 130px; color:var(--chalk-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .learn-goal-num{ flex:0 0 auto; color:var(--chalk-dim); }
   .learn-goal-trend{ flex:0 0 auto; }
@@ -1406,7 +1415,7 @@ function renderElevationChart(){
   }
   const profile = state.elevationProfile;
   if(!profile || profile.distances.length < 2){
-    return el("div", {class:"muted", style:"font-size:12px;"}, ["Für diese Strecke sind keine Höhendaten verfügbar."]);
+    return el("div", {class:"empty-state"}, ["Für diese Strecke sind keine Höhendaten verfügbar."]);
   }
   const { distances, elevations } = profile;
   const minE = Math.min(...elevations), maxE = Math.max(...elevations);
@@ -1543,12 +1552,12 @@ function renderClimbsContent(card){
   }
   const profile = state.elevationProfile;
   if(!profile || profile.distances.length < 3){
-    card.appendChild(el("div", {class:"muted", style:"font-size:12px;"}, ["Für diese Strecke sind keine Höhendaten verfügbar."]));
+    card.appendChild(el("div", {class:"empty-state"}, ["Für diese Strecke sind keine Höhendaten verfügbar."]));
     return;
   }
   const climbs = detectClimbs(profile);
   if(!climbs.length){
-    card.appendChild(el("div", {class:"muted", style:"font-size:12px;"}, ["Keine nennenswerten Anstiege auf dieser Strecke gefunden."]));
+    card.appendChild(el("div", {class:"empty-state"}, ["Keine nennenswerten Anstiege auf dieser Strecke gefunden."]));
     return;
   }
   if(state.climbIndex >= climbs.length) state.climbIndex = climbs.length - 1;
@@ -1591,7 +1600,7 @@ function renderClimbsContent(card){
 function renderBestStartContent(card){
   const best = findBestStartTimes();
   if(!best.length){
-    card.appendChild(el("div", {class:"muted", style:"font-size:12px;"}, ["Keine Vorhersagedaten verfügbar."]));
+    card.appendChild(el("div", {class:"empty-state"}, ["Keine Vorhersagedaten verfügbar."]));
     return;
   }
   card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px; font-size:12px;"}, ["Basierend auf der 7-Tage-Vorhersage für diese Strecke, bei deiner eingestellten Geschwindigkeit."]));
@@ -3688,6 +3697,17 @@ function renderListItemWindTag(key){
   ]);
 }
 
+// Shared "title + back button" header row for the 3 static detail views —
+// same visual wrapper everywhere, but each caller supplies its own onBack
+// closure since what gets cleared from state and which list-row id gets
+// scrolled back into view differs per page (see each call site).
+function renderDetailHeader(title, backLabel, onBack){
+  return el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-5); gap:var(--space-4);"}, [
+    el("h2", {style:"margin:0;"}, [title]),
+    el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick: onBack}, [backLabel])
+  ]);
+}
+
 function renderRouteCard(){
   const card = el("div", {class:"card"});
 
@@ -3703,23 +3723,20 @@ function renderRouteCard(){
       state.selectedSegmentId = null;
       state.selectedSegmentSource = null;
     } else {
-      card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
-        el("h2", {style:"margin:0;"}, ["Segment"]),
-        el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{
-          // Capture BEFORE clearing selectedSegmentId/Source below — reading
-          // them after would already be null. Mirrors selectSegment()'s own
-          // open-path scroll idiom (requestAnimationFrame + scrollIntoView),
-          // just pointed at the list row instead of the map, so closing the
-          // tall map+detail view lands the user back where they were instead
-          // of at whatever raw pixel offset the page reflowed to.
-          const segId = seg.id, source = "route";
-          state.selectedSegmentId = null; state.selectedSegmentSource = null;
-          render();
-          requestAnimationFrame(()=>{
-            document.getElementById(`segment-row-${source}-${segId}`)?.scrollIntoView({behavior:"smooth", block:"center"});
-          });
-        }}, ["Zur Strecke"])
-      ]));
+      card.appendChild(renderDetailHeader("Segment", "Zur Strecke", () => {
+        // Capture BEFORE clearing selectedSegmentId/Source below — reading
+        // them after would already be null. Mirrors selectSegment()'s own
+        // open-path scroll idiom (requestAnimationFrame + scrollIntoView),
+        // just pointed at the list row instead of the map, so closing the
+        // tall map+detail view lands the user back where they were instead
+        // of at whatever raw pixel offset the page reflowed to.
+        const segId = seg.id, source = "route";
+        state.selectedSegmentId = null; state.selectedSegmentSource = null;
+        render();
+        requestAnimationFrame(()=>{
+          document.getElementById(`segment-row-${source}-${segId}`)?.scrollIntoView({behavior:"smooth", block:"center"});
+        });
+      }));
       card.appendChild(renderSegmentRow(seg, bucket, {clickable:false}));
       card.appendChild(renderSegmentLeaderboard(seg));
       card.appendChild(routeMapContainer);
@@ -3798,7 +3815,7 @@ function renderRouteCard(){
         });
         card.appendChild(list);
       } else {
-        card.appendChild(el("div", {class:"muted"}, ["Keine gespeicherten Routen gefunden."]));
+        card.appendChild(el("div", {class:"empty-state"}, ["Keine gespeicherten Routen gefunden."]));
       }
     } else if(state.routeSourceTab === "activities"){
       if(state.loading.activities){
@@ -3822,7 +3839,7 @@ function renderRouteCard(){
         });
         card.appendChild(list);
       } else if(!state.fullRouteCoords.length){
-        card.appendChild(el("div", {class:"muted"}, ["Keine Aktivitäten gefunden."]));
+        card.appendChild(el("div", {class:"empty-state"}, ["Keine Aktivitäten gefunden."]));
       }
     } else if(state.routeSourceTab === "gpx"){
       card.appendChild(renderGpxUploadRow());
@@ -3929,7 +3946,7 @@ function renderRouteCard(){
       }
     }
   } else if(state.selectedActivity){
-    card.appendChild(el("div", {class:"muted", style:"margin-top:12px;"}, ["Für diese Aktivität liegt keine Streckenkarte vor."]));
+    card.appendChild(el("div", {class:"empty-state", style:"margin-top:12px;"}, ["Für diese Aktivität liegt keine Streckenkarte vor."]));
   }
 
   return card;
@@ -4583,7 +4600,7 @@ function renderSegmentRow(seg, bucket, opts){
     badgeColor = rel.type === "tail" ? "var(--tail)" : rel.type==="head" ? "var(--head)" : "var(--cross)";
     tagClass = rel.type === "tail" ? "tail" : rel.type==="head" ? "head" : "cross";
     tagText = (rel.type === "tail" ? "Rückenwind" : rel.type==="head" ? "Gegenwind" : "Seitenwind") + " · " + Math.round(w.windSpeed) + " km/h";
-    arrowHtml = arrowSvg(bearing, w.windDir, "#0d1712");
+    arrowHtml = arrowSvg(bearing, w.windDir, cssVar('--ink-on-accent'));
   }
   const badge = el("div", {class:"arrow-badge", style:`background:${badgeColor}`, html: arrowHtml});
 
@@ -4751,7 +4768,7 @@ function renderSegmentsCard(){
     return card;
   }
   if(!state.segments.length){
-    card.appendChild(el("div", {class:"muted"}, ["Keine markierten (gesternten) Segmente gefunden."]));
+    card.appendChild(el("div", {class:"empty-state"}, ["Keine markierten (gesternten) Segmente gefunden."]));
     return card;
   }
 
@@ -4812,19 +4829,16 @@ function renderSegmentsPage(){
       state.selectedSegmentSource = null;
     } else {
       const card = el("div", {class:"card"});
-      card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
-        el("h2", {style:"margin:0;"}, ["Segment"]),
-        el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick:()=>{
-          // Same capture-before-clear + scroll-back idiom as renderRouteCard()'s
-          // equivalent back button above — see its comment for why.
-          const segId = seg.id, source = "starred";
-          state.selectedSegmentId = null; state.selectedSegmentSource = null;
-          render();
-          requestAnimationFrame(()=>{
-            document.getElementById(`segment-row-${source}-${segId}`)?.scrollIntoView({behavior:"smooth", block:"center"});
-          });
-        }}, ["Zurück zur Liste"])
-      ]));
+      card.appendChild(renderDetailHeader("Segment", "Zurück zur Liste", () => {
+        // Same capture-before-clear + scroll-back idiom as renderRouteCard()'s
+        // equivalent back button above — see its comment for why.
+        const segId = seg.id, source = "starred";
+        state.selectedSegmentId = null; state.selectedSegmentSource = null;
+        render();
+        requestAnimationFrame(()=>{
+          document.getElementById(`segment-row-${source}-${segId}`)?.scrollIntoView({behavior:"smooth", block:"center"});
+        });
+      }));
       card.appendChild(renderSegmentRow(seg, bucket, {clickable:false}));
       card.appendChild(renderSegmentLeaderboard(seg));
       card.appendChild(routeMapContainer);
@@ -4852,7 +4866,7 @@ function renderRouteSegmentsCard(){
   const isRideActivity = !!(state.connected && activity && !activity.isRoute && !activity.isGpx);
 
   if(!isRideActivity){
-    card.appendChild(el("div", {class:"muted"}, [
+    card.appendChild(el("div", {class:"empty-state"}, [
       "Nur für bereits gefahrene Aktivitäten verfügbar - geplante Routen und GPX-Dateien haben noch keine abgeschlossenen Segmente."
     ]));
     return card;
@@ -4895,7 +4909,7 @@ function renderRouteSegmentsCard(){
     // A truly empty result here is a normal outcome (a short/flat ride with
     // no segments on it), not an error. No sort dropdown either — nothing to
     // sort.
-    card.appendChild(el("div", {class:"muted"}, ["Auf dieser Fahrt wurden keine Segmente abgeschlossen."]));
+    card.appendChild(el("div", {class:"empty-state"}, ["Auf dieser Fahrt wurden keine Segmente abgeschlossen."]));
     return card;
   }
 
@@ -5277,7 +5291,7 @@ function renderProfilFtpSection(frag){
 
   const chartCard = el("div", {class:"card"});
   const c = profilColors();
-  chartCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["FTP-Verlauf & Prognose", infoButton([
+  chartCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["FTP-Verlauf & Prognose", infoButton([
     legendDot(c.grade4,"Hoch (20-Min)"), legendDot(c.grade3,"Mittel (10-Min)"), legendDot(c.grade2,"Niedrig (5-Min)"),
     legendDot(c.head,"Unbestätigt"), legendDot(c.tail,"42-Tage-Bestwert"), legendDot(c.chalkDim,"Trend"), legendDot(c.strava,"Strava-FTP")
   ])]));
@@ -5294,11 +5308,11 @@ function renderProfilFtpSection(frag){
       : (gap>0 ? `Gesetzter FTP liegt ${gap} W über dem Modell.` : `Gesetzter FTP liegt ${Math.abs(gap)} W unter dem Modell.`));
   }
   if(a && a.forecast8!=null) paras.push(`Prognose: ca. ${a.forecast8} W in 8 Wochen (4 Wo.: ${a.forecast4} W, 12 Wo.: ${a.forecast12} W), lineare Extrapolation.`);
-  interpCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Einordnung", infoButton(paras.map(p => el('div',{style:'margin-bottom:6px;'},[p])))]));
+  interpCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Einordnung", infoButton(paras.map(p => el('div',{style:'margin-bottom:6px;'},[p])))]));
   frag.appendChild(interpCard);
 
   const actCard = el("div", {class:"card"});
-  const actH2 = el("h2", {style:"display:flex; align-items:center; gap:8px; flex-wrap:wrap;"}, [`Ausgewertete Aktivitäten (${results.length}${pp.stats?` von ${pp.stats.candidates} geprüften`:''})`]);
+  const actH2 = el("h2", {style:"display:flex; align-items:center; gap:var(--space-3); flex-wrap:wrap;"}, [`Ausgewertete Aktivitäten (${results.length}${pp.stats?` von ${pp.stats.candidates} geprüften`:''})`]);
   actCard.appendChild(actH2);
   results.slice().reverse().slice(0,30).forEach(r => {
     actCard.appendChild(el("div", {class:"activity"}, [
@@ -5336,7 +5350,7 @@ function renderProfilFormSection(frag){
   ]));
 
   const chartCard = el("div", {class:"card"});
-  chartCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Formkurve (Fitness / Ermüdung / Form)", infoButton("TSS aus Normalized Power (nicht Stravas HF-Relative-Effort). CTL = 42-Tage-Schnitt (Fitness), ATL = 7-Tage-Schnitt (Ermüdung), TSB = CTL − ATL (Form). Die ersten Wochen sind ein Einschwing-Artefakt.")]));
+  chartCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Formkurve (Fitness / Ermüdung / Form)", infoButton("TSS aus Normalized Power (nicht Stravas HF-Relative-Effort). CTL = 42-Tage-Schnitt (Fitness), ATL = 7-Tage-Schnitt (Ermüdung), TSB = CTL − ATL (Form). Die ersten Wochen sind ein Einschwing-Artefakt.")]));
   chartCard.appendChild(el("div", {class:"chart-box"}, [el("canvas", {id:"velocastFormChart"})]));
   frag.appendChild(chartCard);
 
@@ -5349,7 +5363,7 @@ function renderProfilFormSection(frag){
 
   if(Z && Z.weeks.length){
     const zoneCard = el("div", {class:"card"});
-    const zoneH2 = el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Zonenverteilung pro Woche"]);
+    const zoneH2 = el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Zonenverteilung pro Woche"]);
     zoneCard.appendChild(zoneH2);
     if(Z.pct){
       // Z.pct is only non-null when total zone time > 0 — without power zones
@@ -5364,7 +5378,7 @@ function renderProfilFormSection(frag){
     frag.appendChild(zoneCard);
 
     const polCard = el("div", {class:"card"});
-    polCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Polarisierung (letzte 8 Wochen)", infoButton("Als Orientierung gilt das polarisierte Modell: rund 80% der Zeit klar locker, der Rest wirklich hart, und möglichst wenig dazwischen.")]));
+    polCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Polarisierung (letzte 8 Wochen)", infoButton("Als Orientierung gilt das polarisierte Modell: rund 80% der Zeit klar locker, der Rest wirklich hart, und möglichst wenig dazwischen.")]));
     if(Z.pct){
       const cc = profilColors();
       polCard.appendChild(barRow("Locker (Z1–Z2)", Z.pct.low, cc.route, Z.pct.low.toFixed(1)+"%"));
@@ -5401,7 +5415,7 @@ function renderProfilKernSection(frag){
   ]));
 
   const pdCard = el("div", {class:"card"});
-  pdCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Leistungs-Dauer-Kurve", infoButton(`Höchste Durchschnittsleistung je Dauer (Mean Maximal Power), aus ${cur.rides} Fahrten der letzten 90 Tage${prev.rides>0?` (Vorjahr: ${prev.rides} Fahrten)`:' (kein Vorjahres-Vergleich – lade mehr Fahrten)'}. Logarithmische Zeitachse.`)]));
+  pdCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Leistungs-Dauer-Kurve", infoButton(`Höchste Durchschnittsleistung je Dauer (Mean Maximal Power), aus ${cur.rides} Fahrten der letzten 90 Tage${prev.rides>0?` (Vorjahr: ${prev.rides} Fahrten)`:' (kein Vorjahres-Vergleich – lade mehr Fahrten)'}. Logarithmische Zeitachse.`)]));
   pdCard.appendChild(el("div", {class:"chart-box"}, [el("canvas", {id:"velocastPdChart"})]));
   frag.appendChild(pdCard);
 
@@ -5421,7 +5435,7 @@ function renderProfilKernSection(frag){
 
   if(E){
     const efCard = el("div", {class:"card"});
-    efCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Effizienz & aerobe Entkopplung", infoButton("Blau: Watt/Herzschlag – steigt mit aerober Fitness. Amber: Entkopplung, Leistungs-Puls-Verhältnis 2. Fahrthälfte vs. 1. Nur Fahrten über 30 Min.")]));
+    efCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Effizienz & aerobe Entkopplung", infoButton("Blau: Watt/Herzschlag – steigt mit aerober Fitness. Amber: Entkopplung, Leistungs-Puls-Verhältnis 2. Fahrthälfte vs. 1. Nur Fahrten über 30 Min.")]));
     efCard.appendChild(el("div", {class:"chart-box short"}, [el("canvas", {id:"velocastEfChart"})]));
     efCard.appendChild(el("div", {style:"margin-top:12px;"}, [collapsedResult(E.verdict, E.why)]));
     if(E.weeklyEfSlope!=null) efCard.appendChild(el("div", {style:"margin-top:6px;"}, [infoButton(`Effizienz-Trend: ${E.weeklyEfSlope>0?'+':''}${(E.weeklyEfSlope*1000).toFixed(2)} mW/Schlag pro Woche.`)]));
@@ -5430,14 +5444,14 @@ function renderProfilKernSection(frag){
 
   if(D){
     const durCard = el("div", {class:"card"});
-    durCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Ermüdungsresistenz", infoButton(`Beste 10-Min-Leistung im letzten Drittel ÷ beste 10-Min-Leistung der ganzen Fahrt, aus ${D.rides.length} Fahrten über 90 Min. 100% = Fahrtdauer kostet nichts.`)]));
+    durCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Ermüdungsresistenz", infoButton(`Beste 10-Min-Leistung im letzten Drittel ÷ beste 10-Min-Leistung der ganzen Fahrt, aus ${D.rides.length} Fahrten über 90 Min. 100% = Fahrtdauer kostet nichts.`)]));
     durCard.appendChild(collapsedResult(D.verdict, D.why));
     frag.appendChild(durCard);
   }
 
   if(C){
     const climbCard = el("div", {class:"card"});
-    climbCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Kletterleistung", infoButton(
+    climbCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Kletterleistung", infoButton(
       `W/kg auf Anstiegen ≥3% Steigung, über 4 Min.${C.weeklySlope!=null?` Trend: ${C.weeklySlope>0?'+':''}${C.weeklySlope.toFixed(3)} W/kg/Woche.`:''} Anstiege werden aus Höhen- und Leistungsdaten erkannt (keine Strava-Segmentnamen).`
     )]));
     climbCard.appendChild(el("div", {class:"chart-box short"}, [el("canvas", {id:"velocastClimbChart"})]));
@@ -5456,7 +5470,7 @@ function renderProfilKernSection(frag){
 
   if(W && W.items.length){
     const wCard = el("div", {class:"card"});
-    wCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Trainingsschwerpunkt (aus deinen Daten)", infoButton("Balken = Rückstand zu Referenzwerten, nicht absolutes Niveau – zeigt, wo am meisten Luft nach oben ist.")]));
+    wCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Trainingsschwerpunkt (aus deinen Daten)", infoButton("Balken = Rückstand zu Referenzwerten, nicht absolutes Niveau – zeigt, wo am meisten Luft nach oben ist.")]));
     wCard.appendChild(el("div", {style:"margin-bottom:10px;"}, [collapsedResult("Größter Hebel: "+W.headline, W.reason)]));
     W.items.slice(0,5).forEach((it,i) => {
       wCard.appendChild(barRow(it.area, it.score, i===0?"var(--cross)":"var(--chalk-dim)", ""));
@@ -5468,7 +5482,7 @@ function renderProfilKernSection(frag){
   if(pp.gear.length){
     const gearResets = loadGearResets();
     const gearCard = el("div", {class:"card"});
-    gearCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:8px;"}, ["Ausrüstung", infoButton('Richtwerte für Verschleißintervalle (Kette 3000 km, Kassette 9000 km, Bremsbeläge 5000 km, Reifen hinten 4000 km) – abhängig von Fahrstil, Wetter und Material, nur eine grobe Orientierung. Strava kennt kein Wechseldatum für Verschleißteile; „Zurückgesetzt" beim tatsächlichen Teiletausch klicken, um ab da neu zu zählen.')]));
+    gearCard.appendChild(el("h2", {style:"display:flex; align-items:center; gap:var(--space-3);"}, ["Ausrüstung", infoButton('Richtwerte für Verschleißintervalle (Kette 3000 km, Kassette 9000 km, Bremsbeläge 5000 km, Reifen hinten 4000 km) – abhängig von Fahrstil, Wetter und Material, nur eine grobe Orientierung. Strava kennt kein Wechseldatum für Verschleißteile; „Zurückgesetzt" beim tatsächlichen Teiletausch klicken, um ab da neu zu zählen.')]));
     pp.gear.forEach((g,gi) => {
       const gid = g.id ? String(g.id) : String(gi);
       const totalKm = (g.distance||0)/1000;
@@ -5885,19 +5899,16 @@ function renderAktivitaetenDetailChartSection(a){
 function renderAktivitaetenDetail(a){
   const frag = document.createDocumentFragment();
   const card = el("div", {class:"card"});
-  card.appendChild(el("div", {style:"display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; gap:10px;"}, [
-    el("h2", {style:"margin:0;"}, [a.name || "Aktivität"]),
-    el("button", {class:"btn secondary", style:"padding:8px 14px; font-size:12px;", onclick: ()=>{
-      // Same capture-before-clear + scroll-back idiom as renderSegmentsPage()'s
-      // "Zurück zur Liste" button - see its comment for why.
-      const id = a.id;
-      state.aktivitaetenPage.selectedId = null;
-      render();
-      requestAnimationFrame(()=>{
-        document.getElementById(`activity-row-${id}`)?.scrollIntoView({behavior:"smooth", block:"center"});
-      });
-    }}, ["Zurück zur Liste"])
-  ]));
+  card.appendChild(renderDetailHeader(a.name || "Aktivität", "Zurück zur Liste", () => {
+    // Same capture-before-clear + scroll-back idiom as renderSegmentsPage()'s
+    // "Zurück zur Liste" button - see its comment for why.
+    const id = a.id;
+    state.aktivitaetenPage.selectedId = null;
+    render();
+    requestAnimationFrame(()=>{
+      document.getElementById(`activity-row-${id}`)?.scrollIntoView({behavior:"smooth", block:"center"});
+    });
+  }));
 
   const date = new Date(a.start_date_local || a.start_date);
   const km = ((a.distance || 0) / 1000).toFixed(1);
@@ -8683,7 +8694,7 @@ function renderTrainerRouteCard(tp, selectedClassObj, todayRoute){
 }
 function renderHammerheadHint(fileName, distanceMode, usingHr){
   const box = el('div', {class:'callout good', style:'margin-top:12px;'});
-  box.appendChild(el('div',{class:'callout-title', style:'display:flex; align-items:center; gap:6px;'},[
+  box.appendChild(el('div',{class:'callout-title', style:'display:flex; align-items:center; gap:var(--space-2);'},[
     `✅ ${fileName} heruntergeladen`,
     infoButton('Die .FIT-Datei funktioniert genauso auf Garmin- und Wahoo-Geräten.'
       + (distanceMode ? ' Distanz-getriggerte Schritte sind auf Head-Units seltener im Einsatz als zeitbasierte – prüfe die ersten paar Kilometer testweise, bevor du dich für eine lange Ausfahrt darauf verlässt.' : ''))
@@ -8742,7 +8753,7 @@ function renderTrainerWorkoutPreview(tp, ctx){
       // and replaced with an explanation. buildZwo() itself stays untouched
       // and unreachable in HF mode (this is its only call site), so its
       // "Arbeits-FTP X W" description text (plan row 16) never renders.
-      actions.appendChild(el('span', {style:'display:inline-flex; align-items:center; gap:4px; font-size:12px; color:var(--chalk-dim);'}, [
+      actions.appendChild(el('span', {style:'display:inline-flex; align-items:center; gap:var(--space-2); font-size:12px; color:var(--chalk-dim);'}, [
         '.ZWO nicht verfügbar',
         infoButton('Zwift-Workouts benötigen Leistungsziele – im HF-Modus nicht verfügbar.')
       ]));
@@ -8819,12 +8830,12 @@ function renderTrainerZonesCard(hasWorkout, zoneBreakdown, routeBased, actualWee
   const card = el('div', {class:'card'});
   card.appendChild(el('h2', {}, ['Zonen']));
   if(hasWorkout){
-    card.appendChild(el('div', {style:'display:flex; align-items:center; gap:6px; font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:2px 0 4px;'}, [
+    card.appendChild(el('div', {style:'display:flex; align-items:center; gap:var(--space-2); font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:2px 0 4px;'}, [
       'Ausgewähltes Workout', infoButton(routeBased?'Geschätzt aus dem Streckenprofil.':(usingHr?'Aus dem HF-Ziel jedes Abschnitts.':'Aus der Zielleistung jedes Abschnitts.'))
     ]));
     appendZoneBars(card, zoneBreakdown);
   }
-  card.appendChild(el('div', {style:'display:flex; align-items:center; gap:6px; font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:16px 0 4px;'}, [
+  card.appendChild(el('div', {style:'display:flex; align-items:center; gap:var(--space-2); font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:16px 0 4px;'}, [
     'Diese Woche, gefahren',
     actualWeekZones.rides>0 ? infoButton(`${actualWeekZones.rides} Fahrt${actualWeekZones.rides===1?'':'en'} seit Montag, aus deinen echten Aktivitäten (${usingHr ? 'Stravas 7 Leistungszonen aus deinen Fahrten mit Wattdaten – nur Fahrten mit Leistungsmesser zählen hier, unabhängig vom aktuellen Modus.' : 'Stravas 7 Zonen statt der 6 App-Zonen oben.'})`) : ''
   ]));
@@ -8944,13 +8955,13 @@ function renderTrainerAblaufCard(tp, ctx){
   }
 
   const learnSection = el('div', {style:'margin-top:18px; padding-top:14px; border-top:1px solid var(--line);'});
-  learnSection.appendChild(el('h3',{style:'margin:0 0 8px; font-size:13px;'},['Lern-Anpassung aus deinen Auswertungen']));
+  learnSection.appendChild(el('h3',{class:'tsettings-group-title'},['Lern-Anpassung aus deinen Auswertungen']));
   const learnBox = el('div', {});
   appendLearningDetail(learnBox, learning);
   learnSection.appendChild(learnBox);
   body.appendChild(learnSection);
 
-  const evalH3 = el('h3',{style:'margin:0 0 8px; font-size:13px; display:flex; align-items:center; gap:8px;'},['Workout auswerten']);
+  const evalH3 = el('h3',{class:'tsettings-group-title', style:'display:flex; align-items:center; gap:var(--space-3);'},['Workout auswerten']);
   const evalSection = el('div', {style:'margin-top:18px; padding-top:14px; border-top:1px solid var(--line);'}, [evalH3]);
   if(!hasWorkout){
     evalSection.appendChild(el('div',{class:'legend-note'},['Wähle zuerst eine Workout-Art, um eine Vorschau zum Auswerten zu haben.']));
@@ -9330,7 +9341,7 @@ function settingsFieldRow(path, def){
     inputEl = el('span', {class:'tsettings-input-wrap'}, wrapChildren);
   }
 
-  const label = el('label', {for:id, style:'display:flex; align-items:center; gap:6px;'}, [def.label, infoButton(fieldHelpText(path, def))]);
+  const label = el('label', {for:id, style:'display:flex; align-items:center; gap:var(--space-2);'}, [def.label, infoButton(fieldHelpText(path, def))]);
   const main = el('div', {class:'tsettings-row-main'}, [label, inputEl]);
   return el('div', {class:'tsettings-row'}, [main]);
 }
@@ -9394,7 +9405,7 @@ function buildClassSettingsSection(c){
   const exempt = SUITABILITY_EXEMPT_CLASSES.includes(c.key);
   const body = el('div', {style:'margin-top:10px;'});
   if(exempt){
-    body.appendChild(el('div', {style:'margin-bottom:10px; display:flex; align-items:center; gap:6px;'}, [
+    body.appendChild(el('div', {style:'margin-bottom:10px; display:flex; align-items:center; gap:var(--space-2);'}, [
       el('span', {class:'legend-note', style:'margin:0;'}, ['Terrainfolgende Klasse']),
       infoButton('Diese Klasse ist terrainfolgend über die ganze Strecke geplant (kein Intervall-Placement) – die Steigungsfelder unten fließen aktuell nicht in ihre Eignungsprüfung ein, bleiben aber editierbar für spätere Nutzung.')
     ]));
@@ -9421,7 +9432,7 @@ function buildClassSettingsSection(c){
     ]));
   }
   body.appendChild(el('button', {class:'btn secondary', style:'margin-top:12px;', onclick: ()=>{ resetConfigSlice(basePath); if(budgetTable) resetConfigSlice(budgetTable); render(); }}, ['Diese Klasse auf Standard zurücksetzen']));
-  const summary = el('summary', {}, [el('h3', {style:'display:inline; font-size:13px; margin:0;'}, [c.label])]);
+  const summary = el('summary', {}, [el('h3', {class:'tsettings-group-title', style:'display:inline; margin:0;'}, [c.label])]);
   return el('details', {class:'tt-collapse tsettings-class'}, [summary, body]);
 }
 
@@ -9473,7 +9484,7 @@ function buildLthrOverrideRow(){
   const inputEl = el('span', {class:'tsettings-input-wrap'}, [numInput, el('span', {class:'tsettings-unit'}, ['bpm'])]);
 
   const helpText = 'Manuell hinterlegter HF-Schwellenwert (LTHR). Leer lassen, um die automatische Schätzung aus deinen Fahrten zu nutzen. Bestimmt bei aktiviertem "Nur Herzfrequenzgurt"-Modus die Trainingszonen und Workout-Ziele im Trainer-Tab.';
-  const label = el('label', {for:id, style:'display:flex; align-items:center; gap:6px;'}, ['Manuelle LTHR', infoButton(helpText)]);
+  const label = el('label', {for:id, style:'display:flex; align-items:center; gap:var(--space-2);'}, ['Manuelle LTHR', infoButton(helpText)]);
   const main = el('div', {class:'tsettings-row-main'}, [label, inputEl]);
 
   // Override checked first now: TRAINING_CONFIG.rider.lthrOverride always
