@@ -1929,6 +1929,13 @@ async function fetchGearDetail(id, token){
 // existing velocast_settings key or with each other.
 const PROFIL_ACTIVITY_CACHE_KEY = "velocast_activity_cache";
 const PROFIL_ACTIVITY_CACHE_MAX = 400;
+// Bumped whenever processProfilRide()'s derived `metrics` shape changes in a
+// way that makes an old cached row stale (e.g. a new field the app now
+// depends on that can't be backfilled without re-fetching the raw stream,
+// which itself isn't cached). Cache-hit rows without a matching
+// metricsVersion fall through to a real re-fetch instead of being reused
+// verbatim -- see the cache-hit check in loadProfilData().
+const PROFIL_METRICS_VERSION = 2;
 
 function loadProfilActivityCache(){
   try{
@@ -2250,6 +2257,7 @@ function computeStreamMetrics(stream, powerZones, weightKg){
   const avgPower = watts.reduce((a,b)=>a+(b||0),0)/n;
 
   const zoneTimes = new Array(POWER_ZONE_META.length).fill(0);
+  const sampleZoneIdx = new Array(n).fill(-1);
   if(Array.isArray(powerZones) && powerZones.length){
     for(let i=0;i<n;i++){
       const w = watts[i]||0;
@@ -2257,7 +2265,56 @@ function computeStreamMetrics(stream, powerZones, weightKg){
       if(zi < 0) zi = powerZones.length-1;
       if(zi >= zoneTimes.length) zi = zoneTimes.length-1;
       zoneTimes[zi] += dt;
+      sampleZoneIdx[i] = zi;
     }
+  }
+
+  // Weekly-budget-only gate (weeklyClassProgress()/trainedOnDate()): for
+  // classes representing genuine sustained intervals (tempo/threshold/
+  // vo2max/anaerobic), a contiguous span of time-in-zone -- with a short
+  // grace-period tolerance for brief dips, mirroring detectRideClimbs()'s
+  // start/lastClimbingIdx state machine below -- must clear a minimum
+  // duration before it counts. zoneTimes above (used by charts) stays pure
+  // cumulative time, unchanged; this is a separate parallel array that
+  // starts as a copy of it, so classes without a gate (recovery/endurance/
+  // sprint/longdistance) end up byte-identical to zoneTimes automatically.
+  const intervalZoneTimes = zoneTimes.slice();
+  if(Array.isArray(powerZones) && powerZones.length){
+    const idCfg = (typeof TRAINING_CONFIG !== 'undefined' && TRAINING_CONFIG.intervalDetection) || {};
+    const graceSec = idCfg.graceSec ?? 8;
+    const minSecByClass = idCfg.minSecByClass || { tempo:480, threshold:480, vo2max:150, anaerobic:30 };
+    const classList = (typeof TRAINING_CLASSES !== 'undefined') ? TRAINING_CLASSES : [];
+    Object.keys(minSecByClass).forEach(classKey => {
+      const cls = classList.find(c => c.key === classKey);
+      if(!cls || cls.zoneIdx == null) return;
+      const zoneIdx = cls.zoneIdx;
+      const minSec = minSecByClass[classKey];
+      intervalZoneTimes[zoneIdx] = 0;
+      let start = null, lastInZoneIdx = null, inZoneSec = 0;
+      const finalize = (endIdx) => {
+        // +dt: time[endIdx]-time[start] measures between the first and last
+        // in-zone SAMPLE, one dt short of the span's actual elapsed duration
+        // (inZoneSec, which accumulates dt per sample), so add it back to
+        // avoid a systematic 1-sample-too-strict minSec gate.
+        const totalSpan = time[endIdx] - time[start] + dt;
+        // Grace-period gap seconds are only tolerated to avoid fragmenting a
+        // real span (like detectRideClimbs()) -- they don't themselves count
+        // toward the credited zone time, so only inZoneSec (accumulated from
+        // actual in-zone samples) is added, not totalSpan.
+        if(totalSpan >= minSec) intervalZoneTimes[zoneIdx] += inZoneSec;
+      };
+      for(let i=0;i<n;i++){
+        if(sampleZoneIdx[i] === zoneIdx){
+          if(start === null){ start = i; inZoneSec = 0; }
+          inZoneSec += dt;
+          lastInZoneIdx = i;
+        } else if(start !== null && (time[i]-time[lastInZoneIdx]) > graceSec){
+          finalize(lastInZoneIdx);
+          start = null; lastInZoneIdx = null; inZoneSec = 0;
+        }
+      }
+      if(start !== null) finalize(lastInZoneIdx);
+    });
   }
 
   let decoupling = null, efFactor = null;
@@ -2300,7 +2357,7 @@ function computeStreamMetrics(stream, powerZones, weightKg){
 
   return {
     np: Math.round(np), avgPower: Math.round(avgPower), durationSec,
-    zoneTimes, decoupling, efFactor, durability,
+    zoneTimes, intervalZoneTimes, decoupling, efFactor, durability,
     climbPower: climbPower!=null?Math.round(climbPower):null, climbSec,
     climbWkg: (climbPower!=null && weightKg) ? climbPower/weightKg : null
   };
@@ -2560,7 +2617,15 @@ function buildDurability(results){
   return { rides:longRides, recentAvg, verdict, verdictClass, why };
 }
 
-const REFERENCE_RATIOS = { 60:1.72, 300:1.18, 600:1.06 };
+// 2700 (45min) is an authored interpolation, not a separately cited value:
+// FTP_FACTORS already treats ~0.95x20-min-power as the file's own FTP
+// convention, and ratio-to-20min is by definition 1.0 at 20min itself, so
+// 0.965 sits between those two anchors for the 45-minute point.
+const REFERENCE_RATIOS = { 60:1.72, 300:1.18, 600:1.06, 2700:0.965 };
+// Authored/reasoned estimate (not a single cited published value, same
+// disclaimer style as classBaselineScore below) for 5s sprint peak power
+// vs 1-minute power.
+const SPRINT_REFERENCE_RATIO = 1.55;
 
 function buildRiderProfile(pp, ftpAnalysis){
   const results = pp.results;
@@ -2607,7 +2672,8 @@ function detectWeaknesses(rp, zoneDist, efficiency, durability){
     const shape = [
       { sec:60,  label:'Anaerobe Kapazität (1 Min)', goal:'anaerobic' },
       { sec:300, label:'VO2max (5 Min)',              goal:'vo2max' },
-      { sec:600, label:'Aerobe Leistung (10 Min)',    goal:'vo2max' }
+      { sec:600, label:'Aerobe Leistung (10 Min)',    goal:'vo2max' },
+      { sec:2700, label:'Tempo-Ausdauer (45 Min)',    goal:'tempo' }
     ];
     shape.forEach(s => {
       const actual = rp.mmpCurve ? rp.mmpCurve[s.sec] : null;
@@ -2624,6 +2690,18 @@ function detectWeaknesses(rp, zoneDist, efficiency, durability){
     if(p5 && p5/p20 > 1.30) items.push({
       area:'Schwellenleistung (FTP)', goal:'ftp', score: Math.min(100,(p5/p20-1.30)*300),
       why:`Deine 5-Minuten-Leistung liegt ${((p5/p20-1)*100).toFixed(0)}% über deiner 20-Minuten-Leistung — eine sehr steile Kurve. Deine Spitze ist gut, dein Unterbau hinkt hinterher: Schwellenarbeit ist der größte Hebel.`
+    });
+  }
+
+  // Sprint uses its own ratio (5s peak vs 1-min power) instead of vs-p20,
+  // so it isn't part of the `shape` loop above.
+  if(rp.mmpCurve && rp.mmpCurve[5] && rp.p1){
+    const p5s = rp.mmpCurve[5];
+    const ratio = p5s/rp.p1;
+    const deficit = (SPRINT_REFERENCE_RATIO-ratio)/SPRINT_REFERENCE_RATIO*100;
+    if(deficit > 3) items.push({
+      area:'Sprintleistung (5 Sek.)', goal:'sprint', score: Math.min(100, deficit*6),
+      why:`Deine 5-Sekunden-Spitzenleistung liegt bei ${(ratio*100).toFixed(0)}% deiner 1-Minuten-Leistung; typisch wären etwa ${(SPRINT_REFERENCE_RATIO*100).toFixed(0)}%. Dir fehlt kurze, maximale Sprintpower obendrauf.`
     });
   }
 
@@ -2713,7 +2791,7 @@ async function processProfilRide(a, token, weightKg, zonesRaw){
     avgWatts: a.average_watts!=null ? Math.round(a.average_watts) : null,
     mmp, intervalAvgHr:avgHr, intervalMaxHr:maxHr, hrSource,
     estFtp: est.ftp, basis: est.basis, confidence, weight, hrNote,
-    metrics, climbs
+    metrics, climbs, metricsVersion: PROFIL_METRICS_VERSION
   }};
 }
 
@@ -2777,7 +2855,11 @@ async function loadProfilData(token, opts){
     candidates.forEach(a => {
       const id = String(a.id);
       const hit = cache[id];
-      if(hit){ cachedRows.push(hit); return; }
+      // Only reuse a cached row if it was computed under the current
+      // metrics shape (PROFIL_METRICS_VERSION) -- an old row is missing
+      // fields like intervalZoneTimes that can't be backfilled without
+      // re-fetching the raw stream, so let it fall through to toFetch below.
+      if(hit && hit.metricsVersion === PROFIL_METRICS_VERSION){ cachedRows.push(hit); return; }
       const skip = skipCache[id];
       if(skip){
         if(skip.status==='noWatts') skippedNoWatts++; else skippedNoBestEffort++;
@@ -6067,7 +6149,28 @@ const WEEKLY_QUALITY_TABLE_BY_CLASS = { tempo:'weeklyTempoMinutesByPriority', th
 
 const TRAINING_CONFIG = {
   classBaselineScore: { recovery:0, endurance:20, tempo:12, threshold:15, vo2max:10, anaerobic:5, sprint:0, longdistance:10 },
-  priority: { highMin:55, mediumMin:25, lowMin:8 },
+  priority: { highMin:55, mediumMin:25, lowMin:5 },
+  // How many weeks in a row a class's weekly progress can fall below
+  // floorFraction of its own fixed LOW-tier target before priority gets a
+  // "neglected" boost — see classNeglectWeeks()/computeTrainingPriorities().
+  neglect: { lookbackWeeks:4, floorFraction:0.5, boostPerWeek:8, boostMax:24 },
+  // Minimum contiguous (grace-tolerant) time-in-zone before a span counts
+  // toward the weekly training-class BUDGET (weeklyClassProgress()/
+  // trainedOnDate() only -- NOT the raw cumulative zoneTimes used by charts).
+  // Values are reasoned starting points based on common interval-training
+  // convention, not single validated constants:
+  //  - tempo/threshold (Sweet Spot/FTP work): typically prescribed in reps
+  //    of >=8 min to produce a real training effect at that intensity.
+  //  - vo2max: classic VO2max reps run 2-3 min; 150s (2.5 min) as the midpoint.
+  //  - anaerobic: capacity reps run roughly 30-60s; 30s as the conservative
+  //    (inclusive) lower bound so short-but-real reps still count.
+  // endurance/longdistance (Z1/Z2) and sprint (Z7) are deliberately absent --
+  // those stay on pure cumulative time / the existing synthetic effort-count
+  // heuristic respectively.
+  intervalDetection: {
+    graceSec: 8, // mirrors detectRideClimbs()'s GRACE_SEC
+    minSecByClass: { tempo:480, threshold:480, vo2max:150, anaerobic:30 },
+  },
   // Split per class (was one shared value for all four) so each class's
   // weekly quality-time target matches its actual research-backed session
   // structure instead of a single compromise number -- see plan for sources.
@@ -6197,13 +6300,15 @@ function classPerformanceScores(weaknessData){
   });
   return scores;
 }
-function computeTrainingPriorities(scores, selectedGoal, config){
+function computeTrainingPriorities(scores, selectedGoal, config, results, todayIso){
   const cfg = config.priority;
+  const neglect = classNeglectWeeks(results, todayIso, config);
   const priorities = {};
   TRAINING_CLASSES.forEach(c => {
     if(!c.priorityEligible){ priorities[c.key] = 'MAINTENANCE'; return; }
     const raw = (scores[c.key] && scores[c.key].score) || 0;
-    const total = Math.min(100, raw + (config.classBaselineScore[c.key] || 0));
+    const neglectBoost = Math.min(config.neglect?.boostMax ?? 24, (neglect[c.key]||0) * (config.neglect?.boostPerWeek ?? 8));
+    const total = Math.min(100, raw + (config.classBaselineScore[c.key] || 0) + neglectBoost);
     priorities[c.key] = total >= cfg.highMin ? 'HIGH' : total >= cfg.mediumMin ? 'MEDIUM'
       : total >= cfg.lowMin ? 'LOW' : 'MAINTENANCE';
   });
@@ -6243,8 +6348,15 @@ function weeklyClassProgress(results, todayIso, config){
     const d = r.date instanceof Date ? r.date : new Date(r.date);
     if(isNaN(d.getTime()) || d < monday || d >= nextMonday) return;
     if(r.metrics && Array.isArray(r.metrics.zoneTimes)){
+      // Prefer the interval-gated array so tempo/threshold/vo2max/anaerobic
+      // only bank weekly-budget credit for genuine sustained efforts, not
+      // scattered spikes -- see computeStreamMetrics(). Falls back to raw
+      // zoneTimes for cached rows computed before intervalZoneTimes existed
+      // (PROFIL_METRICS_VERSION), which is byte-identical for the
+      // ungated classes anyway.
+      const zt = Array.isArray(r.metrics.intervalZoneTimes) ? r.metrics.intervalZoneTimes : r.metrics.zoneTimes;
       TRAINING_CLASSES.forEach(c => {
-        if(c.zoneIdx != null && r.metrics.zoneTimes[c.zoneIdx] != null) progress[c.key] += r.metrics.zoneTimes[c.zoneIdx]/60;
+        if(c.zoneIdx != null && zt[c.zoneIdx] != null) progress[c.key] += zt[c.zoneIdx]/60;
       });
     }
     if(r.movingMin != null && r.movingMin >= config.longRideMinMinutes) longRideCount++;
@@ -6252,6 +6364,50 @@ function weeklyClassProgress(results, todayIso, config){
   progress.longdistance = longRideCount;
   progress.sprint = Math.round((progress.sprint||0) / config.sprintMinutesPerEffort);
   return progress;
+}
+// Consecutive weeks (walking backward from the week before todayIso's week)
+// that a class's weekly progress fell below floorFraction of its own fixed
+// LOW-tier weekly target. Uses the fixed LOW-tier target rather than
+// whatever tier is currently assigned as the reference floor, since
+// priority itself now depends on this neglect count -- a dynamically
+// assigned target would be circular. Counting stops at the first
+// non-neglected week found going backward, and classes with no meaningful
+// floor (0/undefined) are skipped (0 neglect weeks) rather than falsely
+// flagged.
+function classNeglectWeeks(results, todayIso, config){
+  const neglect = {};
+  const cfg = config.neglect || {};
+  const lookbackWeeks = cfg.lookbackWeeks ?? 4;
+  const floorFraction = cfg.floorFraction ?? 0.5;
+  const thisMonday = mondayOfUTC(parseIsoDateUTC(todayIso));
+  // Precompute each lookback week's progress once (not once per class) --
+  // weeklyClassProgress() does a full pass over `results`, so this turns
+  // O(classes * lookbackWeeks) full passes into O(lookbackWeeks).
+  const weekProgress = [];
+  for(let i=1; i<=lookbackWeeks; i++){
+    const weekIso = toIsoDate(addDaysUTC(thisMonday, -7*i));
+    weekProgress.push(weeklyClassProgress(results, weekIso, config));
+  }
+  TRAINING_CLASSES.forEach(c => {
+    neglect[c.key] = 0;
+    if(!c.priorityEligible) return;
+    // Same per-class target lookup as computeWeeklyBudgetTargets(), fixed to
+    // the LOW tier instead of whatever tier is currently assigned.
+    let floor;
+    if(c.key === 'endurance') floor = config.weeklyEnduranceMinutesByPriority?.LOW;
+    else if(c.key === 'sprint') floor = config.weeklySprintEffortsByPriority?.LOW;
+    else if(c.key === 'longdistance') floor = config.weeklyLongRidesByPriority?.LOW;
+    else floor = config[WEEKLY_QUALITY_TABLE_BY_CLASS[c.key]]?.LOW;
+    if(!floor) return;
+    let count = 0;
+    for(let i=0; i<lookbackWeeks; i++){
+      const done = weekProgress[i][c.key] || 0;
+      if(done < floor*floorFraction) count++;
+      else break;
+    }
+    neglect[c.key] = count;
+  });
+  return neglect;
 }
 function reconcileWeeklyBudgets(targets, progress){
   const out = {};
@@ -6266,7 +6422,7 @@ function reconcileWeeklyBudgets(targets, progress){
 }
 function computeTrainingDecisionState(results, weaknessData, selectedGoal, todayIso, config){
   const scores = classPerformanceScores(weaknessData);
-  const priorities = computeTrainingPriorities(scores, selectedGoal, config);
+  const priorities = computeTrainingPriorities(scores, selectedGoal, config, results, todayIso);
   const targets = computeWeeklyBudgetTargets(priorities, config);
   const progress = weeklyClassProgress(results, todayIso, config);
   const budgets = reconcileWeeklyBudgets(targets, progress);
@@ -6278,7 +6434,11 @@ function trainedOnDate(results, cls, dateIso, config){
   return (results||[]).some(r => {
     const d = r.date instanceof Date ? r.date : new Date(r.date);
     if(isNaN(d.getTime()) || toIsoDate(d) !== dateIso) return false;
-    return r.metrics && Array.isArray(r.metrics.zoneTimes) && (r.metrics.zoneTimes[cls.zoneIdx]||0)/60 >= thresholdMin;
+    if(!r.metrics) return false;
+    // Same interval-gated preference (with graceful fallback for old cached
+    // rows) as weeklyClassProgress() -- see there for rationale.
+    const zt = Array.isArray(r.metrics.intervalZoneTimes) ? r.metrics.intervalZoneTimes : r.metrics.zoneTimes;
+    return Array.isArray(zt) && (zt[cls.zoneIdx]||0)/60 >= thresholdMin;
   });
 }
 function pickIntendedTrainingClass(decisionState, results, todayIso, config, forceRecovery){
@@ -7864,7 +8024,19 @@ function getTrainerRouteForDate(dateKey){
   return result;
 }
 function invalidateTrainerRouteCache(dateKey){ trainerRouteAnalysisCache.delete(dateKey); }
-function todayIsoKey(){ return new Date().toISOString().slice(0,10); }
+// Local (not UTC) calendar-day key for "today" -- new Date().toISOString()
+// reads the UTC calendar date, which in Germany (UTC+1/+2) shifts the
+// weekly-budget window's Sunday->Monday rollover ~1-2 hours before local
+// midnight. localDateKey() (above) already does the correct local-time
+// calendar-day computation, so reuse it here instead of reimplementing.
+// Note: mondayOfUTC()/parseIsoDateUTC()/addDaysUTC()/toIsoDate() (used by
+// the weekly-budget window math once today's key is known) are deliberately
+// left UTC-field-based and untouched -- r.date is built from Strava's
+// start_date_local, which encodes local wall-clock time with a "Z" suffix,
+// so treating its UTC fields as the local calendar fields is already
+// correct there. Fixing only the "what day is today" computation here is
+// correct and sufficient.
+function todayIsoKey(){ return localDateKey(new Date()); }
 
 // GPX upload — reuses parseGpxTrack()/buildCumulativeDistances() (Strecke's
 // own GPX pipeline) rather than a second regex-based GPX parser, then zips
