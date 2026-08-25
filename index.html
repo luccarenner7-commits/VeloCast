@@ -7710,8 +7710,14 @@ function placeIntervalsOnRoute(route, spec, adj, classKey, config, options){
     const placed = assign.get(si);
     if(!placed){
       const pct = baselinePctForSegment(s, 'cruise') * adj;
-      steps.push(rseg(`Verbindung (${((s.endDist-s.startDist)/1000).toFixed(1)} km)`, s.startDist, s.endDist, pct,
-        s.type==='descent' ? 'Erholen' : 'Ruhig weiterfahren, für den nächsten Abschnitt sparen', 'cruise', s.type, s.avgGradient));
+      const cruiseStep = rseg(`Verbindung (${((s.endDist-s.startDist)/1000).toFixed(1)} km)`, s.startDist, s.endDist, pct,
+        s.type==='descent' ? 'Erholen' : 'Ruhig weiterfahren, für den nächsten Abschnitt sparen', 'cruise', s.type, s.avgGradient);
+      // Kurvigkeit wird von rseg() nicht übernommen (dessen Feldsatz ist für
+      // alle Schritt-Typen einheitlich) -- extendCompressedIntervalsBackward()
+      // braucht sie aber, um beim Rückwärts-Leihen dieselbe Eignungsprüfung
+      // wie bei der Intervall-Platzierung anzuwenden.
+      cruiseStep.curvy = s.curvy;
+      steps.push(cruiseStep);
       return;
     }
     let cursor = s.startDist;
@@ -7741,12 +7747,14 @@ function placeIntervalsOnRoute(route, spec, adj, classKey, config, options){
     });
     if(s.endDist - cursor > 1){
       const pct = baselinePctForSegment(s, 'cruise') * adj;
-      steps.push(rseg(`Verbindung (${((s.endDist-cursor)/1000).toFixed(1)} km)`, cursor, s.endDist, pct,
-        'Ruhig weiterfahren', 'cruise', s.type, s.avgGradient));
+      const cruiseStep = rseg(`Verbindung (${((s.endDist-cursor)/1000).toFixed(1)} km)`, cursor, s.endDist, pct,
+        'Ruhig weiterfahren', 'cruise', s.type, s.avgGradient);
+      cruiseStep.curvy = s.curvy;
+      steps.push(cruiseStep);
     }
   });
 
-  extendCompressedIntervalsBackward(steps);
+  extendCompressedIntervalsBackward(steps, classKey, config, { ignoreCurve, ignoreIntersections, intersections });
 
   if(cDist > 0.5) steps.push(rseg(spec.cooldown.label, totalDist-cDist, totalDist, spec.cooldown.pct, spec.cooldown.note, 'cooldown', 'flat', 0));
 
@@ -7764,8 +7772,21 @@ function placeIntervalsOnRoute(route, spec, adj, classKey, config, options){
 // (distanceM > nominalDistM) -- those are left completely untouched.
 // Best-effort: if there isn't enough preceding cruise budget to fully close
 // the gap, the interval ends up less short than before but is never dropped
-// or errored on.
-function extendCompressedIntervalsBackward(steps){
+// or errored on. A cruise step must meet the SAME suitability bar used for
+// primary interval placement (gradient band, not curvy, no intersection) to
+// be borrowed from -- otherwise a compressed interval could get "topped up"
+// with e.g. descent pace, which the rider can't realistically hold the
+// interval's target power through. Walk stops (doesn't skip over) the first
+// unsuitable cruise step it meets, same as it already stops at a rest/other
+// step -- contiguous terrain right before the interval is required either way.
+function extendCompressedIntervalsBackward(steps, classKey, config, opts){
+  opts = opts || {};
+  const borrowEligible = cruiseStep => {
+    if(!classKey || !config) return cruiseStep.type !== 'descent' && !cruiseStep.curvy;
+    const adapted = { type: cruiseStep.type, avgGradient: cruiseStep.gradient,
+                       curvy: cruiseStep.curvy, startDist: cruiseStep.startDist, endDist: cruiseStep.endDist };
+    return evaluateSegmentForClass(adapted, classKey, config, opts).tier !== 'unsuitable';
+  };
   for(let i=0; i<steps.length; i++){
     const step = steps[i];
     if(step.kind !== 'interval' || step.nominalDistM == null) continue;
@@ -7778,7 +7799,7 @@ function extendCompressedIntervalsBackward(steps){
     }
     let borrowedDistM = 0, borrowedElevM = 0;
     let j = i - 1;
-    while(shortfallM > 1 && j >= 0 && steps[j].kind === 'cruise'){
+    while(shortfallM > 1 && j >= 0 && steps[j].kind === 'cruise' && borrowEligible(steps[j])){
       // Borrow physical route meters 1:1 against the shortfall -- this is
       // what makes the extended interval's distanceM converge on
       // nominalDistM (the acceptance bar for this fix), rather than a
