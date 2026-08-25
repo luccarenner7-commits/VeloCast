@@ -480,7 +480,6 @@
   .bar-row{ display:flex; align-items:center; gap:var(--space-3); margin-bottom:8px; font-family:'IBM Plex Mono', monospace; font-size:11px; }
   .bar-row .bar-label{ flex:0 0 130px; color:var(--chalk-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .bar-row .bar-track{ flex:1; height:8px; border-radius:var(--r-full); overflow:hidden; background:var(--asphalt-3); }
-  .bar-row .bar-val{ display:block; height:100%; border-radius:var(--r-full); }
   .bar-row .bar-num{ flex:0 0 auto; color:var(--chalk-dim); white-space:nowrap; }
 
   .data-table{ width:100%; border-collapse:collapse; font-family:'IBM Plex Mono', monospace; font-size:11px; }
@@ -780,7 +779,6 @@ let state = {
   windFieldPoints: null, // [{lat,lon,windSpeed,windDir}, ...] for the overlay, or null if not (yet) loaded for the current route
   loading: {},
   error: null,
-  authCodeInput: "",
   // seg.id -> {starred, pending, error} for the star/un-star-on-Strava
   // action button (see renderStarButton()/toggleSegmentStar()). Keyed
   // directly by segment id rather than nested under a bucket, since a
