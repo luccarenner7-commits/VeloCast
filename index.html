@@ -1337,12 +1337,10 @@ async function ensureElevationProfile(){
   render();
 }
 
-// Builds the elevation line/area SVG for any distance/elevation slice —
-// shared by the full-route Höhenprofil tab and the per-climb zoom-in view
-// in the Anstiege tab. Distances don't need to start at 0 (a climb's slice
-// starts at its own km mark); the x-scale is relative to the slice's own
-// first point.
-function buildElevationChartSvg(distances, elevations){
+// Shared SVG coordinate scales for any distance/elevation slice. Distances
+// don't need to start at 0 (a climb's slice starts at its own km mark); the
+// x-scale is relative to the slice's own first point.
+function buildDistanceElevationScales(distances, elevations){
   const width = 600, height = 140, pad = 6;
   const minE = Math.min(...elevations), maxE = Math.max(...elevations);
   const rangeE = Math.max(1, maxE - minE);
@@ -1350,6 +1348,14 @@ function buildElevationChartSvg(distances, elevations){
   const totalD = (distances[distances.length - 1] - d0) || 1;
   const x = d => pad + ((d - d0) / totalD) * (width - pad*2);
   const y = e => (height - pad) - ((e - minE) / rangeE) * (height - pad*2);
+  return { width, height, pad, x, y };
+}
+
+// Builds the elevation line/area SVG for any distance/elevation slice —
+// shared by the full-route Höhenprofil tab and the per-climb zoom-in view
+// in the Anstiege tab.
+function buildElevationChartSvg(distances, elevations){
+  const { width, height, pad, x, y } = buildDistanceElevationScales(distances, elevations);
 
   let linePath = `M ${x(distances[0]).toFixed(1)} ${y(elevations[0]).toFixed(1)}`;
   for(let i=1;i<distances.length;i++){
@@ -1521,13 +1527,7 @@ function gradeColor(grade){
 // Only used for the zoomed-in climb view; the full-route Höhenprofil tab
 // keeps its plain line.
 function buildClimbChartSvg(distances, elevations){
-  const width = 600, height = 140, pad = 6;
-  const minE = Math.min(...elevations), maxE = Math.max(...elevations);
-  const rangeE = Math.max(1, maxE - minE);
-  const d0 = distances[0];
-  const totalD = (distances[distances.length - 1] - d0) || 1;
-  const x = d => pad + ((d - d0) / totalD) * (width - pad*2);
-  const y = e => (height - pad) - ((e - minE) / rangeE) * (height - pad*2);
+  const { width, height, pad, x, y } = buildDistanceElevationScales(distances, elevations);
   const smoothed = smoothElevations(elevations, 2);
 
   let areaPath = `M ${x(distances[0]).toFixed(1)} ${(height-pad).toFixed(1)}`;
@@ -2557,20 +2557,8 @@ function localDateKey(d){
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 
-function buildTrainingLoad(results, ftp){
-  const withNp = results.filter(r=>r.metrics && r.metrics.np>0 && r.metrics.durationSec>0);
-  if(!withNp.length || !ftp) return null;
-
-  const daily = new Map();
-  withNp.forEach(r => {
-    const np = r.metrics.np, sec = r.metrics.durationSec;
-    const intensity = np/ftp;
-    const tss = (sec*np*intensity)/(ftp*3600)*100;
-    const key = localDateKey(r.date);
-    daily.set(key, (daily.get(key)||0) + tss);
-  });
-
-  const start = new Date(withNp[0].date); start.setHours(0,0,0,0);
+function computeEwmaLoadSeries(daily, startDate){
+  const start = new Date(startDate); start.setHours(0,0,0,0);
   const end = new Date(); end.setHours(0,0,0,0);
   const series = [];
   let ctl=0, atl=0;
@@ -2599,6 +2587,22 @@ function buildTrainingLoad(results, ftp){
 
   return { series, last, rampWeekly, formVerdict, formClass, formWhy,
     ctl: last?last.ctl:0, atl: last?last.atl:0, tsb };
+}
+
+function buildTrainingLoad(results, ftp){
+  const withNp = results.filter(r=>r.metrics && r.metrics.np>0 && r.metrics.durationSec>0);
+  if(!withNp.length || !ftp) return null;
+
+  const daily = new Map();
+  withNp.forEach(r => {
+    const np = r.metrics.np, sec = r.metrics.durationSec;
+    const intensity = np/ftp;
+    const tss = (sec*np*intensity)/(ftp*3600)*100;
+    const key = localDateKey(r.date);
+    daily.set(key, (daily.get(key)||0) + tss);
+  });
+
+  return computeEwmaLoadSeries(daily, withNp[0].date);
 }
 
 function buildZoneDistribution(results){
@@ -2675,8 +2679,7 @@ function buildEfficiency(results){
 }
 
 function buildClimbing(results, weightKg){
-  const all = [];
-  results.forEach(r => (r.climbs||[]).forEach(c => all.push({ ...c, date:r.date })));
+  const all = results.flatMap(r => (r.climbs||[]).map(c => ({ ...c, date:r.date })));
   if(!all.length) return null;
   const best = all.slice().sort((a,b)=>(b.wkg||0)-(a.wkg||0)).slice(0,15);
   const byDate = all.slice().sort((a,b)=>a.date-b.date);
@@ -6844,41 +6847,14 @@ function buildBlendedTrainingLoad(activities, ftp, lthr){
   });
   if(!earliest) return null;
 
-  // Identical EWMA procedure to buildTrainingLoad() (~2393) -- 42-day/7-day
-  // time constants -- just fed by the blended daily TSS above instead of
-  // pp.results' NP-based TSS. formVerdict/rampWeekly are reproduced 1:1 from
-  // buildTrainingLoad() too (renderTrainerSummaryCards reads them for the
-  // Fitness/Ermüdung/Form cards regardless of equipmentMode) so an HR-only
-  // rider gets the same cards filled in, not a permanent "–".
-  const start = new Date(earliest); start.setHours(0,0,0,0);
-  const end = new Date(); end.setHours(0,0,0,0);
-  const series = [];
-  let ctl=0, atl=0;
-  for(let d=new Date(start); d<=end; d.setDate(d.getDate()+1)){
-    const key = localDateKey(d);
-    const tss = daily.get(key)||0;
-    ctl = ctl + (tss-ctl)/42;
-    atl = atl + (tss-atl)/7;
-    series.push({ date:new Date(d), tss, ctl, atl, tsb: ctl-atl });
-  }
-  const last = series[series.length-1];
-  const rampWeekly = series.length>7 ? last.ctl - series[Math.max(0,series.length-8)].ctl : 0;
-
-  let formVerdict, formClass, formWhy;
-  const tsb = last ? last.tsb : 0;
-  if(tsb > 15){ formVerdict='Sehr frisch / Formspitze'; formClass='good';
-    formWhy=`Dein TSB liegt bei ${tsb.toFixed(0)}. Das ist Wettkampf-Frische — gut für einen Test oder ein Rennen, auf Dauer aber ein Zeichen für zu wenig Reiz.`; }
-  else if(tsb > 5){ formVerdict='Erholt'; formClass='good';
-    formWhy=`TSB ${tsb.toFixed(0)}: du bist ausgeruht und aufnahmefähig für harte Einheiten.`; }
-  else if(tsb > -10){ formVerdict='Produktiv'; formClass='good';
-    formWhy=`TSB ${tsb.toFixed(0)}: der Bereich, in dem Anpassung passiert, ohne dass Ermüdung überhandnimmt.`; }
-  else if(tsb > -30){ formVerdict='Deutlich belastet'; formClass='warn';
-    formWhy=`TSB ${tsb.toFixed(0)}: hoher Trainingsreiz. Kurzfristig produktiv, braucht aber bald Entlastung.`; }
-  else { formVerdict='Überlastet'; formClass='danger';
-    formWhy=`TSB ${tsb.toFixed(0)}: sehr tief. Das Risiko, dass Ermüdung die Anpassung auffrisst, ist hoch.`; }
-
-  return { series, last, rampWeekly, formVerdict, formClass, formWhy,
-    ctl: last?last.ctl:0, atl: last?last.atl:0, tsb };
+  // Same EWMA procedure as buildTrainingLoad(), via the shared
+  // computeEwmaLoadSeries() helper -- 42-day/7-day time constants -- just fed
+  // by the blended daily TSS above instead of pp.results' NP-based TSS.
+  // formVerdict/rampWeekly come out identical to buildTrainingLoad() too
+  // (renderTrainerSummaryCards reads them for the Fitness/Ermüdung/Form cards
+  // regardless of equipmentMode) so an HR-only rider gets the same cards
+  // filled in, not a permanent "–".
+  return computeEwmaLoadSeries(daily, earliest);
 }
 
 // Mirrors HR_PROFILE_CACHE_KEY's shape/rationale, under its own key. Caches
