@@ -7328,7 +7328,7 @@ function analyzeRoute(pts, config){
     merged.shift();
   }
 
-  const segments = merged.map(seg => {
+  const rawTyped = merged.map(seg => {
     const p0 = pts[seg.startIdx], p1 = pts[seg.endIdx];
     const e0 = smoothed[seg.startIdx], e1 = smoothed[seg.endIdx];
     const distanceM = p1.dist - p0.dist;
@@ -7340,6 +7340,35 @@ function analyzeRoute(pts, config){
     const avgCurviness = curveCount ? curveSum/curveCount : 0;
     return { type, startDist:p0.dist, endDist:p1.dist, distanceM, elevChangeM, avgGradient,
              startIdx:seg.startIdx, endIdx:seg.endIdx, avgCurviness, curvy: avgCurviness > curvyThreshold };
+  });
+
+  // Der Merge oben entfernt nur zu kurze Zwischenabschnitte, indem sie in den
+  // jeweils vorherigen Roh-Abschnitt aufgenommen werden; der Typ jedes
+  // gemergten Abschnitts wird danach aus dessen tatsächlichem Höhenprofil neu
+  // berechnet (oben). Das kann dazu führen, dass zwei direkt benachbarte
+  // Abschnitte zufällig wieder denselben Typ bekommen, ohne je zu einem
+  // Abschnitt verschmolzen worden zu sein -- sichtbar z.B. als mehrere
+  // aufeinanderfolgende "Verbindung"-Schritte mit identischer Ziel-Leistung
+  // im exportierten Workout, da baselinePctForSegment() nur nach `type`
+  // unterscheidet. Zweiter Durchgang: direkt benachbarte, gleich-typige
+  // Abschnitte zu einem zusammenfassen. Der gewichtete Mittelwert zweier
+  // Gradienten, die beide in derselben Klassifikations-Spanne liegen, bleibt
+  // zwangsläufig in derselben Spanne -- der Typ muss danach nicht neu geprüft
+  // werden.
+  const segments = [];
+  rawTyped.forEach(seg => {
+    const prev = segments[segments.length-1];
+    if(prev && prev.type === seg.type){
+      const distanceM = prev.distanceM + seg.distanceM;
+      const elevChangeM = prev.elevChangeM + seg.elevChangeM;
+      const avgGradient = distanceM > 0 ? elevChangeM/distanceM*100 : 0;
+      const avgCurviness = distanceM > 0
+        ? (prev.avgCurviness*prev.distanceM + seg.avgCurviness*seg.distanceM)/distanceM : 0;
+      Object.assign(prev, { endDist:seg.endDist, endIdx:seg.endIdx, distanceM, elevChangeM, avgGradient,
+                             avgCurviness, curvy: avgCurviness > curvyThreshold });
+    } else {
+      segments.push({ ...seg });
+    }
   });
 
   let totalElevGainM = 0;
