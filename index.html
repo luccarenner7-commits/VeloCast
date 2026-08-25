@@ -3378,20 +3378,30 @@ function renderGpxUploadRow(){
   return wrap;
 }
 
-function renderConnectCard(){
+function pageTitleCard(title){
   const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Verbinden"]));
-  card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [
-    "Autorisiere den Zugriff auf deine Aktivitäten/Routen. Du wirst weitergeleitet und kommst danach automatisch hierher zurück."
-  ]));
+  card.appendChild(el("h2", {}, [title]));
+  return card;
+}
 
-  const stravaBtn = el("button", {class:"btn", style:"margin-bottom:8px; width:100%;", onclick: ()=>{ window.location.href = buildAuthUrl(); }}, [state.loading.connect ? "Verbinde…" : "Mit Strava einloggen →"]);
-  if(state.loading.connect) stravaBtn.disabled = true;
-  card.appendChild(stravaBtn);
+function renderStravaConnectCard(title, description){
+  const card = pageTitleCard(title);
+  card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [description]));
+  const btn = el("button", {class:"btn", style:"width:100%;", onclick: ()=>{ window.location.href = buildAuthUrl(); }}, [state.loading.connect ? "Verbinde…" : "Mit Strava einloggen →"]);
+  if(state.loading.connect) btn.disabled = true;
+  card.appendChild(btn);
+  return card;
+}
 
+function renderConnectCard(){
+  const card = renderStravaConnectCard("Verbinden", "Autorisiere den Zugriff auf deine Aktivitäten/Routen. Du wirst weitergeleitet und kommst danach automatisch hierher zurück.");
+  // renderStravaConnectCard()'s button has no bottom margin (nothing follows
+  // it at its other call sites) -- restore it here since the button is an
+  // inline-block (.btn has no display override), so its margin never
+  // collapses with the "oder..." div's own margin-top below.
+  card.lastChild.style.marginBottom = "8px";
   card.appendChild(el("div", {class:"muted", style:"margin:16px 0 8px; font-size:12px;"}, ["oder, ganz ohne Account:"]));
   card.appendChild(renderGpxUploadRow());
-
   return card;
 }
 
@@ -4982,17 +4992,7 @@ function renderSegmentsCard(){
 // swapping the whole page is the natural equivalent of the "Zur Strecke"
 // back-button pattern there.
 function renderSegmentsPage(){
-  if(!state.connected){
-    const card = el("div", {class:"card"});
-    card.appendChild(el("h2", {}, ["Meine Segmente"]));
-    card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [
-      "Verbinde dich mit Strava, um deine markierten (gesternten) Segmente mit Windbewertung zu sehen."
-    ]));
-    const stravaBtn = el("button", {class:"btn", style:"width:100%;", onclick: ()=>{ window.location.href = buildAuthUrl(); }}, [state.loading.connect ? "Verbinde…" : "Mit Strava einloggen →"]);
-    if(state.loading.connect) stravaBtn.disabled = true;
-    card.appendChild(stravaBtn);
-    return card;
-  }
+  if(!state.connected) return renderStravaConnectCard("Meine Segmente", "Verbinde dich mit Strava, um deine markierten (gesternten) Segmente mit Windbewertung zu sehen.");
 
   if(isShowingSegmentDetail()){
     const bucket = segmentBucket("starred");
@@ -5364,22 +5364,9 @@ function legendDot(color, label){
   ]);
 }
 
-function renderProfilConnectCard(){
-  const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Profil"]));
-  card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [
-    "Verbinde dich mit Strava, um FTP-Verlauf, Formkurve und dein Leistungsprofil aus deinen Fahrten zu sehen."
-  ]));
-  const btn = el("button", {class:"btn", style:"width:100%;", onclick: ()=>{ window.location.href = buildAuthUrl(); }}, [state.loading.connect ? "Verbinde…" : "Mit Strava einloggen →"]);
-  if(state.loading.connect) btn.disabled = true;
-  card.appendChild(btn);
-  return card;
-}
-
 function renderProfilLoadPromptCard(){
   const pp = state.profilPage;
-  const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Profil"]));
+  const card = pageTitleCard("Profil");
   card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [
     `Analysiert deine letzten Fahrten: FTP-Verlauf & Prognose, Formkurve (Fitness/Ermüdung/Form) und dein Leistungsprofil. Lädt Leistungsdaten (Watt/Puls/Höhe) für bis zu ${pp.rideBudget} Fahrten direkt von Strava — je nach Anzahl kann das eine Weile dauern.`
   ]));
@@ -5389,16 +5376,14 @@ function renderProfilLoadPromptCard(){
 }
 
 function renderProfilLoadingCard(){
-  const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Profil"]));
+  const card = pageTitleCard("Profil");
   const label = (state.profilPage.progress && state.profilPage.progress.label) || "Lade Trainingsdaten…";
   card.appendChild(el("div", {class:"loading"}, [label]));
   return card;
 }
 
 function renderProfilErrorCard(){
-  const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Profil"]));
+  const card = pageTitleCard("Profil");
   card.appendChild(el("div", {class:"error", style:"margin-bottom:14px;"}, [state.profilPage.error]));
   card.appendChild(el("button", {class:"btn secondary", onclick: ()=>loadProfilData(state.accessToken)}, ["Erneut versuchen"]));
   return card;
@@ -5406,8 +5391,7 @@ function renderProfilErrorCard(){
 
 function renderProfilEmptyCard(){
   const pp = state.profilPage;
-  const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Profil"]));
+  const card = pageTitleCard("Profil");
   const detail = pp.stats ? `${pp.stats.candidates} Fahrten geprüft, ${pp.stats.skippedNoWatts} ohne Leistungsmesser, ${pp.stats.skippedNoBestEffort} ohne ausreichend lange Bestleistung.` : "";
   card.appendChild(el("div", {class:"empty-state"}, [
     "Keine auswertbaren Fahrten mit Leistungsdaten gefunden. " + detail
@@ -5705,7 +5689,7 @@ function renderProfilKernSection(frag){
 function renderProfilPage(){
   const frag = document.createDocumentFragment();
   if(!state.connected){
-    frag.appendChild(renderProfilConnectCard());
+    frag.appendChild(renderStravaConnectCard("Profil", "Verbinde dich mit Strava, um FTP-Verlauf, Formkurve und dein Leistungsprofil aus deinen Fahrten zu sehen."));
     return frag;
   }
   const pp = state.profilPage;
@@ -5936,37 +5920,22 @@ function mountAktivitaetenChart(){
 }
 
 // ---------- Aktivitäten: page ----------
-function renderAktivitaetenConnectCard(){
-  const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Aktivitäten"]));
-  card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [
-    "Verbinde dich mit Strava, um deine Aktivitäten zu durchstöbern - mit Distanz, Höhenmetern, Leistung/Puls und Detailansicht je Fahrt."
-  ]));
-  const btn = el("button", {class:"btn", style:"width:100%;", onclick: ()=>{ window.location.href = buildAuthUrl(); }}, [state.loading.connect ? "Verbinde…" : "Mit Strava einloggen →"]);
-  if(state.loading.connect) btn.disabled = true;
-  card.appendChild(btn);
-  return card;
-}
-
 function renderAktivitaetenLoadingCard(){
-  const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Aktivitäten"]));
+  const card = pageTitleCard("Aktivitäten");
   card.appendChild(el("div", {class:"loading"}, ["Lade Aktivitäten…"]));
   return card;
 }
 
 function renderAktivitaetenErrorCard(){
   const ap = state.aktivitaetenPage;
-  const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Aktivitäten"]));
+  const card = pageTitleCard("Aktivitäten");
   card.appendChild(el("div", {class:"error", style:"margin-bottom:14px;"}, [ap.error]));
   card.appendChild(el("button", {class:"btn secondary", onclick: ()=>{ ap.loading = true; render(); loadAktivitaetenList(state.accessToken, {more:false}); }}, ["Erneut versuchen"]));
   return card;
 }
 
 function renderAktivitaetenEmptyCard(){
-  const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Aktivitäten"]));
+  const card = pageTitleCard("Aktivitäten");
   card.appendChild(el("div", {class:"empty-state"}, ["Keine Aktivitäten auf Strava gefunden."]));
   return card;
 }
@@ -6106,7 +6075,7 @@ function renderAktivitaetenDetail(a){
 function renderAktivitaetenPage(){
   const frag = document.createDocumentFragment();
   if(!state.connected){
-    frag.appendChild(renderAktivitaetenConnectCard());
+    frag.appendChild(renderStravaConnectCard("Aktivitäten", "Verbinde dich mit Strava, um deine Aktivitäten zu durchstöbern - mit Distanz, Höhenmetern, Leistung/Puls und Detailansicht je Fahrt."));
     return frag;
   }
   const ap = state.aktivitaetenPage;
@@ -9431,15 +9400,7 @@ function renderTrainerAblaufCard(tp, ctx){
 function renderTrainerPage(){
   const frag = document.createDocumentFragment();
   if(!state.connected){
-    const card = el('div', {class:'card'});
-    card.appendChild(el('h2', {}, ['Trainer']));
-    card.appendChild(el('div', {class:'muted', style:'margin-bottom:14px;'}, [
-      'Verbinde dich mit Strava, um Trainingsziele, Workout-Vorschläge und Export nach .FIT/.ZWO zu nutzen.'
-    ]));
-    const btn = el('button', {class:'btn', style:'width:100%;', onclick: ()=>{ window.location.href = buildAuthUrl(); }}, [state.loading.connect ? 'Verbinde…' : 'Mit Strava einloggen →']);
-    if(state.loading.connect) btn.disabled = true;
-    card.appendChild(btn);
-    frag.appendChild(card);
+    frag.appendChild(renderStravaConnectCard('Trainer', 'Verbinde dich mit Strava, um Trainingsziele, Workout-Vorschläge und Export nach .FIT/.ZWO zu nutzen.'));
     return frag;
   }
 
