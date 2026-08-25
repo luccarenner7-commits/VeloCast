@@ -827,6 +827,12 @@ let state = {
       metrics: null // computeStreamMetrics() output + maxWatts, only set when the stream has watts
     }
   },
+  // Persisted rider preference, same category as avgSpeedKmh/trainerGoal —
+  // whether the Trainer tab computes zones/workout targets/training load from
+  // a power meter (FTP) or from a heart-rate strap alone (LTHR). Defaults to
+  // 'power' whenever not set in savedSettings, so every existing power-meter
+  // user's behavior is byte-for-byte unchanged (see saveSettings() below).
+  equipmentMode: (savedSettings.equipmentMode==='hr') ? 'hr' : 'power',
   // ---- Trainer page (goal/workout generation, route attachment, exports) ----
   // Own bucket, same rationale as profilPage/aktivitaetenPage above. Reads
   // profilPage.results/riderProfile/weak/trainingLoad rather than fetching
@@ -847,7 +853,27 @@ let state = {
     evalLoading: false,
     evalError: null,
     evalResult: null, // evaluateWorkout() output, or null
-    lastWorkout: null // {steps, ftp, routeBased} for the deferred mountTrainerChart() call after render
+    lastWorkout: null, // {steps, rp, routeBased} for the deferred mountTrainerChart() call after render
+    // HF-only LTHR auto-estimation pipeline (see loadHrLthrEstimate() near
+    // trainerRiderContext()) — the full network fetch only ever runs lazily,
+    // on first switch to equipmentMode==='hr' without an existing manual
+    // override, or via the explicit "Automatisch schätzen" button in
+    // Einstellungen. trainerRiderContext() itself may still populate
+    // `estimate`/`source` synchronously from the on-disk cache
+    // (syncCachedHrLthrEstimate()) so a reload doesn't re-block the gate —
+    // that path only runs when equipmentMode==='hr', so power users still
+    // see zero change here.
+    hrProfile: { loading:false, loaded:false, error:null, estimate:null, source:null },
+    // Additive blended training-load ingestion for HF-only users (see
+    // buildBlendedTrainingLoad()/loadBlendedTrainingLoad() near
+    // trainerRiderContext()) -- `activities` holds the raw per-ride summary
+    // fields (id/date/moving_time/device_watts/weighted_average_watts/
+    // average_heartrate) needed to recompute CTL/ATL on every render; the
+    // derived numbers themselves are never cached here since ftp/lthr can
+    // change independently of this data. Same lazy-trigger story as
+    // hrProfile above -- only runs in equipmentMode==='hr', so power users
+    // see zero change.
+    blendedLoad: { loading:false, loaded:false, error:null, activities:null, fetchedAt:0 }
   }
 };
 
@@ -1663,7 +1689,8 @@ function saveSettings(){
       // back into a {[id]: true} object on load — see state.
       // irrelevantSegmentIds' declaration above.
       irrelevantSegmentIds: Object.keys(state.irrelevantSegmentIds),
-      trainerGoal: state.trainerPage.goal
+      trainerGoal: state.trainerPage.goal,
+      equipmentMode: state.equipmentMode
     }));
   }catch(e){}
 }
@@ -1855,6 +1882,23 @@ async function fetchActivityPowerStreams(id, token){
   });
   if(!res.ok){
     const err = new Error("Leistungsdaten nicht verfügbar (" + res.status + ")");
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+// Light twin of fetchActivityPowerStreams() above, for HF-only riders — only
+// time+heartrate, used by loadHrLthrEstimate()'s LTHR auto-estimation
+// pipeline (see near trainerRiderContext()). No watts/altitude/distance
+// needed there, so this stays a separate, cheaper request rather than
+// reusing the power-streams call and discarding most of the response.
+async function fetchActivityHrStream(id, token){
+  const res = await fetch(`https://www.strava.com/api/v3/activities/${id}/streams?keys=time,heartrate&key_by_type=true`, {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok){
+    const err = new Error("Herzfrequenzdaten nicht verfügbar (" + res.status + ")");
     err.status = res.status;
     throw err;
   }
@@ -2085,6 +2129,69 @@ function estimateFtpFromMmp(mmp){
     basis: candidates.length>1
       ? `${fmtDurLabel(best.sec)} (max von ${candidates.map(c=>fmtDurLabel(c.sec)).join('/')})`
       : `${fmtDurLabel(best.sec)} (einziger Wert)`
+  };
+}
+
+// ---------- Trainer: HF-only LTHR-Schätzung (Mean-Maximal-HF) ----------
+// Mean-maximal-HF ladder computed straight from a stream — same technique as
+// computeMmpFromStream() above, just walked over stream.heartrate instead of
+// stream.watts. Feeds estimateLthrFromHrCurve() below.
+function computeHrMmpFromStream(stream){
+  const time = stream.time, hr = stream.heartrate;
+  if(!Array.isArray(time) || !Array.isArray(hr) || time.length < 5) return null;
+  const n = time.length;
+  const avgDt = (time[n-1]-time[0])/(n-1);
+  if(!avgDt || avgDt <= 0) return null;
+  const mmp = {};
+  MMP_DURATIONS_SEC.forEach(sec => {
+    const windowSamples = Math.max(1, Math.round(sec/avgDt));
+    if(windowSamples > n) return;
+    const avg = bestWindowAvg(hr, windowSamples, 0, n);
+    if(avg != null) mmp[sec] = avg;
+  });
+  return Object.keys(mmp).length ? mmp : null;
+}
+
+// Friel's LTHR field-test protocol: a 20-30-minute hard, steady effort's raw
+// average HR *is* the LTHR estimate — no discount factor. This is a
+// deliberate, load-bearing difference from estimateFtpFromMmp()'s
+// FTP_FACTORS (0.95/0.89/0.80): power output can spike well above what's
+// sustainable for the full test duration (hence FTP needing a haircut off a
+// shorter best effort), but heart rate does not overshoot the same way — it
+// converges toward threshold over the course of the effort rather than
+// spiking early. Do NOT copy the FTP_FACTORS discount pattern here; that
+// would systematically under-estimate LTHR.
+const LTHR_ESTIMATION_WINDOWS_SEC = [
+  { sec:1800, confidence:'hoch' },   // 30-min test
+  { sec:1200, confidence:'mittel' }, // 20-min test (shorter, thus lower confidence)
+];
+// maxHr (optional): the ride's own observed max heart rate (a.max_heartrate),
+// used as a plausibility ceiling on top of the hard sanity range below — a
+// 20/30-min average can never exceed the ride's own peak (it's a mean over a
+// window that includes non-peak samples), so a plain "> maxHr" check is
+// mathematically unreachable and would silently no-op. Instead this requires
+// meaningful separation from the peak: a genuine threshold effort should sit
+// noticeably below the ride's short-term max, so an estimate that creeps
+// above 98% of maxHr is more likely a sensor artifact (e.g. a chest-strap
+// dropout spike dragging the whole window up) than a real LTHR.
+function estimateLthrFromHrCurve(hrMmpCurve, maxHr){
+  if(!hrMmpCurve) return null;
+  // Ordered longest-first above, so the first hit is the longest available
+  // window — no discount applied, see the block comment above.
+  const win = LTHR_ESTIMATION_WINDOWS_SEC.find(w => hrMmpCurve[w.sec] != null);
+  if(!win) return null;
+  const lthr = Math.round(hrMmpCurve[win.sec]);
+  // Hard physiological sanity range — mirrors the intent of
+  // checkEffortPlausibility() used for FTP estimation above, just without a
+  // zones-based floor since Strava doesn't expose a comparable HR-zone table
+  // here. This must always apply, regardless of whether maxHr is available.
+  if(lthr < 100 || lthr > 210) return null;
+  // 30-min-Schnitt sollte spürbar unter dem Fahrt-Maximum liegen; sonst
+  // Hinweis auf Sensor-Artefakt/Dropout statt eines echten Schwellenwerts.
+  if(maxHr != null && lthr > maxHr * 0.98) return null;
+  return {
+    lthr, sec: win.sec, confidence: win.confidence,
+    basis: `${fmtDurLabel(win.sec)}-Fenster`
   };
 }
 
@@ -2932,10 +3039,13 @@ function resetConnectionState(){
   state.aktivitaetenPage.hasMore = true;
   state.aktivitaetenPage.selectedId = null;
   state.aktivitaetenPage.detail = { id:null, loading:false, error:null, notAvailable:false, stream:null, metrics:null };
-  // Trainer page: only transient/session UI state is reset here — it never
-  // held any token-derived fetched data of its own to begin with (see
-  // trainerPage's declaration). `goal`/`exportDistanceMode` are rider
-  // preferences, not tied to the connection, so they survive a reconnect.
+  // Trainer page: mostly transient/session UI state, reset here.
+  // `goal`/`exportDistanceMode` are rider preferences, not tied to the
+  // connection, so they survive a reconnect. `hrProfile` IS token-derived
+  // (an LTHR estimate built from this account's activity streams — see
+  // loadHrLthrEstimate()) and must be reset too: without this, a
+  // disconnect + reconnect as a different Strava account would keep the
+  // previous account's LTHR estimate alive in state and feeding rp.lthr.
   state.trainerPage.selectedClassKey = null;
   state.trainerPage.workoutPreviewOpen = false;
   state.trainerPage.routeError = null;
@@ -2946,6 +3056,19 @@ function resetConnectionState(){
   state.trainerPage.evalError = null;
   state.trainerPage.evalResult = null;
   state.trainerPage.lastWorkout = null;
+  state.trainerPage.hrProfile = { loading:false, loaded:false, error:null, estimate:null, source:null };
+  // The in-memory reset above isn't enough on its own: syncCachedHrLthrEstimate()
+  // reads velocast_hr_profile_cache directly and would immediately repopulate
+  // hrProfile.estimate from the previous account's cached rides otherwise.
+  clearHrProfileCache();
+  clearHrProfileSkipCache();
+  // Same cross-account leak risk as hrProfile above, for the blended
+  // CTL/ATL/ACWR load series: without clearing the cache + fetched-at
+  // stamp too, a reconnect as a different account would keep serving the
+  // previous account's training load for up to BLENDED_LOAD_REFRESH_MS.
+  state.trainerPage.blendedLoad = { loading:false, loaded:false, error:null, activities:null, fetchedAt:0 };
+  clearBlendedLoadCache();
+  clearBlendedLoadFetchedAt();
   // A fetch failure from while the user was still connected (e.g.
   // loadActivitiesAndSegments()'s catch) would otherwise survive logout and
   // render as a stale error banner on the very next-shown connect screen.
@@ -5867,6 +5990,33 @@ const ZONES = [
 ];
 function zoneFor(pct){ return ZONES.find(z=>pct<=z.max) || ZONES[ZONES.length-1]; }
 
+// TrainingPeaks/Friel 7-zone %LTHR ladder — the HF analog of ZONES above,
+// used once equipmentMode==='hr'. Boundaries are Joe Friel's published %LTHR
+// zone system (The Cyclist's Training Bible; also reproduced in
+// TrainingPeaks' own zone documentation) — like ZONES, these are fixed,
+// published thresholds and not exposed in the Einstellungen tab.
+const LTHR_ZONES = [
+  { max:0.81, name:'Aktive Erholung (Z1)',     color: POWER_ZONE_META[0].color },
+  { max:0.89, name:'Ausdauer (Z2)',            color: POWER_ZONE_META[1].color },
+  { max:0.93, name:'Tempo (Z3)',               color: POWER_ZONE_META[2].color },
+  { max:0.99, name:'Sub-Schwelle (Z4)',        color: POWER_ZONE_META[3].color },
+  { max:1.02, name:'Supra-Schwelle (Z5a)',     color: POWER_ZONE_META[4].color },
+  { max:1.06, name:'Aerobe Kapazität (Z5b)',   color: POWER_ZONE_META[5].color },
+  { max:99,   name:'Anaerobe Kapazität (Z5c)', color: POWER_ZONE_META[6].color },
+];
+function lthrZoneFor(pct){ return LTHR_ZONES.find(z=>pct<=z.max) || LTHR_ZONES[LTHR_ZONES.length-1]; }
+
+// Central resolver for every display-only call site below: `pct` is always
+// "% of the active threshold metric" (FTP or LTHR) regardless of
+// equipmentMode — these two functions are the only place that decides which
+// metric that means. Consumed by buildRouteWorkoutChart(), drawStepPowerChart()
+// and renderTrainerAblaufCard(). Generation/evaluation/export call sites
+// (workoutMetrics, evaluateWorkout, buildFit, buildZwo, generateTimeBasedWorkout,
+// buildIntervalSpec, ...) still don't use these helpers — they inline the
+// `usingHr ? rp.lthr : rp.ftp` branch themselves instead.
+function stepTargetValue(pct, rp){ return rp.usingHr ? pct*rp.lthr : pct*rp.ftp; }
+function stepZoneFor(pct, rp){ return rp.usingHr ? lthrZoneFor(pct) : zoneFor(pct); }
+
 // Top-bar goal selector — the classic 5-way manual pick (plus "auto"). Tempo
 // and Sprint are only ever reached through the "Workout wählen" class picker
 // below, not this dropdown, matching the Artifact's own GOALS scope.
@@ -5957,6 +6107,28 @@ const TRAINING_CONFIG = {
     anaerobic:    { min:1.35, max:1.75 },
     sprint:       { min:1.40, max:2.20 },
     longdistance: { min:0.55, max:0.75 },
+  },
+  // HF-only rider settings, edited via the "Leistungsmesser oder
+  // Herzfrequenz"-card in Einstellungen (see buildLthrOverrideRow()).
+  rider: {
+    lthrOverride: null, // bpm, null = Auto-Schätzung (loadHrLthrEstimate()) nutzen
+  },
+  // %LTHR-Äquivalent von targetRangePct above, für equipmentMode==='hr'.
+  // Grenzwerte selbst (Friel 7-Zonen-%LTHR-System, siehe LTHR_ZONES) sind
+  // publiziert; die Zuordnung der 8 VeloCast-Trainingsklassen auf diese Zonen
+  // ist dagegen eine eigene Ableitung an targetRangePct ausgerichtet -- keine
+  // kanonische Quelle mappt die App-eigenen Klassen 1:1 auf Friel-Zonen.
+  // Wird von classTargetRange() gelesen (usingHr-Zweig), das wiederum die
+  // Ziel-Range fürs HF-Rationale/Compliance-UI liefert.
+  targetRangePctLthr: {
+    recovery:     { min:0.60, max:0.80 },
+    endurance:    { min:0.81, max:0.89 },
+    tempo:        { min:0.90, max:0.96 },
+    threshold:    { min:0.94, max:1.02 },
+    vo2max:       { min:1.03, max:1.06 },  // Backing-Wert, Live-Ziel ist RPE
+    anaerobic:    { min:1.06, max:1.20 },  // Backing-Wert, Live-Ziel ist RPE
+    sprint:       { min:1.06, max:1.20 },  // Backing-Wert, Live-Ziel ist RPE
+    longdistance: { min:0.81, max:0.89 },
   },
 };
 
@@ -6156,21 +6328,579 @@ function computeOpportunityForClass(decisionState, route, classKey, config, rp, 
 // "relative effort" score — VeloCast never fetches relative_effort, and this
 // ratio answers the same "how loaded now vs. your longer-term average"
 // question using the TSS-based load model Phase 1 already built.
+// ---------- Trainer: HF-only LTHR-Schätzung (Ingestion-Pipeline) ----------
+// processProfilRide()/loadProfilData() (see Profil pipeline further up)
+// reject any ride without a watts stream before ever fetching one, so
+// HF-only rides never reach the Profil page's analysis at all. Since Profil
+// stays power-only by design (see plan), this is a separate, Trainer-owned
+// ingestion that mirrors that pipeline's shape (pagination budget, cache +
+// skip-cache, bounded concurrency) but walks HR streams instead of power
+// streams. Populates state.trainerPage.hrProfile — see loadHrLthrEstimate().
+
+// Mirrors PROFIL_ACTIVITY_CACHE_KEY/PROFIL_SKIP_CACHE_KEY, but under its own
+// key so this pipeline's reload behavior can never affect (or be affected
+// by) the Profil page's own cache.
+const HR_PROFILE_CACHE_KEY = "velocast_hr_profile_cache";
+const HR_PROFILE_CACHE_MAX = 400;
+function loadHrProfileCache(){
+  try{
+    const raw = localStorage.getItem(HR_PROFILE_CACHE_KEY);
+    if(!raw) return {};
+    const parsed = JSON.parse(raw);
+    if(!parsed || typeof parsed !== "object") return {};
+    const out = {};
+    Object.entries(parsed).forEach(([id, row]) => {
+      if(!row || typeof row !== "object" || !row.date || !row.id) return;
+      const d = new Date(row.date);
+      if(isNaN(d.getTime())) return;
+      out[String(id)] = { ...row, id: String(row.id), date: d };
+    });
+    return out;
+  }catch(e){ return {}; }
+}
+function saveHrProfileCache(cacheObj){
+  const attempt = (cap) => {
+    const entries = Object.values(cacheObj).sort((a,b)=>b.date-a.date).slice(0, cap);
+    const trimmed = {};
+    entries.forEach(r => { trimmed[r.id] = r; });
+    localStorage.setItem(HR_PROFILE_CACHE_KEY, JSON.stringify(trimmed));
+  };
+  try{ attempt(HR_PROFILE_CACHE_MAX); }
+  catch(e){ try{ attempt(150); }catch(e2){ /* cache is a speed optimization, not required */ } }
+}
+function clearHrProfileCache(){ try{ localStorage.removeItem(HR_PROFILE_CACHE_KEY); }catch(e){} }
+
+const HR_PROFILE_SKIP_CACHE_KEY = "velocast_hr_profile_skip_cache";
+const HR_PROFILE_SKIP_CACHE_MAX = 800;
+const HR_PROFILE_SKIP_STATUSES = new Set(["noHr","noBestEffort"]);
+function loadHrProfileSkipCache(){
+  try{
+    const raw = localStorage.getItem(HR_PROFILE_SKIP_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    if(!parsed || typeof parsed !== "object") return {};
+    const out = {};
+    Object.entries(parsed).forEach(([id, v]) => {
+      if(!v || typeof v !== "object" || !HR_PROFILE_SKIP_STATUSES.has(v.status)) return;
+      const d = v.date ? new Date(v.date) : new Date(0);
+      out[String(id)] = { status:v.status, date: isNaN(d.getTime()) ? new Date(0) : d };
+    });
+    return out;
+  }catch(e){ return {}; }
+}
+function saveHrProfileSkipCache(cacheObj){
+  const attempt = (cap) => {
+    const entries = Object.entries(cacheObj).sort((a,b)=>b[1].date-a[1].date).slice(0, cap);
+    const trimmed = {};
+    entries.forEach(([id,v]) => { const dt = (v.date instanceof Date && !isNaN(v.date.getTime())) ? v.date : new Date(0); trimmed[id] = { status:v.status, date:dt.toISOString() }; });
+    localStorage.setItem(HR_PROFILE_SKIP_CACHE_KEY, JSON.stringify(trimmed));
+  };
+  try{ attempt(HR_PROFILE_SKIP_CACHE_MAX); }
+  catch(e){ try{ attempt(200); }catch(e2){} }
+}
+function clearHrProfileSkipCache(){ try{ localStorage.removeItem(HR_PROFILE_SKIP_CACHE_KEY); }catch(e){} }
+
+// How many recent qualifying rides to consider — fixed budget, no "Mehr
+// laden" UI for this pipeline in this phase (unlike pp.rideBudget); a single
+// LTHR estimate needs far fewer samples than an FTP trend does.
+const HR_PROFILE_RIDE_BUDGET = 60;
+
+async function processHrProfileRide(a, token){
+  const id = String(a.id);
+  let raw;
+  try{ raw = await fetchActivityHrStream(id, token); }
+  catch(e){ return { status:'apiError' }; }
+  const stream = normalizeStreams(raw);
+  if(!stream.time || !stream.heartrate || stream.time.length < 30) return { status:'noBestEffort' };
+  const mmp = computeHrMmpFromStream(stream);
+  const est = mmp ? estimateLthrFromHrCurve(mmp, a.max_heartrate!=null ? a.max_heartrate : null) : null;
+  if(!est) return { status:'noBestEffort' };
+  return { status:'ok', row: {
+    id, date: new Date(a.start_date_local || a.start_date),
+    lthr: est.lthr, sec: est.sec, confidence: est.confidence, basis: est.basis
+  }};
+}
+
+// Orchestrates the HF-only LTHR estimate: paginates /athlete/activities up
+// to HR_PROFILE_RIDE_BUDGET qualifying rides (mirrors loadProfilData()'s
+// device_watts filter, just on average_heartrate instead), skips anything
+// already known from cache/skip-cache for free, fetches HR streams for
+// genuinely new candidates in small concurrent batches, and picks the single
+// best estimate (highest-confidence window wins; ties broken by the higher
+// bpm value). Deliberately NOT a 42-day-ceiling regression like FTP's
+// currentCeiling — LTHR is a physiological ceiling that doesn't trend across
+// a season the way FTP does, so one best test-effort is the right model.
+//
+// Lazy by design: only ever called from the equipmentMode toggle (on first
+// switch to 'hr' without an existing override/loaded estimate) or the
+// explicit "Automatisch schätzen" button in Einstellungen — never from the
+// normal Trainer-tab render path, so it can't block or regress it.
+//
+// opts.forceRefresh: clears both the estimate cache and the skip cache first,
+// so a ride once skipped as noBestEffort/noHr (e.g. before a HR sensor issue
+// was fixed, or before the plausibility check above existed) gets a genuine
+// re-check instead of staying permanently skipped. Without this, clearHrProfileCache()/
+// clearHrProfileSkipCache() had no caller at all.
+async function loadHrLthrEstimate(token, opts){
+  opts = opts || {};
+  const tp = state.trainerPage;
+  if(tp.hrProfile.loading) return;
+  if(!token){ tp.hrProfile.error = "Bitte zuerst mit Strava verbinden."; render(); return; }
+  if(opts.forceRefresh){ clearHrProfileCache(); clearHrProfileSkipCache(); }
+  tp.hrProfile.loading = true; tp.hrProfile.error = null;
+  render();
+  try{
+    const cache = loadHrProfileCache();
+    const skipCache = loadHrProfileSkipCache();
+
+    let candidates = [];
+    let page = 1;
+    const perPage = 100;
+    while(candidates.length < HR_PROFILE_RIDE_BUDGET && page <= 10){
+      const batch = await fetchActivitiesPage(token, page, perPage);
+      if(!batch || !batch.length) break;
+      candidates = candidates.concat(batch.filter(a => RIDE_SPORT_TYPES.has(a.sport_type || a.type)));
+      if(batch.length < perPage) break;
+      page++;
+    }
+    candidates = candidates.slice(0, HR_PROFILE_RIDE_BUDGET);
+
+    const cachedRows = [], toFetch = [];
+    candidates.forEach(a => {
+      const id = String(a.id);
+      const hit = cache[id];
+      if(hit){ cachedRows.push(hit); return; }
+      const skip = skipCache[id];
+      if(skip) return;
+      if(a.average_heartrate == null){
+        skipCache[id] = { status:'noHr', date: new Date(a.start_date_local || a.start_date) };
+        return;
+      }
+      toFetch.push(a);
+    });
+
+    const freshRows = [];
+    const concurrency = 4;
+    for(let i=0;i<toFetch.length;i+=concurrency){
+      const batch = toFetch.slice(i, i+concurrency);
+      const results = await Promise.all(batch.map(a => processHrProfileRide(a, token)));
+      results.forEach((r, idx) => {
+        const a = batch[idx];
+        const id = String(a.id);
+        if(r.status === 'ok'){ cache[id] = r.row; freshRows.push(r.row); }
+        else if(r.status === 'noBestEffort'){ skipCache[id] = { status:'noBestEffort', date: new Date(a.start_date_local || a.start_date) }; }
+        // apiError: neither cached nor skip-cached, so it's retried next run
+      });
+      if(i+concurrency < toFetch.length) await new Promise(r=>setTimeout(r,150));
+    }
+    saveHrProfileCache(cache);
+    saveHrProfileSkipCache(skipCache);
+
+    const allRows = cachedRows.concat(freshRows);
+    const best = allRows.reduce((a,b) => {
+      if(!a) return b;
+      if(CONFIDENCE_WEIGHT[b.confidence] !== CONFIDENCE_WEIGHT[a.confidence]) return CONFIDENCE_WEIGHT[b.confidence] > CONFIDENCE_WEIGHT[a.confidence] ? b : a;
+      return b.lthr > a.lthr ? b : a;
+    }, null);
+
+    tp.hrProfile.estimate = best ? best.lthr : null;
+    tp.hrProfile.source = best ? `aus deinen Fahrten geschätzt (${best.basis}, ${best.confidence}e Zuversicht)` : null;
+    if(!best) tp.hrProfile.error = "Keine geeigneten Fahrten mit Herzfrequenzdaten gefunden.";
+  }catch(e){
+    tp.hrProfile.error = e.message || "HF-Schwelle konnte nicht geschätzt werden.";
+  }
+  tp.hrProfile.loading = false; tp.hrProfile.loaded = true;
+  render();
+}
+
+// Cheap, synchronous cache-only fallback for loadHrLthrEstimate() above: on a
+// fresh page load state.trainerPage.hrProfile.estimate starts back at null —
+// it's in-memory only, never persisted itself — so a user already restored
+// into equipmentMode==='hr' from savedSettings would otherwise hit the
+// "kein HF-Schwellenwert verfügbar" empty state on every reload until they
+// manually click "Automatisch schätzen" again, even though their estimate is
+// sitting right there in velocast_hr_profile_cache from last time. This reads
+// that cache (no network, no fetchActivitiesPage) and picks the same "best"
+// row loadHrLthrEstimate() would land on (highest confidence, ties broken by
+// the higher bpm value). Called lazily from trainerRiderContext() below so it
+// costs nothing on the power-only path and never blocks the normal render.
+function syncCachedHrLthrEstimate(){
+  const cache = loadHrProfileCache();
+  const best = Object.values(cache).reduce((a,b) => {
+    if(!a) return b;
+    if(CONFIDENCE_WEIGHT[b.confidence] !== CONFIDENCE_WEIGHT[a.confidence]) return CONFIDENCE_WEIGHT[b.confidence] > CONFIDENCE_WEIGHT[a.confidence] ? b : a;
+    return b.lthr > a.lthr ? b : a;
+  }, null);
+  if(!best) return;
+  const tp = state.trainerPage;
+  tp.hrProfile.estimate = best.lthr;
+  tp.hrProfile.source = `aus deinen Fahrten geschätzt (${best.basis}, ${best.confidence}e Zuversicht)`;
+}
+
+// ---------- Trainer: blended training-load model for HF-only users ----------
+// buildTrainingLoad() (~2393) only ever sees pp.results, which is Profil's
+// own power-meter-only pipeline (device_watts filtered before a stream is
+// even fetched) -- HF-only riders always get pp.trainingLoad === null there,
+// silencing acwr/freshness/forceEasy entirely (see plan §7). This is a
+// separate, additive per-day TSS series built straight from the raw Strava
+// activity list instead of pp.results, so HF-only rides are captured too.
+//
+// Per ride: prefer a watt-based TSS when the ride has power data (mirrors
+// buildTrainingLoad()'s own NP/FTP formula exactly, just sourced from the
+// activity summary's own weighted_average_watts -- Strava's own NP-equivalent
+// computed at upload time -- instead of a stream-derived NP, so this needs NO
+// stream fetch at all: every field it reads already sits on the plain
+// /athlete/activities list response). Otherwise, if average_heartrate and a
+// resolved LTHR are available, fall back to the same simplified hrTSS formula
+// used by workoutMetrics()'s HR branch (~6593, plan §6): IF_HR = avgHR/LTHR,
+// hrTSS = hours × IF_HR² × 100. A ride with neither is skipped (no TSS that
+// day), same as buildTrainingLoad() implicitly skipping rides with no NP.
+//
+// Independent of the currently active equipmentMode -- this answers "what
+// actually happened", not "what is the current target" -- so a power-meter
+// ride still contributes a watt-based TSS day even while the rider is
+// currently in HR mode, and vice versa.
+function buildBlendedTrainingLoad(activities, ftp, lthr){
+  const daily = new Map();
+  let earliest = null;
+  (activities||[]).forEach(a => {
+    const sec = a.moving_time || 0;
+    if(sec <= 0) return;
+    let tss = null;
+    if(a.device_watts && a.weighted_average_watts && ftp){
+      const np = a.weighted_average_watts, intensity = np/ftp;
+      tss = (sec*np*intensity)/(ftp*3600)*100;
+    } else if(a.average_heartrate != null && lthr){
+      const ifHr = a.average_heartrate/lthr, hours = sec/3600;
+      tss = hours*ifHr*ifHr*100;
+    }
+    if(tss == null || !isFinite(tss)) return;
+    const d = new Date(a.date);
+    if(isNaN(d.getTime())) return;
+    const key = localDateKey(d);
+    daily.set(key, (daily.get(key)||0) + tss);
+    if(!earliest || d < earliest) earliest = d;
+  });
+  if(!earliest) return null;
+
+  // Identical EWMA procedure to buildTrainingLoad() (~2393) -- 42-day/7-day
+  // time constants -- just fed by the blended daily TSS above instead of
+  // pp.results' NP-based TSS. formVerdict/rampWeekly are reproduced 1:1 from
+  // buildTrainingLoad() too (renderTrainerSummaryCards reads them for the
+  // Fitness/Ermüdung/Form cards regardless of equipmentMode) so an HR-only
+  // rider gets the same cards filled in, not a permanent "–".
+  const start = new Date(earliest); start.setHours(0,0,0,0);
+  const end = new Date(); end.setHours(0,0,0,0);
+  const series = [];
+  let ctl=0, atl=0;
+  for(let d=new Date(start); d<=end; d.setDate(d.getDate()+1)){
+    const key = localDateKey(d);
+    const tss = daily.get(key)||0;
+    ctl = ctl + (tss-ctl)/42;
+    atl = atl + (tss-atl)/7;
+    series.push({ date:new Date(d), tss, ctl, atl, tsb: ctl-atl });
+  }
+  const last = series[series.length-1];
+  const rampWeekly = series.length>7 ? last.ctl - series[Math.max(0,series.length-8)].ctl : 0;
+
+  let formVerdict, formClass, formWhy;
+  const tsb = last ? last.tsb : 0;
+  if(tsb > 15){ formVerdict='Sehr frisch / Formspitze'; formClass='good';
+    formWhy=`Dein TSB liegt bei ${tsb.toFixed(0)}. Das ist Wettkampf-Frische — gut für einen Test oder ein Rennen, auf Dauer aber ein Zeichen für zu wenig Reiz.`; }
+  else if(tsb > 5){ formVerdict='Erholt'; formClass='good';
+    formWhy=`TSB ${tsb.toFixed(0)}: du bist ausgeruht und aufnahmefähig für harte Einheiten.`; }
+  else if(tsb > -10){ formVerdict='Produktiv'; formClass='good';
+    formWhy=`TSB ${tsb.toFixed(0)}: der Bereich, in dem Anpassung passiert, ohne dass Ermüdung überhandnimmt.`; }
+  else if(tsb > -30){ formVerdict='Deutlich belastet'; formClass='warn';
+    formWhy=`TSB ${tsb.toFixed(0)}: hoher Trainingsreiz. Kurzfristig produktiv, braucht aber bald Entlastung.`; }
+  else { formVerdict='Überlastet'; formClass='danger';
+    formWhy=`TSB ${tsb.toFixed(0)}: sehr tief. Das Risiko, dass Ermüdung die Anpassung auffrisst, ist hoch.`; }
+
+  return { series, last, rampWeekly, formVerdict, formClass, formWhy,
+    ctl: last?last.ctl:0, atl: last?last.atl:0, tsb };
+}
+
+// Mirrors HR_PROFILE_CACHE_KEY's shape/rationale, under its own key. Caches
+// the RAW per-ride summary fields buildBlendedTrainingLoad() needs -- NOT the
+// derived CTL/ATL numbers -- since ftp/lthr can change (manual LTHR edited, a
+// fresh estimate lands) without invalidating anything cached here; the blend
+// is a cheap pure recompute over these rows on every trainerRiderContext() call.
+const BLENDED_LOAD_CACHE_KEY = "velocast_blended_load_cache";
+const BLENDED_LOAD_CACHE_MAX = 400;
+// Same default as pp.rideBudget (~788) and HR_PROFILE_RIDE_BUDGET above --
+// no separate "Mehr laden" UI for this pipeline in this phase either.
+const BLENDED_LOAD_RIDE_BUDGET = 60;
+// Separate key (not bundled into the ride cache) for the last fetch-ATTEMPT
+// timestamp -- deliberately NOT the newest ride's date. Gating staleness on
+// the newest cached ride's date re-triggers a fetch on every render whenever
+// the rider hasn't ridden in >1 day (any rest day), or the fetch itself keeps
+// failing, or the account has zero rides -- none of those make a fresh fetch
+// any more likely to find newer data, so that version loops: render -> stale
+// -> fetch -> render -> stale -> fetch -> ... Gating on "did we already TRY
+// recently" instead bounds retries to once per BLENDED_LOAD_REFRESH_MS
+// regardless of outcome, fixing the loop while still refreshing periodically.
+const BLENDED_LOAD_FETCHED_AT_KEY = "velocast_blended_load_fetched_at";
+const BLENDED_LOAD_REFRESH_MS = 6 * 60 * 60 * 1000; // 6h
+function loadBlendedLoadCache(){
+  try{
+    const raw = localStorage.getItem(BLENDED_LOAD_CACHE_KEY);
+    if(!raw) return {};
+    const parsed = JSON.parse(raw);
+    if(!parsed || typeof parsed !== "object") return {};
+    const out = {};
+    Object.entries(parsed).forEach(([id, row]) => {
+      if(!row || typeof row !== "object" || !row.date || !row.id) return;
+      out[String(id)] = row;
+    });
+    return out;
+  }catch(e){ return {}; }
+}
+function saveBlendedLoadCache(cacheObj){
+  const attempt = (cap) => {
+    const entries = Object.values(cacheObj).sort((a,b)=>new Date(b.date)-new Date(a.date)).slice(0, cap);
+    const trimmed = {};
+    entries.forEach(r => { trimmed[r.id] = r; });
+    localStorage.setItem(BLENDED_LOAD_CACHE_KEY, JSON.stringify(trimmed));
+  };
+  try{ attempt(BLENDED_LOAD_CACHE_MAX); }
+  catch(e){ try{ attempt(150); }catch(e2){ /* cache is a speed optimization, not required */ } }
+}
+function clearBlendedLoadCache(){ try{ localStorage.removeItem(BLENDED_LOAD_CACHE_KEY); }catch(e){} }
+function clearBlendedLoadFetchedAt(){ try{ localStorage.removeItem(BLENDED_LOAD_FETCHED_AT_KEY); }catch(e){} }
+function loadBlendedLoadFetchedAt(){
+  try{ const raw = localStorage.getItem(BLENDED_LOAD_FETCHED_AT_KEY); const n = raw ? Number(raw) : 0; return isFinite(n) ? n : 0; }
+  catch(e){ return 0; }
+}
+function saveBlendedLoadFetchedAt(ts){ try{ localStorage.setItem(BLENDED_LOAD_FETCHED_AT_KEY, String(ts)); }catch(e){} }
+
+// Orchestrates the blend ingestion: paginates /athlete/activities up to
+// BLENDED_LOAD_RIDE_BUDGET rides (mirrors loadHrLthrEstimate()'s own
+// pagination loop exactly), keeps only the handful of summary fields the
+// blend formula needs -- no stream fetch, no concurrency batching required,
+// since nothing here needs a per-ride network call -- and caches them.
+//
+// Triggered from two places: the equipmentMode toggle (eager first load, see
+// buildEquipmentModeCard()) AND the normal Trainer-tab render path itself
+// (trainerRiderContext(), see the staleness check there) -- a rider who
+// leaves equipmentMode='hr' set across sessions would otherwise never
+// refresh past that first toggle-triggered fetch, and the cache would go
+// stale forever (ACWR decaying toward 0 as it reads an ever-older snapshot).
+// The .loading guard above is what keeps both trigger sites safe together --
+// whichever call gets here first wins, the other just returns.
+// See syncCachedBlendedLoad() below for the cache-only fallback used on reload.
+async function loadBlendedTrainingLoad(token, opts){
+  opts = opts || {};
+  const tp = state.trainerPage;
+  if(tp.blendedLoad.loading) return;
+  if(!token){ tp.blendedLoad.error = "Bitte zuerst mit Strava verbinden."; render(); return; }
+  if(opts.forceRefresh) clearBlendedLoadCache();
+  tp.blendedLoad.loading = true; tp.blendedLoad.error = null;
+  // Mark the attempt NOW, before the network call, and persist it -- this is
+  // what the staleness check in trainerRiderContext() gates on. Set here
+  // (not only on success) so a persistently failing fetch still backs off
+  // for BLENDED_LOAD_REFRESH_MS instead of being retried on every render.
+  tp.blendedLoad.fetchedAt = Date.now();
+  saveBlendedLoadFetchedAt(tp.blendedLoad.fetchedAt);
+  render();
+  let success = false;
+  try{
+    let candidates = [];
+    let page = 1;
+    const perPage = 100;
+    while(candidates.length < BLENDED_LOAD_RIDE_BUDGET && page <= 10){
+      const batch = await fetchActivitiesPage(token, page, perPage);
+      if(!batch || !batch.length) break;
+      candidates = candidates.concat(batch.filter(a => RIDE_SPORT_TYPES.has(a.sport_type || a.type)));
+      if(batch.length < perPage) break;
+      page++;
+    }
+    candidates = candidates.slice(0, BLENDED_LOAD_RIDE_BUDGET);
+
+    const cache = loadBlendedLoadCache();
+    candidates.forEach(a => {
+      const id = String(a.id);
+      cache[id] = {
+        id,
+        date: a.start_date_local || a.start_date,
+        moving_time: a.moving_time || 0,
+        device_watts: !!a.device_watts,
+        weighted_average_watts: a.weighted_average_watts != null ? a.weighted_average_watts : null,
+        average_heartrate: a.average_heartrate != null ? a.average_heartrate : null,
+      };
+    });
+    saveBlendedLoadCache(cache);
+    tp.blendedLoad.activities = Object.values(cache);
+    success = true;
+  }catch(e){
+    tp.blendedLoad.error = e.message || "Trainingsbelastung konnte nicht geladen werden.";
+  }
+  tp.blendedLoad.loading = false;
+  // Issue 3 fix: only mark `loaded` on an actual successful fetch. Setting it
+  // unconditionally (including on a failed fetch that left `activities` at
+  // whatever it was before, possibly still null on a first-ever attempt)
+  // used to permanently defeat the `!activities && !loaded` cache-fallback
+  // guard in trainerRiderContext() for the rest of the session -- a single
+  // transient network blip would then keep a perfectly good previous
+  // localStorage snapshot from ever being read again until a full reload.
+  // Leaving `loaded` false on failure lets that guard keep retrying
+  // syncCachedBlendedLoad() (a cheap, harmless local read) on every render.
+  if(success) tp.blendedLoad.loaded = true;
+  render();
+}
+
+// Cheap, synchronous cache-only fallback for loadBlendedTrainingLoad() above,
+// mirroring syncCachedHrLthrEstimate()'s rationale exactly: on a fresh page
+// load state.trainerPage.blendedLoad.activities starts back at null (in-
+// memory only), so a reload with equipmentMode already 'hr' would otherwise
+// show "Unbekannt" freshness until the network pipeline runs again this
+// session, even though the raw rows are sitting in BLENDED_LOAD_CACHE_KEY
+// from last time. No network call here. Called lazily from
+// trainerRiderContext() so it costs nothing on the power-only path.
+function syncCachedBlendedLoad(){
+  const rows = Object.values(loadBlendedLoadCache());
+  if(rows.length) state.trainerPage.blendedLoad.activities = rows;
+  // Restore the persisted fetch-attempt timestamp too, so a page reload
+  // within BLENDED_LOAD_REFRESH_MS of the last attempt doesn't look "stale"
+  // in trainerRiderContext() and immediately re-fetch on first render.
+  // Only overwrite when a persisted value actually exists: loadBlendedTrainingLoad()
+  // already stamps fetchedAt in memory synchronously before its first await, so if
+  // saveBlendedLoadFetchedAt() silently failed (private-mode Safari, quota pressure)
+  // this must not clobber that fresh stamp back down to 0 -- doing so would make
+  // every render look stale again and re-trigger a fetch loop against a failing API.
+  const persisted = loadBlendedLoadFetchedAt();
+  if(persisted) state.trainerPage.blendedLoad.fetchedAt = persisted;
+}
+
 function trainerRiderContext(pp){
   const rp0 = pp.riderProfile;
   if(!rp0) return null;
-  const results = pp.results || [], load = pp.trainingLoad;
+  const results = pp.results || [];
   const today = new Date();
   const daysAgo = d => (today-d)/86400000;
+
+  // HF-only resolved LTHR, mirroring rp0.ftp/rp0.ftpSource's shape exactly.
+  // rp.lthr/rp.lthrSource/rp.usingHr are read throughout the Trainer tab
+  // (charts, step list, zone legend, context cards, gate, generation and
+  // evaluation). Resolved BEFORE the load/acwr block below (moved up from
+  // this function's original layout) since the blended-load branch needs
+  // `lthr` for its hrTSS fallback -- purely a reordering, no behavior change
+  // for the lthr/lthrSource/usingHr values themselves.
+  //
+  // Lazy cache-only fallback (see syncCachedHrLthrEstimate() above) so a
+  // reload with equipmentMode already 'hr' doesn't fire the empty-state gate
+  // before the full loadHrLthrEstimate() network pipeline has ever run this
+  // session. Skipped once that pipeline has run (tp.hrProfile.loaded) so it
+  // doesn't fight a real "no estimate found" outcome on every render.
+  if(state.equipmentMode === 'hr' && !state.trainerPage.hrProfile.estimate && !state.trainerPage.hrProfile.loaded && !TRAINING_CONFIG.rider.lthrOverride){
+    syncCachedHrLthrEstimate();
+  }
+  const lthrOverride = TRAINING_CONFIG.rider.lthrOverride;
+  const lthrEstimate = state.trainerPage.hrProfile.estimate;
+  const lthr = lthrOverride || lthrEstimate || null;
+  const lthrSource = lthrOverride ? 'manuell in den Einstellungen hinterlegt'
+    : (lthrEstimate ? 'aus deinen Fahrten geschätzt' : null);
+  const usingHr = state.equipmentMode === 'hr';
+
+  // Trainingsbelastung: power path is byte-for-byte pp.trainingLoad, exactly
+  // as before this phase -- zero change for power users. HF path switches to
+  // the additive blend source (buildBlendedTrainingLoad, see above), with the
+  // same cache-only-on-reload fallback story as the LTHR estimate above.
+  let load;
+  if(usingHr){
+    if(!state.trainerPage.blendedLoad.activities && !state.trainerPage.blendedLoad.loaded){
+      syncCachedBlendedLoad();
+    }
+    // Bug 1 fix (round 2): refresh trigger from the render path itself, not
+    // just the equipmentMode toggle's onchange handler (buildEquipmentModeCard()).
+    // Without this, a rider who leaves equipmentMode='hr' set across sessions
+    // only ever gets ONE fetch (from that first toggle flip) and every later
+    // render/reload reads an increasingly stale localStorage snapshot forever
+    // -- ACWR silently decays toward 0, the exact inverse of the overload-
+    // protection this feature exists for.
+    //
+    // NOTE: the first version of this fix gated "stale" on the newest CACHED
+    // RIDE's date (>1 day old). That re-triggers on every render whenever the
+    // rider simply hasn't ridden today (any rest day), or the fetch keeps
+    // failing, or the account has zero rides -- fetching never makes the
+    // rider's last ride any newer, so render() -> stale -> fetch -> render()
+    // -> stale -> fetch -> ... looped without bound. Gating on "did we already
+    // ATTEMPT a fetch recently" (fetchedAt, set unconditionally -- success or
+    // failure -- at the start of loadBlendedTrainingLoad() and persisted via
+    // BLENDED_LOAD_FETCHED_AT_KEY so a page reload doesn't forget it) bounds
+    // retries to once per BLENDED_LOAD_REFRESH_MS regardless of outcome,
+    // fixing the loop while still refreshing periodically.
+    //
+    // Deferred via setTimeout(0) rather than calling loadBlendedTrainingLoad()
+    // directly here: that function calls render() synchronously before its
+    // first await, and trainerRiderContext() itself runs synchronously
+    // inside an in-progress render() call (renderTrainerPage() -> here). A
+    // same-tick render() call would re-enter the outer render() while it's
+    // still building the current DOM tree (app.innerHTML was already
+    // cleared) and end up appending a duplicated tree. Deferring to the next
+    // tick lets the current render() finish first, so the refresh's own
+    // render() is a normal, independent one. blendedLoad.loading is still
+    // the guard that prevents duplicate concurrent fetches: even if several
+    // renders happen to schedule this before the first callback fires, each
+    // scheduled callback checks/sets that flag synchronously and in order,
+    // so only the first actually calls the network -- and fetchedAt itself is
+    // stamped synchronously at that same moment, before any await, so any
+    // further renders in the same tick already see a fresh fetchedAt and
+    // don't schedule a second attempt.
+    if(state.accessToken && !state.trainerPage.blendedLoad.loading){
+      const isStale = (Date.now() - (state.trainerPage.blendedLoad.fetchedAt || 0)) > BLENDED_LOAD_REFRESH_MS;
+      if(isStale) setTimeout(()=>{ loadBlendedTrainingLoad(state.accessToken); }, 0);
+    }
+    load = state.trainerPage.blendedLoad.activities
+      ? buildBlendedTrainingLoad(state.trainerPage.blendedLoad.activities, rp0.ftp, lthr)
+      : null;
+  } else {
+    load = pp.trainingLoad;
+  }
+
   const acwr = (load && load.ctl>0) ? load.atl/load.ctl : null;
-  const hoursIn7 = results.filter(r=>daysAgo(r.date)<=7).reduce((s,r)=>s+(r.movingSec||0),0)/3600;
-  const ridesIn7 = results.filter(r=>daysAgo(r.date)<=7).length;
   const wPerKg = (rp0.weight && rp0.ftp) ? rp0.ftp/rp0.weight : null;
-  const hardRides = results.filter(r=>r.confidence!=='unbestätigt' && r.estFtp!=null && rp0.ftp && r.estFtp>=rp0.ftp*0.93);
-  const lastHard = hardRides.length ? hardRides[hardRides.length-1] : null;
-  const daysSinceHard = lastHard ? Math.floor(daysAgo(lastHard.date)) : null;
-  const lastRide = results.length ? results[results.length-1] : null;
-  const daysSinceRide = lastRide ? Math.floor(daysAgo(lastRide.date)) : null;
+
+  // Issue 4 fix: hoursIn7/ridesIn7/daysSinceHard/daysSinceRide used to be
+  // derived from `results` (pp.results) unconditionally, even in HR mode --
+  // but pp.results is Profil's device_watts-filtered pipeline (~2670) and is
+  // always empty for HR-only riders, so "Woche bisher" permanently showed
+  // "0,0 h / 0 Fahrten", "Letzte harte Einheit" permanently showed "keine
+  // erkannt", and the rodeHardYesterday/hoursIn7>8 branches that feed
+  // forceEasy/volume logic (~7292, 7478, 7559) were permanently dead in HR
+  // mode -- silently weakening the overload guard on top of Bug 1. The HR
+  // branch below derives the same four metrics from the blended-load cache
+  // rows instead (same raw per-ride data buildBlendedTrainingLoad() above
+  // uses -- date + moving_time + watts/heartrate -- covering the rider's
+  // full activity history, power+HR combined, not just power rides). The
+  // power branch is untouched, byte-for-byte the same computation as before.
+  let hoursIn7, ridesIn7, daysSinceHard, daysSinceRide;
+  if(usingHr){
+    const blendedRows = state.trainerPage.blendedLoad.activities || [];
+    const recentRows = blendedRows.filter(r=>{ const d=new Date(r.date); return !isNaN(d.getTime()) && daysAgo(d)<=7; });
+    hoursIn7 = recentRows.reduce((s,r)=>s+(r.moving_time||0),0)/3600;
+    ridesIn7 = recentRows.length;
+    // "Hard" mirrors the power path's >=93%-of-threshold definition, just
+    // sourced per-ride from whichever metric that ride actually has: NP vs
+    // FTP when it's a power ride, avg HR vs LTHR otherwise (same fallback
+    // buildBlendedTrainingLoad() uses for its per-ride TSS above).
+    const hardBlendedRows = blendedRows.filter(r=>{
+      if(r.device_watts && r.weighted_average_watts && rp0.ftp) return r.weighted_average_watts >= rp0.ftp*0.93;
+      if(r.average_heartrate != null && lthr) return r.average_heartrate >= lthr*0.93;
+      return false;
+    }).sort((a,b)=>new Date(a.date)-new Date(b.date));
+    const lastHardBlended = hardBlendedRows.length ? hardBlendedRows[hardBlendedRows.length-1] : null;
+    daysSinceHard = lastHardBlended ? Math.floor(daysAgo(new Date(lastHardBlended.date))) : null;
+    const sortedRows = blendedRows.slice().sort((a,b)=>new Date(a.date)-new Date(b.date));
+    const lastBlendedRide = sortedRows.length ? sortedRows[sortedRows.length-1] : null;
+    daysSinceRide = lastBlendedRide ? Math.floor(daysAgo(new Date(lastBlendedRide.date))) : null;
+  } else {
+    hoursIn7 = results.filter(r=>daysAgo(r.date)<=7).reduce((s,r)=>s+(r.movingSec||0),0)/3600;
+    ridesIn7 = results.filter(r=>daysAgo(r.date)<=7).length;
+    const hardRides = results.filter(r=>r.confidence!=='unbestätigt' && r.estFtp!=null && rp0.ftp && r.estFtp>=rp0.ftp*0.93);
+    const lastHard = hardRides.length ? hardRides[hardRides.length-1] : null;
+    daysSinceHard = lastHard ? Math.floor(daysAgo(lastHard.date)) : null;
+    const lastRide = results.length ? results[results.length-1] : null;
+    daysSinceRide = lastRide ? Math.floor(daysAgo(lastRide.date)) : null;
+  }
 
   let freshness='Unbekannt', freshnessClass='warn', freshnessWhy='Zu wenig Belastungsdaten für eine Frische-Einschätzung.';
   if(acwr!=null){
@@ -6182,16 +6912,46 @@ function trainerRiderContext(pp){
       freshnessWhy=`ATL liegt ${Math.round((1-acwr)*100)}% unter CTL. Gut erholt.`; }
     else { freshness='Ausgeglichen'; freshnessClass='good'; freshnessWhy='Deine Ermüdung entspricht ungefähr deiner Fitness.'; }
   }
-  return { ...rp0, wPerKg, acwr, freshness, freshnessClass, freshnessWhy, hoursIn7, ridesIn7, daysSinceHard, daysSinceRide };
+
+  // blendedLoad is exposed (not just acwr) so renderTrainerSummaryCards() can
+  // show real Fitness/Ermüdung/Form cards for HR-only riders too, instead of
+  // permanent "–" placeholders next to a working Frische/ACWR card -- the
+  // rows already carry ctl/atl/tsb/formVerdict, computed identically to
+  // pp.trainingLoad's (see buildBlendedTrainingLoad()'s own comment).
+  return { ...rp0, wPerKg, acwr, freshness, freshnessClass, freshnessWhy, hoursIn7, ridesIn7, daysSinceHard, daysSinceRide, lthr, lthrSource, usingHr, blendedLoad: usingHr ? load : null };
 }
 
-function workoutMetrics(steps, ftp){
-  let totalSec=0, sumP4=0, sumP=0;
-  steps.forEach(s=>{ const sec=s.minutes*60, w=s.pct*ftp; totalSec+=sec; sumP4+=Math.pow(w,4)*sec; sumP+=w*sec; });
+// rp.usingHr branches to a simplified hrTSS (TrainingPeaks methodology:
+// IF_HR = avgHR/LTHR, hrTSS = hours × IF_HR² × 100) instead of NP⁴-weighted
+// power TSS -- HR has no NP-equivalent (it's already a self-smoothing,
+// slower-moving signal than power, so a rolling 4th-power average would just
+// double-smooth it, not add information). The full TrainingPeaks hrTSS
+// formula also curve-corrects at very low/high HR; that correction needs a
+// reference table this app doesn't have without an external library, so this
+// is a deliberate simplification -- plain time-weighted IF_HR², no curve fit.
+// `np`/`avgPower` are reused (not renamed) to keep this a single return
+// shape both branches' one caller can consume identically; in the HR branch
+// they both just hold the time-weighted average target bpm (no NP-style
+// weighting exists to make them diverge from one another the way real
+// power's np vs avgPower do).
+function workoutMetrics(steps, rp){
+  const usingHr = rp.usingHr;
+  const metricValue = usingHr ? rp.lthr : rp.ftp;
+  let totalSec=0;
+  if(usingHr){
+    let sumPctSec=0;
+    steps.forEach(s=>{ const sec=s.minutes*60; totalSec+=sec; sumPctSec+=s.pct*sec; });
+    if(totalSec===0) return { totalMin:0, np:0, avgPower:0, intensityFactor:0, tss:0 };
+    const avgIF = sumPctSec/totalSec, avgHrTarget = avgIF*metricValue, hours = totalSec/3600;
+    return { totalMin:Math.round(totalSec/60), np:Math.round(avgHrTarget), avgPower:Math.round(avgHrTarget), intensityFactor:avgIF,
+      tss: Math.round(hours*avgIF*avgIF*100) };
+  }
+  let sumP4=0, sumP=0;
+  steps.forEach(s=>{ const sec=s.minutes*60, w=s.pct*metricValue; totalSec+=sec; sumP4+=Math.pow(w,4)*sec; sumP+=w*sec; });
   if(totalSec===0) return { totalMin:0, np:0, avgPower:0, intensityFactor:0, tss:0 };
-  const np=Math.pow(sumP4/totalSec,0.25), intensityFactor=np/ftp;
+  const np=Math.pow(sumP4/totalSec,0.25), intensityFactor=np/metricValue;
   return { totalMin:Math.round(totalSec/60), np:Math.round(np), avgPower:Math.round(sumP/totalSec), intensityFactor,
-    tss: Math.round((totalSec*np*intensityFactor)/(ftp*3600)*100) };
+    tss: Math.round((totalSec*np*intensityFactor)/(metricValue*3600)*100) };
 }
 
 // ---------- Trainer: route-based training ----------
@@ -6436,9 +7196,24 @@ function computeSpecificityScore(workout, goal){
   return Math.round(weighted/totalDist);
 }
 
+// RPE (Rate of Perceived Exertion, 1-10) targets used INSTEAD of a real-time
+// bpm target for HF-mode VO2max/Anaerobic/Sprint interval steps -- these
+// efforts are all short enough (3 min down to 15s) that heart rate lags too
+// far behind the actual effort to serve as a live target (Sprint included,
+// not just the first two -- same HF-inertia problem, if anything worse given
+// how short sprint efforts are; see plan §5). s.pct is left untouched on
+// these steps (still needed for hrTSS estimation / chart zone coloring), only
+// the *displayed* target switches to rpeLabel wherever equipmentMode==='hr'.
+const RPE_TARGET_BY_CLASS = {
+  vo2max:    { rpeTarget:9,  rpeLabel:'RPE 9 – nahezu maximale Anstrengung' },
+  anaerobic: { rpeTarget:10, rpeLabel:'RPE 10 – maximale Anstrengung' },
+  sprint:    { rpeTarget:10, rpeLabel:'RPE 10 – maximale Anstrengung' },
+};
+
 // A pure, terrain-independent description of a goal's interval structure —
-// reps, duration, target %FTP and rest between them. Route placement below
-// packs this queue onto the attached route's terrain.
+// reps, duration, target %FTP (or %LTHR/RPE in HF mode) and rest between
+// them. Route placement below packs this queue onto the attached route's
+// terrain.
 function buildIntervalSpec(goal, rp){
   const acwr = rp.acwr;
   const elevated = acwr!=null && acwr>1.25;
@@ -6453,43 +7228,51 @@ function buildIntervalSpec(goal, rp){
     const intervalMin = elevated ? 10 : 12;
     const repsList = [];
     for(let i=1;i<=reps;i++){
-      repsList.push({ ...seg('Intervall', intervalMin, 0.97, 'Gleichmäßig, knapp unter/an FTP'),
+      repsList.push({ ...seg('Intervall', intervalMin, 0.97, rp.usingHr ? 'Gleichmäßig, knapp unter/an LTHR' : 'Gleichmäßig, knapp unter/an FTP'),
         restAfter: i<reps ? [seg('Pause', 5, 0.50)] : [] });
     }
     return { title:`${reps} × ${intervalMin} min an der Schwelle`, adaptation:'Laktat-Toleranz und Schwellenleistung',
       warmup: seg('Einrollen', 12, 0.55), activation: seg('Aktivierung', 3, 0.80, '2× 30s auf Tempo'),
       reps: repsList, cooldown: seg('Ausrollen', 10, 0.50),
       rationale:[{ type:'good', title:'Warum Schwellenintervalle',
-        text:`FTP steigt am effizientesten durch längere Blöcke knapp an der Schwelle (95–100%). Bei deinem FTP von ${rp.ftp} W sind das etwa ${Math.round(rp.ftp*0.97)} W – "kontrolliert hart", nicht wie ein Wettkampf.` }] };
+        text: rp.usingHr
+          ? `Schwelle steigt am effizientesten durch längere Blöcke knapp an der Schwelle (95–100%). Bei deiner LTHR von ${rp.lthr} bpm sind das etwa ${Math.round(rp.lthr*0.97)} bpm – "kontrolliert hart", nicht wie ein Wettkampf.`
+          : `FTP steigt am effizientesten durch längere Blöcke knapp an der Schwelle (95–100%). Bei deinem FTP von ${rp.ftp} W sind das etwa ${Math.round(rp.ftp*0.97)} W – "kontrolliert hart", nicht wie ein Wettkampf.` }] };
   }
   if(goal === 'vo2max'){
     const reps = Math.max(4, Math.round(5*volumeFactor));
     const repsList = [];
+    const rpe = rp.usingHr ? RPE_TARGET_BY_CLASS.vo2max : null;
     for(let i=1;i<=reps;i++){
-      repsList.push({ ...seg('VO2max', 3, 1.15, 'Hart – die letzten 30s sollen brennen'),
+      repsList.push({ ...seg('VO2max', 3, 1.15, 'Hart – die letzten 30s sollen brennen'), ...rpe,
         restAfter: i<reps ? [seg('Pause', 3, 0.45, 'Vollständig locker rollen')] : [] });
     }
     return { title:`${reps} × 3 min VO2max-Intervalle`, adaptation:'Maximale Sauerstoffaufnahme, Herzleistung',
       warmup: seg('Einrollen', 15, 0.55), activation: seg('Aktivierung', 4, 0.85, '3× 20s hart, je 40s locker'),
       reps: repsList, cooldown: seg('Ausrollen', 10, 0.48),
       rationale:[{ type:'good', title:'Warum 3-Minuten-Intervalle',
-        text:`VO2max-Reize brauchen Zeit "oben". 3 Minuten bei ca. ${Math.round(rp.ftp*1.15)} W (115% FTP) mit gleichlanger Pause maximieren die Zeit in diesem Bereich, ohne dass du nach zwei Intervallen einbrichst.` }] };
+        text: rp.usingHr
+          ? `VO2max-Reize brauchen Zeit "oben". Bei kurzen, harten 3-Minuten-Intervallen hinkt die Herzfrequenz dem Effort zu weit hinterher, um als Echtzeitziel zu taugen – fahre daher nach Gefühl auf RPE 9 (nahezu maximale Anstrengung), nicht nach einer bpm-Zahl.`
+          : `VO2max-Reize brauchen Zeit "oben". 3 Minuten bei ca. ${Math.round(rp.ftp*1.15)} W (115% FTP) mit gleichlanger Pause maximieren die Zeit in diesem Bereich, ohne dass du nach zwei Intervallen einbrichst.` }] };
   }
   if(goal === 'anaerobic'){
     const sets = Math.max(2, Math.round(3*volumeFactor));
     const repsList = [];
+    const rpe = rp.usingHr ? RPE_TARGET_BY_CLASS.anaerobic : null;
     for(let s2=1;s2<=sets;s2++){
       for(let i=1;i<=5;i++){
         const restAfter = [seg('Pause', 1.5, 0.45)];
         if(i===5 && s2<sets) restAfter.push(seg('Satzpause', 8, 0.50, 'Komplett locker'));
-        repsList.push({ ...seg('Sprint', 0.5, 1.55, 'Maximal, aus dem Sattel'), restAfter });
+        repsList.push({ ...seg('Sprint', 0.5, 1.55, 'Maximal, aus dem Sattel'), ...rpe, restAfter });
       }
     }
     return { title:`${sets} Sätze à 5 × 30 s All-out`, adaptation:'Anaerobe Kapazität, neuromuskuläre Spitzenleistung',
       warmup: seg('Einrollen', 15, 0.55), activation: seg('Aktivierung', 5, 0.85, '3× 15s Sprints mit langer Pause'),
       reps: repsList, cooldown: seg('Ausrollen', 10, 0.48),
       rationale:[{ type:'good', title:'Warum kurze All-out-Sprints',
-        text:`Anaerobe Kapazität trainierst du nur mit maximalen, kurzen Belastungen und viel Pause. Deine beste 1-Minuten-Leistung liegt bei ${rp.p1?rp.p1+' W':'unbekannt'} – die Sprints sollen deutlich darüber liegen.` }] };
+        text: rp.usingHr
+          ? `Anaerobe Kapazität trainierst du nur mit maximalen, kurzen Belastungen und viel Pause. Bei so kurzen, maximalen Sprints hinkt die Herzfrequenz dem Effort viel zu weit hinterher, um als Echtzeitziel zu taugen – fahre daher nach Gefühl auf RPE 10 (maximale Anstrengung), nicht nach einer bpm-Zahl.`
+          : `Anaerobe Kapazität trainierst du nur mit maximalen, kurzen Belastungen und viel Pause. Deine beste 1-Minuten-Leistung liegt bei ${rp.p1?rp.p1+' W':'unbekannt'} – die Sprints sollen deutlich darüber liegen.` }] };
   }
   if(goal === 'tempo'){
     const reps = Math.max(2, Math.round(3*volumeFactor));
@@ -6503,20 +7286,25 @@ function buildIntervalSpec(goal, rp){
       warmup: seg('Einrollen', 12, 0.55), activation: seg('Aktivierung', 3, 0.78, '2× 30s auf Tempo'),
       reps: repsList, cooldown: seg('Ausrollen', 10, 0.50),
       rationale:[{ type:'good', title:'Warum Sweet Spot',
-        text:'Sweet Spot (ca. 88–92% FTP) baut muskuläre Ausdauer auf, mit weniger Erholungsbedarf als echte Schwellenintervalle – gut geeignet, wenn Threshold/VO2max diese Woche schon bedient sind.' }] };
+        text: rp.usingHr
+          ? 'Sweet Spot (ca. 88–92% LTHR) baut muskuläre Ausdauer auf, mit weniger Erholungsbedarf als echte Schwellenintervalle – gut geeignet, wenn Threshold/VO2max diese Woche schon bedient sind.'
+          : 'Sweet Spot (ca. 88–92% FTP) baut muskuläre Ausdauer auf, mit weniger Erholungsbedarf als echte Schwellenintervalle – gut geeignet, wenn Threshold/VO2max diese Woche schon bedient sind.' }] };
   }
   if(goal === 'sprint'){
     const reps = Math.max(4, Math.round(6*volumeFactor));
     const repsList = [];
+    const rpe = rp.usingHr ? RPE_TARGET_BY_CLASS.sprint : null;
     for(let i=1;i<=reps;i++){
-      repsList.push({ ...seg('Sprint', 0.25, 1.7, 'Maximal, aus dem Sattel'),
+      repsList.push({ ...seg('Sprint', 0.25, 1.7, 'Maximal, aus dem Sattel'), ...rpe,
         restAfter: i<reps ? [seg('Pause', 4, 0.48, 'Vollständig locker rollen')] : [] });
     }
     return { title:`${reps} × 15 s Sprints`, adaptation:'Neuromuskuläre Spitzenleistung, Sprintkraft',
       warmup: seg('Einrollen', 15, 0.55), activation: seg('Aktivierung', 5, 0.85, '3× 10s Antritte mit langer Pause'),
       reps: repsList, cooldown: seg('Ausrollen', 10, 0.48),
       rationale:[{ type:'good', title:'Warum sehr kurze Sprints',
-        text:'Neuromuskuläre Leistung trainierst du mit maximalen, sehr kurzen Antritten und vollständiger Erholung dazwischen – Ermüdung würde die Rekrutierung schneller Fasern sofort begrenzen.' }] };
+        text: rp.usingHr
+          ? `Neuromuskuläre Leistung trainierst du mit maximalen, sehr kurzen Antritten und vollständiger Erholung dazwischen. Bei 15 s All-out reagiert die Herzfrequenz gar nicht erst schnell genug, um als Ziel zu taugen – fahre daher nach Gefühl auf RPE 10 (maximale Anstrengung), nicht nach einer bpm-Zahl.`
+          : 'Neuromuskuläre Leistung trainierst du mit maximalen, sehr kurzen Antritten und vollständiger Erholung dazwischen – Ermüdung würde die Rekrutierung schneller Fasern sofort begrenzen.' }] };
   }
   return null;
 }
@@ -6547,7 +7335,7 @@ function placeIntervalsOnRoute(route, spec, adj, classKey, config, options){
   const queue = [];
   spec.reps.forEach(r => {
     const pct = Math.min(1.5, r.pct*adj);
-    queue.push({ kind:'interval', label:r.label, minutes:clampInterval(r.minutes), pct, note:r.note });
+    queue.push({ kind:'interval', label:r.label, minutes:clampInterval(r.minutes), pct, note:r.note, rpeTarget:r.rpeTarget, rpeLabel:r.rpeLabel });
     (r.restAfter||[]).forEach(ra => queue.push({ kind:'rest', label:ra.label, minutes:clampRest(ra.minutes), pct:ra.pct, note:ra.note }));
   });
   const targetIntervalMin = queue.filter(b=>b.kind==='interval').reduce((s,b)=>s+b.minutes,0);
@@ -6621,8 +7409,12 @@ function placeIntervalsOnRoute(route, spec, adj, classKey, config, options){
       const end = cursor + b.blockDistM;
       if(b.kind === 'interval'){
         intervalCounter++;
-        steps.push(rseg(`${baseLabel} ${intervalCounter} (${(b.blockDistM/1000).toFixed(2)} km, ${s.avgGradient.toFixed(1)}%)`,
-          cursor, end, b.pct, b.note, 'interval', s.type, s.avgGradient));
+        const intervalStep = rseg(`${baseLabel} ${intervalCounter} (${(b.blockDistM/1000).toFixed(2)} km, ${s.avgGradient.toFixed(1)}%)`,
+          cursor, end, b.pct, b.note, 'interval', s.type, s.avgGradient);
+        // RPE (HF-mode VO2max/Anaerobic/Sprint) rides through the block queue
+        // untouched from buildIntervalSpec()'s reps -- see RPE_TARGET_BY_CLASS.
+        if(b.rpeLabel){ intervalStep.rpeTarget = b.rpeTarget; intervalStep.rpeLabel = b.rpeLabel; }
+        steps.push(intervalStep);
       } else {
         steps.push(rseg(b.label, cursor, end, b.pct, b.note, 'rest', s.type, s.avgGradient));
       }
@@ -6711,8 +7503,8 @@ function generateRouteWorkout(goal, rp, route, learning, config, classKey, optio
   }
   if(Math.abs(adj-1) > 0.005) rationale.push({ type: adj<1 ? 'warn':'good', title:'Aus deiner Historie angepasst',
     text: adj<1
-      ? `Bei früheren Einheiten dieses Ziels hast du im Schnitt ${Math.round(adj*100)}% der Zielleistung erreicht – ich habe die Vorgabe entsprechend abgesenkt, damit sie realistisch bleibt.`
-      : `Bei früheren Einheiten dieses Ziels hast du die Zielleistung im Schnitt übertroffen – ich habe die Vorgabe leicht angehoben.` });
+      ? `Bei früheren Einheiten dieses Ziels hast du im Schnitt ${Math.round(adj*100)}% ${rp.usingHr?'des HF-Ziels':'der Zielleistung'} erreicht – ich habe die Vorgabe entsprechend abgesenkt, damit sie realistisch bleibt.`
+      : `Bei früheren Einheiten dieses Ziels hast du ${rp.usingHr?'das HF-Ziel':'die Zielleistung'} im Schnitt übertroffen – ich habe die Vorgabe leicht angehoben.` });
 
   return { title: spec.title, steps: placement.steps, rationale, adaptation: spec.adaptation, overridden:false,
     routeBased:true, totalDistanceM:route.totalDistanceM, intervalSegments:[] };
@@ -6747,21 +7539,43 @@ function generateWorkoutForOpportunity(opportunity, rp, route, learning, config,
   return result;
 }
 
-function estimateRouteWorkoutMetrics(steps, ftp){
-  let totalSec=0, sumP4=0, sumP=0, totalDistanceM=0;
+// Same power-vs-HF branch as workoutMetrics() above (see its comment for the
+// hrTSS simplification note) -- route-based twin, speed-estimated per step.
+function estimateRouteWorkoutMetrics(steps, rp){
+  const usingHr = rp.usingHr;
+  const metricValue = usingHr ? rp.lthr : rp.ftp;
+  let totalSec=0, totalDistanceM=0;
+  if(usingHr){
+    let sumPctSec=0;
+    steps.forEach(s=>{
+      const kmh = estimateSpeedKmh(s);
+      const sec = Math.max(1, s.distanceM/1000/kmh*3600);
+      totalSec += sec; sumPctSec += s.pct*sec; totalDistanceM += s.distanceM;
+    });
+    if(totalSec===0) return { totalMin:0, np:0, avgPower:0, intensityFactor:0, tss:0, totalDistanceKm:0 };
+    const avgIF = sumPctSec/totalSec, avgHrTarget = avgIF*metricValue, hours = totalSec/3600;
+    return { totalMin: Math.round(totalSec/60), np: Math.round(avgHrTarget), avgPower: Math.round(avgHrTarget), intensityFactor: avgIF,
+      tss: Math.round(hours*avgIF*avgIF*100), totalDistanceKm: totalDistanceM/1000 };
+  }
+  let sumP4=0, sumP=0;
   steps.forEach(s=>{
     const kmh = estimateSpeedKmh(s);
     const sec = Math.max(1, s.distanceM/1000/kmh*3600);
-    const w = s.pct*ftp;
+    const w = s.pct*metricValue;
     totalSec += sec; sumP4 += Math.pow(w,4)*sec; sumP += w*sec; totalDistanceM += s.distanceM;
   });
   if(totalSec===0) return { totalMin:0, np:0, avgPower:0, intensityFactor:0, tss:0, totalDistanceKm:0 };
-  const np = Math.pow(sumP4/totalSec,0.25), intensityFactor = np/ftp;
+  const np = Math.pow(sumP4/totalSec,0.25), intensityFactor = np/metricValue;
   return { totalMin: Math.round(totalSec/60), np: Math.round(np), avgPower: Math.round(sumP/totalSec), intensityFactor,
-    tss: Math.round((totalSec*np*intensityFactor)/(ftp*3600)*100), totalDistanceKm: totalDistanceM/1000 };
+    tss: Math.round((totalSec*np*intensityFactor)/(metricValue*3600)*100), totalDistanceKm: totalDistanceM/1000 };
 }
-function workoutZoneBreakdown(steps, routeBased){
-  const mins = ZONES.map(()=>0);
+function workoutZoneBreakdown(steps, routeBased, rp){
+  // HF-Zweig iteriert LTHR_ZONES/lthrZoneFor statt ZONES/zoneFor. rp is
+  // still guarded as optional (defaults to the power branch) purely as a
+  // defensive fallback -- the single current caller always passes rp.
+  const zonesTable = (rp && rp.usingHr) ? LTHR_ZONES : ZONES;
+  const zoneFn = pct => (rp && rp.usingHr) ? lthrZoneFor(pct) : zoneFor(pct);
+  const mins = zonesTable.map(()=>0);
   let totalMin = 0;
   (steps||[]).forEach(s=>{
     let minutes;
@@ -6772,11 +7586,11 @@ function workoutZoneBreakdown(steps, routeBased){
       minutes = s.minutes || 0;
     }
     if(minutes <= 0) return;
-    const idx = ZONES.indexOf(zoneFor(s.pct));
+    const idx = zonesTable.indexOf(zoneFn(s.pct));
     mins[idx] += minutes;
     totalMin += minutes;
   });
-  const zones = ZONES.map((z,i)=>({ name:z.name, color:z.color, minutes: mins[i],
+  const zones = zonesTable.map((z,i)=>({ name:z.name, color:z.color, minutes: mins[i],
     pct: totalMin>0 ? mins[i]/totalMin*100 : 0 }));
   return { zones, totalMin };
 }
@@ -6847,12 +7661,14 @@ function generateTimeBasedWorkout(classKey, rp, learning){
       steps.push(seg('Einrollen',12,0.55,null,'warmup'));
       steps.push(seg('Aktivierung',3,0.80,'2× 30s auf Tempo','activation'));
       for(let i=1;i<=reps;i++){
-        steps.push(seg(`Intervall ${i}`,intervalMin,bump(0.97),'Gleichmäßig, knapp unter/an FTP','interval'));
+        steps.push(seg(`Intervall ${i}`,intervalMin,bump(0.97),rp.usingHr ? 'Gleichmäßig, knapp unter/an LTHR' : 'Gleichmäßig, knapp unter/an FTP','interval'));
         if(i<reps) steps.push(seg(`Pause ${i}`,5,0.50,null,'rest'));
       }
       steps.push(seg('Ausrollen',10,0.50,null,'cooldown'));
       rationale.push({ type:'good', title:'Warum Schwellenintervalle',
-        text:`FTP steigt am effizientesten durch längere Blöcke knapp an der Schwelle (95–100%). Bei deinem FTP von ${rp.ftp} W sind das etwa ${Math.round(rp.ftp*0.97)} W – "kontrolliert hart", nicht wie ein Wettkampf.` });
+        text: rp.usingHr
+          ? `Schwelle steigt am effizientesten durch längere Blöcke knapp an der Schwelle (95–100%). Bei deiner LTHR von ${rp.lthr} bpm sind das etwa ${Math.round(rp.lthr*0.97)} bpm – "kontrolliert hart", nicht wie ein Wettkampf.`
+          : `FTP steigt am effizientesten durch längere Blöcke knapp an der Schwelle (95–100%). Bei deinem FTP von ${rp.ftp} W sind das etwa ${Math.round(rp.ftp*0.97)} W – "kontrolliert hart", nicht wie ein Wettkampf.` });
       break;
     }
     case 'vo2max': {
@@ -6862,12 +7678,16 @@ function generateTimeBasedWorkout(classKey, rp, learning){
       steps.push(seg('Einrollen',15,0.55,null,'warmup'));
       steps.push(seg('Aktivierung',4,0.85,'3× 20s hart, je 40s locker','activation'));
       for(let i=1;i<=reps;i++){
-        steps.push(seg(`VO2max ${i}`,3,bump(1.15),'Hart – die letzten 30s sollen brennen','interval'));
+        const iv = seg(`VO2max ${i}`,3,bump(1.15),'Hart – die letzten 30s sollen brennen','interval');
+        if(rp.usingHr) Object.assign(iv, RPE_TARGET_BY_CLASS.vo2max);
+        steps.push(iv);
         if(i<reps) steps.push(seg(`Pause ${i}`,3,0.45,'Vollständig locker rollen','rest'));
       }
       steps.push(seg('Ausrollen',10,0.48,null,'cooldown'));
       rationale.push({ type:'good', title:'Warum 3-Minuten-Intervalle',
-        text:`VO2max-Reize brauchen Zeit "oben". 3 Minuten bei ca. ${Math.round(rp.ftp*1.15)} W (115% FTP) mit gleichlanger Pause maximieren die Zeit in diesem Bereich, ohne dass du nach zwei Intervallen einbrichst.` });
+        text: rp.usingHr
+          ? `VO2max-Reize brauchen Zeit "oben". Bei kurzen, harten 3-Minuten-Intervallen hinkt die Herzfrequenz dem Effort zu weit hinterher, um als Echtzeitziel zu taugen – fahre daher nach Gefühl auf RPE 9 (nahezu maximale Anstrengung), nicht nach einer bpm-Zahl.`
+          : `VO2max-Reize brauchen Zeit "oben". 3 Minuten bei ca. ${Math.round(rp.ftp*1.15)} W (115% FTP) mit gleichlanger Pause maximieren die Zeit in diesem Bereich, ohne dass du nach zwei Intervallen einbrichst.` });
       break;
     }
     case 'tempo': {
@@ -6883,7 +7703,9 @@ function generateTimeBasedWorkout(classKey, rp, learning){
       }
       steps.push(seg('Ausrollen',10,0.50,null,'cooldown'));
       rationale.push({ type:'good', title:'Warum Sweet Spot',
-        text:'Sweet Spot (ca. 88–92% FTP) baut muskuläre Ausdauer auf, mit weniger Erholungsbedarf als echte Schwellenintervalle.' });
+        text: rp.usingHr
+          ? 'Sweet Spot (ca. 88–92% LTHR) baut muskuläre Ausdauer auf, mit weniger Erholungsbedarf als echte Schwellenintervalle.'
+          : 'Sweet Spot (ca. 88–92% FTP) baut muskuläre Ausdauer auf, mit weniger Erholungsbedarf als echte Schwellenintervalle.' });
       break;
     }
     case 'endurance': {
@@ -6896,7 +7718,9 @@ function generateTimeBasedWorkout(classKey, rp, learning){
       steps.push(seg('Grundlage Teil 2',Math.round(baseMin*0.4),0.66,null,'cruise'));
       steps.push(seg('Ausrollen',8,0.50,null,'cooldown'));
       rationale.push({ type:'good', title:'Warum lange und locker',
-        text:`Grundlagenfahrten wirken über Dauer, nicht Intensität. Bei ca. ${Math.round(rp.ftp*0.67)} W bleibst du im Fettstoffwechsel. Die Versuchung ist, "ein bisschen schneller" zu fahren – das macht die Einheit härter, ohne sie wirksamer zu machen.` });
+        text: rp.usingHr
+          ? `Grundlagenfahrten wirken über Dauer, nicht Intensität. Bei ca. ${Math.round(rp.lthr*0.67)} bpm bleibst du im Fettstoffwechsel. Die Versuchung ist, "ein bisschen schneller" zu fahren – das macht die Einheit härter, ohne sie wirksamer zu machen.`
+          : `Grundlagenfahrten wirken über Dauer, nicht Intensität. Bei ca. ${Math.round(rp.ftp*0.67)} W bleibst du im Fettstoffwechsel. Die Versuchung ist, "ein bisschen schneller" zu fahren – das macht die Einheit härter, ohne sie wirksamer zu machen.` });
       break;
     }
     case 'anaerobic': {
@@ -6907,14 +7731,18 @@ function generateTimeBasedWorkout(classKey, rp, learning){
       steps.push(seg('Aktivierung',5,0.85,'3× 15s Sprints mit langer Pause','activation'));
       for(let s2=1;s2<=sets;s2++){
         for(let i=1;i<=5;i++){
-          steps.push(seg(`Satz ${s2} – Sprint ${i}`,0.5,bump(1.55),'Maximal, aus dem Sattel','interval'));
+          const iv = seg(`Satz ${s2} – Sprint ${i}`,0.5,bump(1.55),'Maximal, aus dem Sattel','interval');
+          if(rp.usingHr) Object.assign(iv, RPE_TARGET_BY_CLASS.anaerobic);
+          steps.push(iv);
           steps.push(seg('Pause',1.5,0.45,null,'rest'));
         }
         if(s2<sets) steps.push(seg(`Satzpause ${s2}`,8,0.50,'Komplett locker','rest'));
       }
       steps.push(seg('Ausrollen',10,0.48,null,'cooldown'));
       rationale.push({ type:'good', title:'Warum kurze All-out-Sprints',
-        text:`Anaerobe Kapazität trainierst du nur mit maximalen, kurzen Belastungen und viel Pause. Deine beste 1-Minuten-Leistung liegt bei ${rp.p1?rp.p1+' W':'unbekannt'} – die Sprints sollen deutlich darüber liegen.` });
+        text: rp.usingHr
+          ? `Anaerobe Kapazität trainierst du nur mit maximalen, kurzen Belastungen und viel Pause. Bei so kurzen, maximalen Sprints hinkt die Herzfrequenz dem Effort viel zu weit hinterher, um als Echtzeitziel zu taugen – fahre daher nach Gefühl auf RPE 10 (maximale Anstrengung), nicht nach einer bpm-Zahl.`
+          : `Anaerobe Kapazität trainierst du nur mit maximalen, kurzen Belastungen und viel Pause. Deine beste 1-Minuten-Leistung liegt bei ${rp.p1?rp.p1+' W':'unbekannt'} – die Sprints sollen deutlich darüber liegen.` });
       break;
     }
     case 'sprint': {
@@ -6924,12 +7752,16 @@ function generateTimeBasedWorkout(classKey, rp, learning){
       steps.push(seg('Einrollen',15,0.55,null,'warmup'));
       steps.push(seg('Aktivierung',5,0.85,'3× 10s Antritte mit langer Pause','activation'));
       for(let i=1;i<=reps;i++){
-        steps.push(seg(`Sprint ${i}`,0.25,bump(1.7),'Maximal, aus dem Sattel','interval'));
+        const iv = seg(`Sprint ${i}`,0.25,bump(1.7),'Maximal, aus dem Sattel','interval');
+        if(rp.usingHr) Object.assign(iv, RPE_TARGET_BY_CLASS.sprint);
+        steps.push(iv);
         if(i<reps) steps.push(seg(`Pause ${i}`,4,0.48,'Vollständig locker rollen','rest'));
       }
       steps.push(seg('Ausrollen',10,0.48,null,'cooldown'));
       rationale.push({ type:'good', title:'Warum sehr kurze Sprints',
-        text:'Neuromuskuläre Leistung trainierst du mit maximalen, sehr kurzen Antritten und vollständiger Erholung dazwischen.' });
+        text: rp.usingHr
+          ? `Neuromuskuläre Leistung trainierst du mit maximalen, sehr kurzen Antritten und vollständiger Erholung dazwischen. Bei 15 s All-out reagiert die Herzfrequenz gar nicht erst schnell genug, um als Ziel zu taugen – fahre daher nach Gefühl auf RPE 10 (maximale Anstrengung), nicht nach einer bpm-Zahl.`
+          : 'Neuromuskuläre Leistung trainierst du mit maximalen, sehr kurzen Antritten und vollständiger Erholung dazwischen.' });
       break;
     }
     case 'recovery':
@@ -6951,7 +7783,9 @@ function generateTimeBasedWorkout(classKey, rp, learning){
     text:`${rp.freshnessWhy} Ich habe die Einheit deshalb kürzer angesetzt als üblich.` });
   if(rp.daysSinceRide!=null && rp.daysSinceRide>=7) rationale.push({ type:'warn',
     title:`Letzte Fahrt vor ${rp.daysSinceRide} Tagen`,
-    text:'Nach einer längeren Pause die erste Einheit bewusst konservativ angehen – die Wattwerte von vorher sind gerade nicht dein Maßstab.' });
+    text: rp.usingHr
+      ? 'Nach einer längeren Pause die erste Einheit bewusst konservativ angehen – die Pulswerte von vorher sind gerade nicht dein Maßstab.'
+      : 'Nach einer längeren Pause die erste Einheit bewusst konservativ angehen – die Wattwerte von vorher sind gerade nicht dein Maßstab.' });
 
   return { title, steps, rationale, adaptation, overridden:false, classKey };
 }
@@ -7107,41 +7941,60 @@ function computeLearningFactors(){
   });
   return { factor, history:list };
 }
-function complianceVerdict(complianceWeighted){
+function complianceVerdict(complianceWeighted, usingHr){
+  const metricLabel = usingHr ? 'des HF-Ziels' : 'der Zielleistung';
   if(complianceWeighted == null) return { verdict:'Keine bewertbaren Intervalle', verdictClass:'warn',
-    why:'Diese Einheit hatte keine Ziel-Abschnitte mit fester Leistungsvorgabe, oder die Aktivität deckt sie nicht ab.' };
+    why: usingHr
+      ? 'Diese Einheit hatte keine Ziel-Abschnitte mit festem HF-Ziel (z.B. weil sie nur RPE-Intervalle enthält), oder die Aktivität deckt sie nicht ab.'
+      : 'Diese Einheit hatte keine Ziel-Abschnitte mit fester Leistungsvorgabe, oder die Aktivität deckt sie nicht ab.' };
   if(complianceWeighted >= 0.97 && complianceWeighted <= 1.08) return { verdict:'Ziel getroffen', verdictClass:'good',
-    why:`Im Schnitt ${(complianceWeighted*100).toFixed(0)}% der Zielleistung auf den harten Abschnitten – genau im Rahmen.` };
+    why:`Im Schnitt ${(complianceWeighted*100).toFixed(0)}% ${metricLabel} auf den harten Abschnitten – genau im Rahmen.` };
   if(complianceWeighted > 1.08) return { verdict:'Über Ziel gefahren', verdictClass:'good',
-    why:`Im Schnitt ${(complianceWeighted*100).toFixed(0)}% der Zielleistung – du hast die Vorgabe übertroffen. Nächstes Mal etwas höher ansetzen.` };
+    why:`Im Schnitt ${(complianceWeighted*100).toFixed(0)}% ${metricLabel} – du hast die Vorgabe übertroffen. Nächstes Mal etwas höher ansetzen.` };
   if(complianceWeighted >= 0.85) return { verdict:'Knapp verfehlt', verdictClass:'warn',
-    why:`Im Schnitt ${(complianceWeighted*100).toFixed(0)}% der Zielleistung – leicht unter Vorgabe. Kann Tagesform, Ermüdung oder Wind gewesen sein.` };
+    why:`Im Schnitt ${(complianceWeighted*100).toFixed(0)}% ${metricLabel} – leicht unter Vorgabe. Kann Tagesform, Ermüdung oder Wind gewesen sein.` };
   return { verdict:'Deutlich verfehlt', verdictClass:'danger',
-    why:`Im Schnitt nur ${(complianceWeighted*100).toFixed(0)}% der Zielleistung erreicht. Die Vorgabe war für diesen Tag zu hoch angesetzt.` };
+    why:`Im Schnitt nur ${(complianceWeighted*100).toFixed(0)}% ${metricLabel} erreicht. Die Vorgabe war für diesen Tag zu hoch angesetzt.` };
 }
-function classTargetRange(classKey, config){
-  return (config.targetRangePct && config.targetRangePct[classKey]) || null;
+// usingHr picks the %LTHR table/metric instead of %FTP -- see
+// TRAINING_CONFIG.targetRangePctLthr's own comment for why the class->band
+// mapping itself is a fresh derivation, not a reuse of targetRangePct.
+function classTargetRange(classKey, config, usingHr){
+  const table = usingHr ? config.targetRangePctLthr : config.targetRangePct;
+  return (table && table[classKey]) || null;
 }
-function classIntervalVerdict(actualWatts, ftp, classKey, config){
-  if(actualWatts == null || !ftp) return null;
-  const range = classTargetRange(classKey, config);
+function classIntervalVerdict(actualValue, metricValue, classKey, config, usingHr){
+  if(actualValue == null || !metricValue) return null;
+  const range = classTargetRange(classKey, config, usingHr);
   if(!range) return null;
-  const pct = actualWatts / ftp;
+  const pct = actualValue / metricValue;
   if(pct >= range.min && pct <= range.max) return 'in-range';
   return pct < range.min ? 'below' : 'above';
 }
-function summarizeClassCompliance(perStep, classKey, ftp, config){
-  const intervals = (perStep||[]).filter(s=>s.kind==='interval' && s.span>0);
+// rp (not a bare ftp number) so the HF branch can read rp.usingHr/rp.lthr.
+// RPE-tagged steps (s.rpeLabel -- HF-mode VO2max/Anaerobic/Sprint, see
+// RPE_TARGET_BY_CLASS) are excluded from the whole class-compliance budget,
+// not just the per-step badge in evaluateWorkout(): comparing a measured bpm
+// against the class's %LTHR band for THESE steps would be systematically
+// misleading, since real HR during a 3s-30s all-out effort never gets close
+// to the >100%-LTHR band these classes target -- it would read as "below
+// target" on every single RPE interval regardless of actual effort.
+function summarizeClassCompliance(perStep, classKey, rp, config){
+  const usingHr = rp.usingHr;
+  const metricValue = usingHr ? rp.lthr : rp.ftp;
+  const intervals = (perStep||[]).filter(s=>s.kind==='interval' && s.span>0 && !s.rpeLabel);
   if(!intervals.length) return null;
   let plannedMin = 0, inRangeMin = 0;
   const rows = intervals.map(s => {
-    const verdict = classIntervalVerdict(s.actualWatts, ftp, classKey, config);
+    const actualValue = usingHr ? s.actualHr : s.actualWatts;
+    const targetValue = usingHr ? s.targetHr : s.targetWatts;
+    const verdict = classIntervalVerdict(actualValue, metricValue, classKey, config, usingHr);
     plannedMin += s.span/60;
     if(verdict === 'in-range') inRangeMin += s.span/60;
-    return { name: s.name, actualWatts: s.actualWatts, targetWatts: s.targetWatts, verdict };
+    return { name: s.name, actualValue, targetValue, verdict };
   });
   return {
-    classKey, range: classTargetRange(classKey, config), rows,
+    classKey, usingHr, range: classTargetRange(classKey, config, usingHr), rows,
     plannedMin: Math.round(plannedMin*10)/10,
     inRangeMin: Math.round(inRangeMin*10)/10,
     remainingMin: Math.max(0, Math.round((plannedMin-inRangeMin)*10)/10),
@@ -7151,14 +8004,19 @@ function summarizeClassCompliance(perStep, classKey, ftp, config){
 // steps — route-based workouts (steps carry startDist/endDist) are matched
 // by distance, time-based workouts by elapsed time. Reads `stream.heartrate`
 // (not `heart_rate`) to match normalizeStreams()'s own field naming, which
-// mirrors Strava's real stream-type key.
-function evaluateWorkout(stream, workout, ftp){
+// mirrors Strava's real stream-type key. Takes rp (not a bare ftp number) so
+// the HF branch can compare against stream.heartrate/rp.lthr instead of
+// stream.watts/rp.ftp -- power users see zero behavior change (same
+// stream.watts gate, same targetWatts math as before).
+function evaluateWorkout(stream, workout, rp){
   const steps = (workout && workout.steps) || [];
   const isRoute = steps.length > 0 && steps[0].startDist != null;
+  const usingHr = rp.usingHr;
+  const primaryKey = usingHr ? 'heartrate' : 'watts';
   if(isRoute){
-    if(!stream || !Array.isArray(stream.distance) || !Array.isArray(stream.watts)) return null;
+    if(!stream || !Array.isArray(stream.distance) || !Array.isArray(stream[primaryKey])) return null;
   } else {
-    if(!stream || !Array.isArray(stream.time) || !Array.isArray(stream.watts)) return null;
+    if(!stream || !Array.isArray(stream.time) || !Array.isArray(stream[primaryKey])) return null;
   }
   const axis = isRoute ? stream.distance : stream.time;
   const watts = stream.watts, hr = stream.heartrate;
@@ -7188,10 +8046,21 @@ function evaluateWorkout(stream, workout, ftp){
     const actualWatts = avgInRange(watts, lo, hi);
     const actualHr = avgInRange(hr, lo, hi);
     const maxHr = maxInRange(hr, lo, hi);
-    const targetWatts = Math.round(s.pct*ftp);
+    const base = { ...s, kind, span,
+      actualWatts: actualWatts!=null?Math.round(actualWatts):null,
+      actualHr: actualHr!=null?Math.round(actualHr):null,
+      maxHr: maxHr!=null?Math.round(maxHr):null };
+    // RPE steps never had a real-time bpm target -- no target/achieved
+    // comparison for them, measured HR above is still carried through.
+    if(s.rpeLabel) return { ...base, targetWatts:null, targetHr:null, achievedPct:null };
+    if(usingHr){
+      const targetHr = Math.round(s.pct*rp.lthr);
+      const achievedPct = actualHr!=null ? actualHr/targetHr : null;
+      return { ...base, targetHr, targetWatts:null, achievedPct };
+    }
+    const targetWatts = Math.round(s.pct*rp.ftp);
     const achievedPct = actualWatts!=null ? actualWatts/targetWatts : null;
-    return { ...s, kind, span, actualWatts: actualWatts!=null?Math.round(actualWatts):null, targetWatts, achievedPct,
-      actualHr: actualHr!=null?Math.round(actualHr):null, maxHr: maxHr!=null?Math.round(maxHr):null };
+    return { ...base, targetWatts, targetHr:null, achievedPct };
   });
 
   const intervalSteps = perStep.filter(s=>s.kind==='interval' && s.achievedPct!=null && s.span>0);
@@ -7201,9 +8070,9 @@ function evaluateWorkout(stream, workout, ftp){
   const plannedTotal = isRoute ? workout.totalDistanceM : cursor*60;
   const mismatchPct = plannedTotal ? Math.abs(actualTotal-plannedTotal)/plannedTotal*100 : null;
 
-  const v = complianceVerdict(complianceWeighted);
+  const v = complianceVerdict(complianceWeighted, usingHr);
   const classCompliance = (workout && workout.classKey)
-    ? summarizeClassCompliance(perStep, workout.classKey, ftp, TRAINING_CONFIG) : null;
+    ? summarizeClassCompliance(perStep, workout.classKey, rp, TRAINING_CONFIG) : null;
   return { perStep, complianceWeighted, ...v, actualTotal, mismatchPct, isRoute, classCompliance };
 }
 async function runTrainerEvaluation(workout, rp, learnGoalKey){
@@ -7211,11 +8080,15 @@ async function runTrainerEvaluation(workout, rp, learnGoalKey){
   if(!tp.evalActivityId){ tp.evalError = 'Bitte eine Aktivität auswählen.'; render(); return; }
   tp.evalLoading = true; tp.evalError = null; tp.evalResult = null; render();
   try{
+    // fetchActivityPowerStreams() already requests heartrate alongside watts
+    // (see its own comment), so the HF branch needs no separate fetch here.
     const raw = await fetchActivityPowerStreams(tp.evalActivityId, state.accessToken);
     const stream = normalizeStreams(raw);
-    const evaluation = evaluateWorkout(stream, workout, rp.ftp);
+    const evaluation = evaluateWorkout(stream, workout, rp);
     if(!evaluation){
-      tp.evalError = 'Diese Aktivität hat keine geeigneten Rohdaten-Streams (Leistungsmesser nötig).';
+      tp.evalError = rp.usingHr
+        ? 'Diese Aktivität hat keine geeigneten Rohdaten-Streams (Herzfrequenzdaten nötig).'
+        : 'Diese Aktivität hat keine geeigneten Rohdaten-Streams (Leistungsmesser nötig).';
     } else {
       recordEvaluation(learnGoalKey, tp.evalActivityId, evaluation);
       tp.evalResult = evaluation;
@@ -7263,6 +8136,27 @@ function buildZwo(workout, rp, goalLabelText){
 // the Artifact (cross-checked against the FIT SDK's global message numbers
 // for file_id/workout/workout_step); only rp/workout field access changed to
 // match this file's own naming, none of the binary layout did.
+//
+// workout_step's `target_type` (field 3) is the FIT SDK's wkt_step_target
+// enum. Verified against the official FIT SDK Profile (Garmin's Profile.xlsx,
+// cross-checked via its python-fitparse mirror, since no local FIT SDK/build
+// tool is available in this project): 0=speed, 1=heart_rate, 2=open,
+// 3=cadence, 4=power, 5=grade, 6=resistance, 7=power_3s, 8=power_10s,
+// 9=power_30s, 10=power_lap, 11=swim_stroke — the existing power branch's
+// literal `u8(4)` below is that enum's `power`, confirmed correct (a
+// generic online summary of this enum can read 3=power/4=grade instead;
+// the Profile-derived source above is the authoritative one and is what the
+// numbers below follow). `heart_rate`=1 is used for the new HR branch;
+// `open`=2 (no real-time target — free ride) is used for RPE-only interval
+// steps, since no FIT-native RPE target field exists.
+//
+// custom_target_value_low/high (fields 5/6) share one raw uint32 range with
+// the field-type's own zone-index encoding: for `workout_power`, 0-1000 means
+// %FTP and >1000 means watts+1000 (the existing +1000 offset below); for
+// `workout_hr`, 0-100 means %max-HR and >100 means bpm+100 — confirmed by the
+// same Profile source, so the "real bpm value + 100" convention this file's
+// plan called for is exactly the FIT SDK's own bpm_offset constant, not a
+// guess.
 const FIT_CRC_TABLE = [0x0000,0xCC01,0xD801,0x1400,0xF001,0x3C00,0x2800,0xE401,
                        0xA001,0x6C00,0x7800,0xB401,0x5000,0x9C01,0x8801,0x4400];
 function fitCrc(bytes, from, to, crc){
@@ -7335,13 +8229,43 @@ function buildFit(workout, rp){
   u8(7);   u8(1); u8(0x00);
 
   steps.forEach((s,i)=>{
-    const watts = Math.max(1, Math.round(s.pct*rp.ftp));
-    const lo = 1000 + Math.max(0, watts - Math.round(watts*0.04));
-    const hi = 1000 + watts + Math.round(watts*0.04);
+    let targetType, lo, hi, stepName = s.name;
+    if(rp.usingHr && s.rpeLabel){
+      // VO2max/Anaerobic/Sprint intervals in HF mode carry an RPE target
+      // instead of a real-time bpm target (plan §5) — there's no FIT-native
+      // RPE field, so `open` (no target, free ride) is the honest fit rather
+      // than faking a bpm range. The RPE info is folded into the step name
+      // itself since this local message definition has no separate `notes`
+      // field (def_num 8, not defined in the field list above) — adding one
+      // would also change every power-mode step's byte layout, which the
+      // regression requirement rules out.
+      //
+      // Bug 2 fix: the RPE marker sits as a PREFIX, not a suffix. fitString()
+      // below hard-truncates at FIT_STEP_NAME_LEN-1 = 23 bytes, and real base
+      // names (route-based `${baseLabel} ${n} (${km} km, ${grad}%)` labels,
+      // ~7259/7345; time-based "Satz N – Sprint M" labels, ~7581) routinely
+      // run past 23 bytes on their own -- a trailing " (RPE X)" suffix used
+      // to get silently cut off in exactly those cases, leaving the step
+      // with target_type=open AND no RPE text at all (zero guidance for the
+      // rider on-device). A short, fixed-length prefix survives truncation
+      // regardless of how long the base name is or grows in the future.
+      targetType = 2; // open
+      lo = 0; hi = 0;
+      stepName = `RPE ${s.rpeTarget} - ${s.name}`; // plain hyphen, not an en-dash: fitString() maps non-ASCII (besides umlauts) to '?', which would land right after the RPE number
+    } else {
+      // stepTargetValue() (~6000) already resolves pct*ftp vs pct*lthr the
+      // same way every other Trainer call site does — for the power branch
+      // this is byte-identical to the old `Math.round(s.pct*rp.ftp)`.
+      const target = Math.max(1, Math.round(stepTargetValue(s.pct, rp)));
+      const offset = rp.usingHr ? 100 : 1000; // workout_hr vs workout_power field-type offset, see comment above
+      targetType = rp.usingHr ? 1 : 4; // heart_rate : power
+      lo = offset + Math.max(0, target - Math.round(target*0.04));
+      hi = offset + target + Math.round(target*0.04);
+    }
     const intensity = i===0 ? 2 : (i===steps.length-1 ? 3 : (s.pct<=0.6 ? 1 : 0));
     u8(0x02);
     u16(i);
-    fitString(s.name, FIT_STEP_NAME_LEN).forEach(u8);
+    fitString(stepName, FIT_STEP_NAME_LEN).forEach(u8);
     if(s.distanceM != null){
       u8(1);
       u32(Math.max(100, Math.round(s.distanceM*100)));
@@ -7349,7 +8273,7 @@ function buildFit(workout, rp){
       u8(0);
       u32(Math.max(1000, Math.round(s.minutes*60*1000)));
     }
-    u8(4);
+    u8(targetType);
     u32(0);
     u32(lo); u32(hi);
     u8(intensity);
@@ -7465,7 +8389,11 @@ function slugify(s){
 // charts. Two variants (route elevation+power vs. plain time+power),
 // selected by tp.lastWorkout.routeBased — same "one canvas id, swapped
 // config" idea as buildTrainerChart() in the Artifact.
-function buildRouteWorkoutChart(workout, route, ftp){
+// rp instead of a bare ftp number so this can branch on rp.usingHr. The
+// power path resolves metric/unitLabel/axisLabel/zoneFn to exactly the same
+// values (rp.ftp/'W'/'Watt'/zoneFor) it used before this branch existed, so
+// power users see byte-identical chart output.
+function buildRouteWorkoutChart(workout, route, rp){
   const c = profilColors();
   const elevPts = [];
   const STRIDE = Math.max(1, Math.floor(route.points.length/400));
@@ -7473,10 +8401,15 @@ function buildRouteWorkoutChart(workout, route, ftp){
   const lastIdx = route.points.length-1;
   elevPts.push({x:route.points[lastIdx].dist/1000, y:route.smoothed[lastIdx]});
 
+  const metric = rp.usingHr ? rp.lthr : rp.ftp;
+  const unitLabel = rp.usingHr ? 'bpm' : 'W';
+  const axisLabel = rp.usingHr ? 'Puls (bpm)' : 'Watt';
+  const zoneFn = pct => stepZoneFor(pct, rp);
+
   const steps = workout.steps;
   const pwrPts = [];
   steps.forEach(s=>{
-    const w = Math.round(s.pct*ftp);
+    const w = Math.round(stepTargetValue(s.pct, rp));
     pwrPts.push({x:s.startDist/1000, y:w});
     pwrPts.push({x:s.endDist/1000, y:w});
   });
@@ -7487,36 +8420,60 @@ function buildRouteWorkoutChart(workout, route, ftp){
       { label:'Höhe', data:elevPts, yAxisID:'y', borderColor:c.chalkDim, backgroundColor:'rgba(152,161,174,0.18)',
         borderWidth:1.5, pointRadius:0, fill:true, tension:.15 },
       { label:'Zielleistung', data:pwrPts, yAxisID:'y2', borderWidth:2.5, pointRadius:0, fill:false,
-        segment:{ borderColor:ctx=>{ const idx = Math.min(Math.floor(ctx.p0DataIndex/2), steps.length-1); return zoneFor(steps[idx].pct).color; } } },
+        segment:{ borderColor:ctx=>{ const idx = Math.min(Math.floor(ctx.p0DataIndex/2), steps.length-1); return zoneFn(steps[idx].pct).color; } } },
     ]},
     options:{ responsive:true, maintainAspectRatio:false, interaction:{mode:'nearest',intersect:false},
       plugins:{ legend:{display:true, labels:{color:c.chalk, boxWidth:12, font:{size:11}}},
         tooltip:{ callbacks:{ title:it=>it.length?`${it[0].parsed.x.toFixed(1)} km`:'',
-          label:i=> i.dataset.label==='Höhe' ? `${Math.round(i.parsed.y)} m` : `${i.parsed.y} W (${zoneFor(i.parsed.y/ftp).name})` } } },
+          label:i=>{
+            if(i.dataset.label==='Höhe') return `${Math.round(i.parsed.y)} m`;
+            // RPE-Schritte (HF-Modus VO2max/Anaerob/Sprint) zeigen die
+            // RPE-Stufe im Tooltip statt einer bpm-Zahl -- gleiche Priorität
+            // wie in renderTrainerAblaufCard's Schrittliste.
+            const rpeStep = steps[Math.min(Math.floor(i.dataIndex/2), steps.length-1)];
+            if(rpeStep && rpeStep.rpeLabel) return rpeStep.rpeLabel;
+            return `${i.parsed.y} ${unitLabel} (${zoneFn(i.parsed.y/metric).name})`;
+          } } } },
       scales:{ x:{type:'linear', title:{display:true,text:'Kilometer',color:c.chalkDim}, grid:{color:c.line}, ticks:{color:c.chalkDim}},
         y:{position:'left', title:{display:true,text:'Höhe (m)',color:c.chalkDim}, grid:{color:c.line}, ticks:{color:c.chalkDim}},
-        y2:{position:'right', title:{display:true,text:'Watt',color:c.chalkDim}, grid:{display:false}, ticks:{color:c.chalkDim}, beginAtZero:true} } },
+        y2:{position:'right', title:{display:true,text:axisLabel,color:c.chalkDim}, grid:{display:false}, ticks:{color:c.chalkDim}, beginAtZero:true} } },
   });
 }
-function drawStepPowerChart(steps, ftp){
+// Same branching approach as buildRouteWorkoutChart() above.
+function drawStepPowerChart(steps, rp){
   const c = profilColors();
+  const metric = rp.usingHr ? rp.lthr : rp.ftp;
+  const unitLabel = rp.usingHr ? 'bpm' : 'W';
+  const axisLabel = rp.usingHr ? 'Puls (bpm)' : 'Watt';
+  const lineLabel = rp.usingHr ? 'LTHR' : 'FTP';
+  const zoneFn = pct => stepZoneFor(pct, rp);
+
   const pts=[]; let t=0;
-  steps.forEach(s=>{ const w=Math.round(s.pct*ftp); pts.push({x:t,y:w}); t+=s.minutes; pts.push({x:t,y:w}); });
+  steps.forEach(s=>{ const w=Math.round(stepTargetValue(s.pct, rp)); pts.push({x:t,y:w}); t+=s.minutes; pts.push({x:t,y:w}); });
   mountChart('velocastTrainerChart', {
     type:'line',
     data:{ datasets:[
       { label:'Zielleistung', data:pts, borderColor:c.route, borderWidth:2.5, pointRadius:0, fill:{target:'origin'},
         backgroundColor: ctx=>{ const g = ctx.chart.ctx.createLinearGradient(0,0,0,ctx.chart.height||300);
           g.addColorStop(0,'rgba(130,162,209,0.20)'); g.addColorStop(1,'rgba(130,162,209,0.02)'); return g; },
-        segment:{ borderColor:ctx=>zoneFor(steps[Math.min(Math.floor(ctx.p0DataIndex/2), steps.length-1)].pct).color } },
-      { label:'FTP', data:[{x:0,y:ftp},{x:t,y:ftp}], borderColor:c.strava, borderDash:[6,4], borderWidth:1.5, pointRadius:0, fill:false },
+        segment:{ borderColor:ctx=>zoneFn(steps[Math.min(Math.floor(ctx.p0DataIndex/2), steps.length-1)].pct).color } },
+      { label:lineLabel, data:[{x:0,y:metric},{x:t,y:metric}], borderColor:c.strava, borderDash:[6,4], borderWidth:1.5, pointRadius:0, fill:false },
     ]},
     options:{ responsive:true, maintainAspectRatio:false, interaction:{mode:'nearest',intersect:false},
       plugins:{ legend:{display:false}, tooltip:{ callbacks:{
         title:it=>it.length?`Minute ${Math.round(it[0].parsed.x)}`:'',
-        label:i=>`${i.parsed.y} W (${Math.round(i.parsed.y/ftp*100)}% FTP) – ${zoneFor(i.parsed.y/ftp).name}` } } },
+        label:i=>{
+          // Same RPE priority as buildRouteWorkoutChart() above -- only the
+          // 'Zielleistung' dataset maps to real steps (the LTHR/FTP reference
+          // line has none).
+          if(i.dataset.label==='Zielleistung'){
+            const rpeStep = steps[Math.min(Math.floor(i.dataIndex/2), steps.length-1)];
+            if(rpeStep && rpeStep.rpeLabel) return rpeStep.rpeLabel;
+          }
+          return `${i.parsed.y} ${unitLabel} (${Math.round(i.parsed.y/metric*100)}% ${lineLabel}) – ${zoneFn(i.parsed.y/metric).name}`;
+        } } } },
       scales:{ x:{type:'linear', title:{display:true,text:'Minuten',color:c.chalkDim}, grid:{color:c.line}, ticks:{color:c.chalkDim}},
-        y:{beginAtZero:true, title:{display:true,text:'Watt',color:c.chalkDim}, grid:{color:c.line}, ticks:{color:c.chalkDim}} } },
+        y:{beginAtZero:true, title:{display:true,text:axisLabel,color:c.chalkDim}, grid:{color:c.line}, ticks:{color:c.chalkDim}} } },
   });
 }
 const TRAINER_CHART_IDS = ['velocastTrainerChart'];
@@ -7526,10 +8483,10 @@ function mountTrainerChart(){
   if(!lw || !lw.steps || !lw.steps.length){ destroyProfilCharts(TRAINER_CHART_IDS); return; }
   if(lw.routeBased){
     const todayRoute = getTrainerRouteForDate(todayIsoKey());
-    if(todayRoute && todayRoute.route) buildRouteWorkoutChart(lw, todayRoute.route, lw.ftp);
+    if(todayRoute && todayRoute.route) buildRouteWorkoutChart(lw, todayRoute.route, lw.rp);
     else destroyProfilCharts(TRAINER_CHART_IDS);
   } else {
-    drawStepPowerChart(lw.steps, lw.ftp);
+    drawStepPowerChart(lw.steps, lw.rp);
   }
 }
 
@@ -7561,13 +8518,31 @@ function renderTrainerSummaryCards(appLoad, goalLabelText, isAuto){
 }
 function renderTrainerContextCards(rp){
   const freshCls = rp.freshnessClass==='good' ? 'up' : (rp.freshnessClass==='danger' ? 'down' : null);
-  return el('div', {class:'metric-grid'}, [
-    metricCard('Arbeits-FTP', `${rp.ftp} W`, `${rp.ftpSource}${rp.wPerKg?' · '+rp.wPerKg.toFixed(2)+' W/kg':''}`),
+  const workMetricCard = rp.usingHr
+    ? metricCard('Arbeits-LTHR', `${rp.lthr} bpm`, rp.lthrSource)
+    : metricCard('Arbeits-FTP', `${rp.ftp} W`, `${rp.ftpSource}${rp.wPerKg?' · '+rp.wPerKg.toFixed(2)+' W/kg':''}`);
+  const grid = el('div', {class:'metric-grid'}, [
+    workMetricCard,
     metricCard('Frische', rp.freshness, `ATL/CTL: ${rp.acwr!=null?rp.acwr.toFixed(2):'–'}`, freshCls),
     metricCard('Woche bisher', `${rp.hoursIn7.toFixed(1)} h`, `${rp.ridesIn7} Fahrt${rp.ridesIn7===1?'':'en'}`),
     metricCard('Letzte harte Einheit', rp.daysSinceHard!=null?`vor ${rp.daysSinceHard} Tag${rp.daysSinceHard===1?'':'en'}`:'keine erkannt',
       rp.daysSinceRide!=null?`letzte Fahrt vor ${rp.daysSinceRide} Tag${rp.daysSinceRide===1?'':'en'}`:null)
   ]);
+  // Issue 3 fix: blendedLoad.error used to be write-only (set by
+  // loadBlendedTrainingLoad() but never read by any UI) -- a persistent
+  // background-refresh failure (see the staleness trigger in
+  // trainerRiderContext()) was silently invisible, even though the cards
+  // above keep working fine off the last good cached snapshot. Minimal
+  // inline note only, since the cache fallback already covers the
+  // functional gap -- this is visibility, not a hard error state.
+  if(rp.usingHr && state.trainerPage.blendedLoad.error){
+    return el('div', {}, [
+      grid,
+      el('div', {class:'muted', style:'font-size:12px; margin-top:6px;'},
+        [`Trainingsbelastung konnte nicht aktualisiert werden (${state.trainerPage.blendedLoad.error}) – zeigt den zuletzt gespeicherten Stand.`])
+    ]);
+  }
+  return grid;
 }
 function renderTrainerGoalBar(chosen, W, rp){
   const card = el('div', {class:'card'});
@@ -7706,7 +8681,7 @@ function renderTrainerRouteCard(tp, selectedClassObj, todayRoute){
   if(tp.routeError) card.appendChild(el('div', {class:'error', style:'margin-top:10px;'}, [tp.routeError]));
   return card;
 }
-function renderHammerheadHint(fileName, distanceMode){
+function renderHammerheadHint(fileName, distanceMode, usingHr){
   const box = el('div', {class:'callout good', style:'margin-top:12px;'});
   box.appendChild(el('div',{class:'callout-title', style:'display:flex; align-items:center; gap:6px;'},[
     `✅ ${fileName} heruntergeladen`,
@@ -7717,7 +8692,7 @@ function renderHammerheadHint(fileName, distanceMode){
   body.appendChild(document.createTextNode('So kommt es auf den Karoo/das Gerät:'));
   const ol = el('ol', {style:'margin:6px 0 0 18px; padding:0; line-height:1.6;'});
   ol.appendChild(el('li',{},[ el('a',{href:'https://dashboard.hammerhead.io/workouts', target:'_blank', rel:'noopener noreferrer'},['dashboard.hammerhead.io/workouts']), ' öffnen' ]));
-  ol.appendChild(el('li',{},['Die gerade geladene Datei importieren (das Gerät akzeptiert .FIT' + (distanceMode?'':' und .ZWO') + ')']));
+  ol.appendChild(el('li',{},['Die gerade geladene Datei importieren (das Gerät akzeptiert .FIT' + (distanceMode||usingHr?'':' und .ZWO') + ')']));
   ol.appendChild(el('li',{},['Sobald das Gerät das nächste Mal online ist, synchronisiert es das Workout automatisch']));
   body.appendChild(ol);
   box.appendChild(body);
@@ -7761,6 +8736,16 @@ function renderTrainerWorkoutPreview(tp, ctx){
         const todayRoute = getTrainerRouteForDate(todayIsoKey());
         if(todayRoute && todayRoute.route) downloadBlob(buildCourseFit(todayRoute.route), base+'-strecke.fit', 'application/octet-stream');
       }}, ['.FIT (Strecke)']));
+    } else if(rp.usingHr){
+      // Zwift's .ZWO format has no native HF-target element (plan §4 row 5)
+      // -- rather than faking a fictional watt value, the export is hidden
+      // and replaced with an explanation. buildZwo() itself stays untouched
+      // and unreachable in HF mode (this is its only call site), so its
+      // "Arbeits-FTP X W" description text (plan row 16) never renders.
+      actions.appendChild(el('span', {style:'display:inline-flex; align-items:center; gap:4px; font-size:12px; color:var(--chalk-dim);'}, [
+        '.ZWO nicht verfügbar',
+        infoButton('Zwift-Workouts benötigen Leistungsziele – im HF-Modus nicht verfügbar.')
+      ]));
     } else {
       actions.appendChild(el('button', {class:'btn secondary', title:'Zwift-Workout-Format', onclick:()=>{
         downloadBlob(buildZwo(workout, rp, goalLabel(workoutGoalKey)), base+'.zwo', 'application/xml;charset=utf-8');
@@ -7780,17 +8765,30 @@ function renderTrainerWorkoutPreview(tp, ctx){
     if(goodRationale.length) body.appendChild(el('div',{style:'margin-bottom:10px;'},[infoButton(goodRationale.map(r=>r.text).join(' '))]));
     body.appendChild(el('div',{class:'chart-box tall'},[el('canvas',{id:'velocastTrainerChart'})]));
     if(!routeBased){
-      body.appendChild(el('div', {style:'margin-top:-4px; margin-bottom:8px;'}, [infoButton(ZONES.map(z=>legendDot(z.color, z.name)).concat([legendDot('#fc4c02','FTP-Linie')]))]));
+      // HF-Zweig: LTHR_ZONES statt ZONES, Referenzlinien-Punkt heißt "LTHR-Linie".
+      const legendZones = rp.usingHr ? LTHR_ZONES : ZONES;
+      const legendLineLabel = rp.usingHr ? 'LTHR-Linie' : 'FTP-Linie';
+      body.appendChild(el('div', {style:'margin-top:-4px; margin-bottom:8px;'}, [infoButton(legendZones.map(z=>legendDot(z.color, z.name)).concat([legendDot('#fc4c02',legendLineLabel)]))]));
     }
-    if(tp.hammerheadHint) body.appendChild(renderHammerheadHint(tp.hammerheadHint, routeBased||tp.exportDistanceMode));
+    if(tp.hammerheadHint) body.appendChild(renderHammerheadHint(tp.hammerheadHint, routeBased||tp.exportDistanceMode, rp.usingHr));
     const cards = [];
     if(routeBased){
       cards.push(metricCard('Distanz', `${metrics.totalDistanceKm.toFixed(1)} km`, `ca. ${Math.floor(metrics.totalMin/60)}:${String(metrics.totalMin%60).padStart(2,'0')} h geschätzt`));
     } else {
       cards.push(metricCard('Dauer', `${Math.floor(metrics.totalMin/60)}:${String(metrics.totalMin%60).padStart(2,'0')} h`, `${metrics.totalMin} Minuten`));
     }
-    cards.push(metricCard('Normalized Power', `${metrics.np} W`, `Ø ${metrics.avgPower} W · IF ${metrics.intensityFactor.toFixed(2)}${routeBased?' (geschätzt)':''}`));
-    cards.push(metricCard('Trainingsbelastung', `${metrics.tss} TSS`, `${metrics.tss<50?'leicht':metrics.tss<100?'moderat':metrics.tss<150?'fordernd':'sehr hart'}${routeBased?' (geschätzt)':''}`));
+    // HF-Zweig: workoutMetrics()/estimateRouteWorkoutMetrics() liefern in
+    // metrics.np/avgPower jetzt einen bpm-Zielwert statt Watt (kein NP-
+    // Äquivalent für HF, siehe deren Kommentar) -- Label/Einheit hier
+    // entsprechend umbenannt statt fälschlich "Normalized Power ... W" zu
+    // zeigen.
+    if(rp.usingHr){
+      cards.push(metricCard('Ø Ziel-Puls', `${metrics.np} bpm`, `IF (HF) ${metrics.intensityFactor.toFixed(2)}${routeBased?' (geschätzt)':''}`));
+      cards.push(metricCard('Trainingsbelastung', `${metrics.tss} hrTSS`, `${metrics.tss<50?'leicht':metrics.tss<100?'moderat':metrics.tss<150?'fordernd':'sehr hart'}${routeBased?' (geschätzt)':''}`));
+    } else {
+      cards.push(metricCard('Normalized Power', `${metrics.np} W`, `Ø ${metrics.avgPower} W · IF ${metrics.intensityFactor.toFixed(2)}${routeBased?' (geschätzt)':''}`));
+      cards.push(metricCard('Trainingsbelastung', `${metrics.tss} TSS`, `${metrics.tss<50?'leicht':metrics.tss<100?'moderat':metrics.tss<150?'fordernd':'sehr hart'}${routeBased?' (geschätzt)':''}`));
+    }
     cards.push(metricCard('Trainingsreiz', workout.adaptation, null));
     body.appendChild(el('div',{class:'metric-grid', style:'margin-top:14px;'}, cards));
     if(routeBased && specificity!=null){
@@ -7811,18 +8809,24 @@ function appendZoneBars(card, breakdown){
     card.appendChild(barRow(z.name, z.pct, z.color, `${Math.round(z.minutes)} min · ${z.pct.toFixed(0)}%`));
   });
 }
-function renderTrainerZonesCard(hasWorkout, zoneBreakdown, routeBased, actualWeekZones){
+function renderTrainerZonesCard(hasWorkout, zoneBreakdown, routeBased, actualWeekZones, rp){
+  // Both info texts below used to hard-assume the power branch (Watt-based
+  // target language, and a 7-vs-6-zone count mismatch that only exists
+  // against ZONES). In HF mode the app's own zone ladder above is LTHR_ZONES
+  // (also 7 zones) and the language is bpm, not Watt, so both need to branch
+  // on rp.usingHr instead of always describing the power case.
+  const usingHr = !!(rp && rp.usingHr);
   const card = el('div', {class:'card'});
   card.appendChild(el('h2', {}, ['Zonen']));
   if(hasWorkout){
     card.appendChild(el('div', {style:'display:flex; align-items:center; gap:6px; font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:2px 0 4px;'}, [
-      'Ausgewähltes Workout', infoButton(routeBased?'Geschätzt aus dem Streckenprofil.':'Aus der Zielleistung jedes Abschnitts.')
+      'Ausgewähltes Workout', infoButton(routeBased?'Geschätzt aus dem Streckenprofil.':(usingHr?'Aus dem HF-Ziel jedes Abschnitts.':'Aus der Zielleistung jedes Abschnitts.'))
     ]));
     appendZoneBars(card, zoneBreakdown);
   }
   card.appendChild(el('div', {style:'display:flex; align-items:center; gap:6px; font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:16px 0 4px;'}, [
     'Diese Woche, gefahren',
-    actualWeekZones.rides>0 ? infoButton(`${actualWeekZones.rides} Fahrt${actualWeekZones.rides===1?'':'en'} seit Montag, aus deinen echten Aktivitäten (Stravas 7 Zonen statt der 6 App-Zonen oben).`) : ''
+    actualWeekZones.rides>0 ? infoButton(`${actualWeekZones.rides} Fahrt${actualWeekZones.rides===1?'':'en'} seit Montag, aus deinen echten Aktivitäten (${usingHr ? 'Stravas 7 Leistungszonen aus deinen Fahrten mit Wattdaten – nur Fahrten mit Leistungsmesser zählen hier, unabhängig vom aktuellen Modus.' : 'Stravas 7 Zonen statt der 6 App-Zonen oben.'})`) : ''
   ]));
   if(actualWeekZones.rides>0){
     appendZoneBars(card, actualWeekZones);
@@ -7834,7 +8838,8 @@ function renderTrainerZonesCard(hasWorkout, zoneBreakdown, routeBased, actualWee
 function renderClassComplianceNoteEl(cc){
   const cls = trainingClass(cc.classKey);
   const label = cls ? cls.label : cc.classKey;
-  const rangeText = cc.range ? ` (Zielbereich ${Math.round(cc.range.min*100)}–${Math.round(cc.range.max*100)}% FTP)` : '';
+  const metricLabel = cc.usingHr ? 'LTHR' : 'FTP';
+  const rangeText = cc.range ? ` (Zielbereich ${Math.round(cc.range.min*100)}–${Math.round(cc.range.max*100)}% ${metricLabel})` : '';
   return el('div',{class:'legend-note', style:'margin-top:10px;'},[
     infoButton(`${label}-Budget aus dieser Fahrt: ${cc.inRangeMin}/${cc.plannedMin} min im Zielbereich${rangeText}, ${cc.remainingMin} min außerhalb.`)
   ]);
@@ -7849,13 +8854,24 @@ function appendEvaluationResult(box, ev){
   if(rows.length){
     box.appendChild(el('div',{style:'margin-top:10px;'},[dataTableNode(
       ['Abschnitt','Ziel','Ist','Erreicht','Ø/Max HF'],
-      rows.map(s=>[
-        s.name,
-        `${s.targetWatts} W`,
-        s.actualWatts!=null?`${s.actualWatts} W`:'–',
-        s.achievedPct!=null ? el('span',{class:s.achievedPct>=0.95?'up':(s.achievedPct<0.85?'down':'')},[`${(s.achievedPct*100).toFixed(0)}%`]) : '–',
-        s.actualHr!=null ? `${s.actualHr} / ${s.maxHr??'–'} bpm` : '–'
-      ])
+      rows.map(s=>{
+        // RPE-Schritte (HF-Modus VO2max/Anaerob/Sprint) hatten kein
+        // Echtzeit-bpm-Ziel -- Ziel/Ist/Erreicht bleiben leer, gemessene
+        // HF/Max-HF (letzte Spalte) wird trotzdem informativ gezeigt.
+        let ziel, ist, erreicht;
+        if(s.rpeLabel){
+          ziel = s.rpeLabel; ist = '–'; erreicht = '–';
+        } else if(s.targetHr!=null){
+          ziel = `${s.targetHr} bpm`;
+          ist = s.actualHr!=null ? `${s.actualHr} bpm` : '–';
+          erreicht = s.achievedPct!=null ? el('span',{class:s.achievedPct>=0.95?'up':(s.achievedPct<0.85?'down':'')},[`${(s.achievedPct*100).toFixed(0)}%`]) : '–';
+        } else {
+          ziel = `${s.targetWatts} W`;
+          ist = s.actualWatts!=null?`${s.actualWatts} W`:'–';
+          erreicht = s.achievedPct!=null ? el('span',{class:s.achievedPct>=0.95?'up':(s.achievedPct<0.85?'down':'')},[`${(s.achievedPct*100).toFixed(0)}%`]) : '–';
+        }
+        return [s.name, ziel, ist, erreicht, s.actualHr!=null ? `${s.actualHr} / ${s.maxHr??'–'} bpm` : '–'];
+      })
     )]));
   } else {
     box.appendChild(el('div',{class:'legend-note'},['Keine harten Ziel-Abschnitte in diesem Workout.']));
@@ -7904,14 +8920,22 @@ function renderTrainerAblaufCard(tp, ctx){
   const body = el('div', {style:'margin-top:10px;'});
   if(hasWorkout){
     const stepsBox = el('div', {class:'workout-steps'});
+    // HF-Zweig: Anzeigegröße wechselt zu bpm/lthrZoneFor über die zentralen
+    // stepZoneFor()/stepTargetValue()-Helper -- s.pct bleibt für alle Klassen
+    // unverändert der einzige Durchlaufwert. Für RPE-getaggte Schritte
+    // (VO2max/Anaerob/Sprint im HF-Modus, s.rpeLabel gesetzt) wird die
+    // RPE-Stufe statt einer bpm-Zahl/% gezeigt -- s.pct ist dort nur noch
+    // Backing-Wert für die Zonenfarbe links, kein angezeigtes Ziel mehr.
     workout.steps.forEach(s=>{
-      const z = zoneFor(s.pct), w = Math.round(s.pct*rp.ftp);
+      const z = stepZoneFor(s.pct, rp);
       const amount = s.distanceM!=null ? `${(s.distanceM/1000).toFixed(2)} km` : (s.minutes<1 ? `${Math.round(s.minutes*60)} s` : `${s.minutes} min`);
       const showGrad = s.gradient!=null && s.kind!=='warmup' && s.kind!=='activation' && s.kind!=='cooldown';
       const gradText = showGrad ? ` · Ø ${s.gradient>0?'+':''}${s.gradient.toFixed(1)}%` : '';
+      const targetText = s.rpeLabel ? s.rpeLabel
+        : `${Math.round(stepTargetValue(s.pct, rp))} ${rp.usingHr ? 'bpm' : 'W'} · ${Math.round(s.pct*100)}%`;
       const row = el('div', {class:'step', style:`border-left-color:${z.color};`});
       row.appendChild(el('span',{class:'step-name'},[ s.name + (s.note?' – '+s.note:'') ]));
-      row.appendChild(el('span',{class:'step-meta'},[ `${amount} · ${w} W · ${Math.round(s.pct*100)}%${gradText}` ]));
+      row.appendChild(el('span',{class:'step-meta'},[ `${amount} · ${targetText}${gradText}` ]));
       stepsBox.appendChild(row);
     });
     body.appendChild(stepsBox);
@@ -7931,7 +8955,9 @@ function renderTrainerAblaufCard(tp, ctx){
   if(!hasWorkout){
     evalSection.appendChild(el('div',{class:'legend-note'},['Wähle zuerst eine Workout-Art, um eine Vorschau zum Auswerten zu haben.']));
   } else {
-    evalH3.appendChild(infoButton('Vergleiche eine absolvierte Aktivität mit dieser Vorschau – Ist- gegen Soll-Leistung je Abschnitt (Ø-Leistung pro Intervall).'));
+    evalH3.appendChild(infoButton(rp.usingHr
+      ? 'Vergleiche eine absolvierte Aktivität mit dieser Vorschau – Ist- gegen Soll-Puls je Abschnitt (Ø-Puls pro Intervall).'
+      : 'Vergleiche eine absolvierte Aktivität mit dieser Vorschau – Ist- gegen Soll-Leistung je Abschnitt (Ø-Leistung pro Intervall).'));
     const row = el('div', {style:'display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:10px 0;'});
     const select = el('select', {style:'width:auto; min-width:220px; margin-bottom:0;'});
     select.appendChild(el('option',{value:''},['Aktivität wählen…']));
@@ -7983,7 +9009,9 @@ function renderTrainerPage(){
     const card = el('div', {class:'card'});
     card.appendChild(el('h2', {}, ['Trainer']));
     card.appendChild(el('div', {class:'muted', style:'margin-bottom:14px;'}, [
-      'Der Trainer baut auf deinem Leistungsprofil auf (FTP, Zonen, Trainingslast). Lade zuerst deine Trainingsdaten — das ist derselbe Ladevorgang wie im Profil-Tab.'
+      state.equipmentMode==='hr'
+        ? 'Der Trainer baut auf deinem Leistungsprofil auf (HF-Schwelle, Zonen, Trainingslast). Lade zuerst deine Trainingsdaten — das ist derselbe Ladevorgang wie im Profil-Tab.'
+        : 'Der Trainer baut auf deinem Leistungsprofil auf (FTP, Zonen, Trainingslast). Lade zuerst deine Trainingsdaten — das ist derselbe Ladevorgang wie im Profil-Tab.'
     ]));
     if(pp.error) card.appendChild(el('div',{class:'error', style:'margin-bottom:14px;'},[pp.error]));
     card.appendChild(el('button', {class:'btn', style:'width:100%;', onclick: ()=>loadProfilData(state.accessToken)}, ['Trainingsdaten laden']));
@@ -7991,11 +9019,22 @@ function renderTrainerPage(){
     return frag;
   }
   const rp = trainerRiderContext(pp);
-  if(!rp || !rp.ftp){
+  // HF-Zweig: die Gate-Bedingung prüft rp.lthr statt rp.ftp und verweist auf
+  // Einstellungen statt Profil, da LTHR (Auto-Schätzung + manueller Override)
+  // dort verwaltet wird, nicht im Profil-Tab. rp kann null sein, bevor
+  // pp.riderProfile existiert -- in dem Fall auf state.equipmentMode zurückfallen,
+  // um trotzdem den richtigen Leerzustand zu zeigen.
+  const usingHr = rp ? rp.usingHr : state.equipmentMode === 'hr';
+  if(!rp || !(usingHr ? rp.lthr : rp.ftp)){
     const card = el('div', {class:'card'});
     card.appendChild(el('h2', {}, ['Trainer']));
-    card.appendChild(el('div', {class:'empty-state'}, ['Kein FTP-Wert verfügbar – im Profil-Tab braucht es entweder ein hinterlegtes Strava-FTP oder auswertbare Fahrten mit Leistungsdaten.']));
-    card.appendChild(el('button', {class:'btn secondary', style:'margin-top:10px;', onclick: ()=>{ state.activePage='profil'; render(); }}, ['Zum Profil-Tab']));
+    if(usingHr){
+      card.appendChild(el('div', {class:'empty-state'}, ['Kein HF-Schwellenwert (LTHR) verfügbar – hinterlege in den Einstellungen einen manuellen LTHR-Wert oder lass ihn automatisch aus deinen Fahrten schätzen.']));
+      card.appendChild(el('button', {class:'btn secondary', style:'margin-top:10px;', onclick: ()=>{ state.activePage='einstellungen'; render(); }}, ['Zu den Einstellungen']));
+    } else {
+      card.appendChild(el('div', {class:'empty-state'}, ['Kein FTP-Wert verfügbar – im Profil-Tab braucht es entweder ein hinterlegtes Strava-FTP oder auswertbare Fahrten mit Leistungsdaten.']));
+      card.appendChild(el('button', {class:'btn secondary', style:'margin-top:10px;', onclick: ()=>{ state.activePage='profil'; render(); }}, ['Zum Profil-Tab']));
+    }
     frag.appendChild(card);
     return frag;
   }
@@ -8028,9 +9067,9 @@ function renderTrainerPage(){
   }
   const workoutExists = !!workout;
   const hasWorkout = !!(workout && workout.steps && workout.steps.length);
-  tp.lastWorkout = hasWorkout ? { steps:workout.steps, ftp:rp.ftp, routeBased } : null;
-  const metrics = hasWorkout ? (routeBased ? estimateRouteWorkoutMetrics(workout.steps, rp.ftp) : workoutMetrics(workout.steps, rp.ftp)) : null;
-  const zoneBreakdown = hasWorkout ? workoutZoneBreakdown(workout.steps, routeBased) : null;
+  tp.lastWorkout = hasWorkout ? { steps:workout.steps, rp, routeBased } : null;
+  const metrics = hasWorkout ? (routeBased ? estimateRouteWorkoutMetrics(workout.steps, rp) : workoutMetrics(workout.steps, rp)) : null;
+  const zoneBreakdown = hasWorkout ? workoutZoneBreakdown(workout.steps, routeBased, rp) : null;
   const specificity = (hasWorkout && routeBased) ? computeSpecificityScore(workout, workoutGoalKey) : null;
   const warnRationale = workoutExists ? (workout.rationale||[]).filter(r=>r.type==='warn'||r.type==='danger') : [];
   const goodRationale = workoutExists ? (workout.rationale||[]).filter(r=>r.type==='good') : [];
@@ -8038,7 +9077,7 @@ function renderTrainerPage(){
   const learnGoalKey = LEARNABLE_GOALS.includes(workoutGoalKey) ? workoutGoalKey : effectiveGoal;
   const analysisRides = pp.results.slice().sort((a,b)=>b.date-a.date).slice(0,25);
 
-  frag.appendChild(renderTrainerSummaryCards(pp.trainingLoad, GOALS[chosen]?GOALS[chosen].label:chosen, chosen==='auto'));
+  frag.appendChild(renderTrainerSummaryCards(rp.usingHr ? rp.blendedLoad : pp.trainingLoad, GOALS[chosen]?GOALS[chosen].label:chosen, chosen==='auto'));
   frag.appendChild(renderTrainerContextCards(rp));
   frag.appendChild(renderTrainerGoalBar(chosen, W, rp));
   frag.appendChild(renderTrainerDecisionDashboard(trainingState, W, dashboardOpportunity));
@@ -8047,9 +9086,9 @@ function renderTrainerPage(){
     frag.appendChild(renderTrainerRouteCard(tp, selectedClassObj, todayRoute));
     frag.appendChild(renderTrainerWorkoutPreview(tp, { workout, workoutExists, hasWorkout, routeBased, rp, metrics, zoneBreakdown, specificity, workoutGoalKey, warnRationale, goodRationale }));
   }
-  frag.appendChild(renderTrainerZonesCard(hasWorkout, zoneBreakdown, routeBased, actualWeekZones));
+  frag.appendChild(renderTrainerZonesCard(hasWorkout, zoneBreakdown, routeBased, actualWeekZones, rp));
   frag.appendChild(renderTrainerAblaufCard(tp, { workout, hasWorkout, rp, learning, learnGoalKey, analysisRides }));
-  frag.appendChild(el('div',{class:'legend-note'},['Trainingsempfehlungen sind aus deinen Daten abgeleitete Orientierung, kein Ersatz für individuelle Trainerbetreuung oder ärztliche Abklärung. Achte auf Signale deines Körpers, die in Wattwerten nicht auftauchen.']));
+  frag.appendChild(el('div',{class:'legend-note'},[`Trainingsempfehlungen sind aus deinen Daten abgeleitete Orientierung, kein Ersatz für individuelle Trainerbetreuung oder ärztliche Abklärung. Achte auf Signale deines Körpers, die in ${rp.usingHr?'Pulswerten':'Wattwerten'} nicht auftauchen.`]));
   return frag;
 }
 
@@ -8404,6 +9443,126 @@ function resetConfigSlice(basePath){
   saveConfigOverrides(overrides);
 }
 
+// Manual LTHR override row — reuses TRAINING_CONFIG.rider.lthrOverride via
+// the exact same setConfigOverride()/getByPath()/setByPath() persistence
+// settingsFieldRow() itself uses, just with bespoke rendering: unlike every
+// other numeric field, `null` here is a meaningful, common, *intended* state
+// ("keep using the auto-estimate") rather than a parse failure to fall back
+// from, so it can't reuse settingsFieldRow()'s plain number-input branch
+// as-is.
+function buildLthrOverrideRow(){
+  const path = 'rider.lthrOverride';
+  const val = getByPath(TRAINING_CONFIG, path);
+  const id = 'sf-' + path.replace(/\./g, '-');
+  const hp = state.trainerPage.hrProfile;
+
+  const numInput = el('input', {type:'number', id, step:1, min:80, max:220, value: val==null ? '' : val, placeholder:'automatisch geschätzt', onchange:(e)=>{
+    const raw = e.target.value.trim();
+    let value = raw==='' ? null : parseFloat(raw);
+    if(value != null && !isFinite(value)){ value = getByPath(TRAINING_CONFIG_DEFAULTS, path); e.target.value = value==null ? '' : value; }
+    // The input's min/max=80/220 attrs are advisory only -- they don't clamp
+    // a value read via e.target.value in an onchange handler, so a stray
+    // entry like 500 would otherwise flow straight into rp.lthr unchecked.
+    // Clamp into the same sanity range the auto-estimate is held to
+    // (estimateLthrFromHrCurve() above).
+    if(value != null){ value = Math.min(220, Math.max(80, value)); e.target.value = value; }
+    setByPath(TRAINING_CONFIG, path, value);
+    setConfigOverride(path, value);
+    flashSettingsSaved();
+  }});
+  const inputEl = el('span', {class:'tsettings-input-wrap'}, [numInput, el('span', {class:'tsettings-unit'}, ['bpm'])]);
+
+  const helpText = 'Manuell hinterlegter HF-Schwellenwert (LTHR). Leer lassen, um die automatische Schätzung aus deinen Fahrten zu nutzen. Bestimmt bei aktiviertem "Nur Herzfrequenzgurt"-Modus die Trainingszonen und Workout-Ziele im Trainer-Tab.';
+  const label = el('label', {for:id, style:'display:flex; align-items:center; gap:6px;'}, ['Manuelle LTHR', infoButton(helpText)]);
+  const main = el('div', {class:'tsettings-row-main'}, [label, inputEl]);
+
+  // Override checked first now: TRAINING_CONFIG.rider.lthrOverride always
+  // wins in trainerRiderContext(), so once a manual value is active that's
+  // the primary status. A stale error from an earlier failed auto-estimate
+  // is demoted to a small secondary line underneath instead of being shown
+  // as *the* status -- otherwise it keeps looking like the manual entry
+  // itself failed, even though it saved fine and is in effect.
+  let statusText, statusSubText = null;
+  if(val != null){
+    statusText = `Manueller Wert aktiv (${val} bpm) – überschreibt die automatische Schätzung.`;
+    if(hp.error) statusSubText = `Letzte automatische Schätzung fehlgeschlagen: ${hp.error}`;
+  }
+  else if(hp.error) statusText = hp.error;
+  else if(hp.loading) statusText = 'Schätzung läuft…';
+  else if(hp.estimate) statusText = `Automatisch geschätzt: ${hp.estimate} bpm (${hp.source || ''})`;
+  else statusText = 'Noch keine automatische Schätzung vorhanden.';
+
+  // Plain click reuses the cache (no forceRefresh) so it can't burn through
+  // Strava's rate limit on a couple of accidental double-clicks. forceRefresh
+  // only kicks in once an estimate already exists and the rider clicks again
+  // -- at that point "get me a fresh one" is the only plausible intent left,
+  // since a from-scratch run already reads the cache for free.
+  const hasEstimate = !!hp.estimate;
+  const estimateBtn = el('button', {type:'button', class:'btn secondary', style:'margin-top:8px;',
+    disabled: (hp.loading || !state.accessToken) ? 'disabled' : null,
+    onclick: ()=>{ loadHrLthrEstimate(state.accessToken, {forceRefresh: hasEstimate}); }
+  }, [hp.loading ? 'Schätzung läuft…' : (hasEstimate ? 'Neu berechnen' : 'Automatisch schätzen')]);
+
+  const statusChildren = [el('div', {class:'muted', style:'font-size:12px; margin-top:4px;'}, [statusText])];
+  if(statusSubText) statusChildren.push(el('div', {class:'muted', style:'font-size:11px; margin-top:2px;'}, [statusSubText]));
+
+  return el('div', {class:'tsettings-row'}, [
+    main,
+    ...statusChildren,
+    estimateBtn
+  ]);
+}
+
+// New card, deliberately named differently from Profil's "Ausrüstung" card
+// (Verschleißteile) to avoid a naming collision — this one switches whether
+// the Trainer tab is powered by a power meter (FTP) or a heart-rate strap
+// alone (LTHR). See plan §3.
+function buildEquipmentModeCard(){
+  const card = el('div', {class:'card'});
+  card.appendChild(el('h2', {style:'display:flex; align-items:center; gap:8px;'}, [
+    'Leistungsmesser oder Herzfrequenz',
+    infoButton('Bestimmt, ob Trainingszonen, Workout-Ziele und Trainingsbelastung aus Watt (FTP) oder aus Herzfrequenz (LTHR) berechnet werden.')
+  ]));
+
+  const usingHr = state.equipmentMode === 'hr';
+  const toggleId = 'sf-equipmentMode';
+  const cb = el('input', {type:'checkbox', id:toggleId, onchange:(e)=>{
+    const next = e.target.checked ? 'hr' : 'power';
+    state.equipmentMode = next;
+    saveSettings();
+    // Lazy-trigger, per plan: only on the first switch to 'hr' when there's
+    // neither a manual override nor an already-loaded estimate — never
+    // blocks this render, loadHrLthrEstimate() re-renders itself when done.
+    if(next==='hr' && !TRAINING_CONFIG.rider.lthrOverride && !state.trainerPage.hrProfile.loaded && !state.trainerPage.hrProfile.loading && state.accessToken){
+      loadHrLthrEstimate(state.accessToken);
+    }
+    // Same lazy-trigger idea for the blended training-load model (plan §7) --
+    // independent of any lthrOverride check since this ingests raw activity
+    // rows, not a derived LTHR number; buildBlendedTrainingLoad() recomputes
+    // from those rows fresh on every trainerRiderContext() call regardless of
+    // what ftp/lthr currently resolve to.
+    if(next==='hr' && !state.trainerPage.blendedLoad.loaded && !state.trainerPage.blendedLoad.loading && state.accessToken){
+      loadBlendedTrainingLoad(state.accessToken);
+    }
+    // render() replaces the DOM subtree (incl. #settingsSavedNote), so
+    // flashSettingsSaved() must run AFTER it — calling it first grabs the
+    // about-to-be-detached node and its setTimeout writes to nothing.
+    render();
+    flashSettingsSaved();
+  }});
+  if(usingHr) cb.checked = true;
+  const toggleInput = el('label', {class:'tsettings-switch'}, [cb, el('span', {class:'tsettings-slider'})]);
+  const toggleLabel = el('label', {for:toggleId}, [usingHr ? 'Nur Herzfrequenzgurt' : 'Leistungsmesser']);
+  card.appendChild(el('div', {class:'tsettings-row'}, [
+    el('div', {class:'tsettings-row-main'}, [toggleLabel, toggleInput])
+  ]));
+
+  card.appendChild(buildLthrOverrideRow());
+  card.appendChild(el('button', {class:'btn secondary', style:'margin-top:8px;', onclick: ()=>{ resetConfigSlice('rider'); render(); }}, ['Zurücksetzen']));
+
+  return card;
+}
+
 function renderEinstellungenPage(){
   const frag = document.createDocumentFragment();
 
@@ -8413,6 +9572,8 @@ function renderEinstellungenPage(){
     el('span', {id:'settingsSavedNote', class:'tsettings-saved-note'}, ['Gespeichert ✓']),
   ]));
   frag.appendChild(headerCard);
+
+  frag.appendChild(buildEquipmentModeCard());
 
   const classCard = el('div', {class:'card'});
   classCard.appendChild(el('h2', {style:'display:flex; align-items:center; gap:8px;'}, ['Trainingsklassen-Constraints', infoButton('Pro Klasse: welche Steigung als ideal/akzeptabel gilt, wie lang Intervalle und Pausen sein dürfen, und wie viel Strecke mindestens nötig ist.')]));
