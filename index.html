@@ -3894,44 +3894,7 @@ function renderDetailHeader(title, backLabel, onBack){
   ]);
 }
 
-function renderRouteCard(){
-  const card = el("div", {class:"card"});
-
-  if(isShowingSegmentDetail()){
-    const bucket = segmentBucket("route");
-    const seg = bucket.list.find(s => s.id === state.selectedSegmentId);
-    if(!seg){
-      // Selection survived into a state where the "route" bucket no longer
-      // has this id (e.g. stale after a route change raced with a fetch) —
-      // recover by clearing it and falling through to the normal route card
-      // below instead of rendering an empty "Segment" shell (heading + back
-      // button + blank map, with nothing in between).
-      state.selectedSegmentId = null;
-      state.selectedSegmentSource = null;
-    } else {
-      card.appendChild(renderDetailHeader("Segment", "Zur Strecke", () => {
-        // Capture BEFORE clearing selectedSegmentId/Source below — reading
-        // them after would already be null. Mirrors selectSegment()'s own
-        // open-path scroll idiom (requestAnimationFrame + scrollIntoView),
-        // just pointed at the list row instead of the map, so closing the
-        // tall map+detail view lands the user back where they were instead
-        // of at whatever raw pixel offset the page reflowed to.
-        const segId = seg.id, source = "route";
-        state.selectedSegmentId = null; state.selectedSegmentSource = null;
-        render();
-        requestAnimationFrame(()=>{
-          document.getElementById(`segment-row-${source}-${segId}`)?.scrollIntoView({behavior:"smooth", block:"center"});
-        });
-      }));
-      card.appendChild(renderSegmentRow(seg, bucket, {clickable:false}));
-      card.appendChild(renderSegmentLeaderboard(seg));
-      card.appendChild(routeMapContainer);
-      return card;
-    }
-  }
-
-  card.appendChild(el("h2", {}, ["Strecke"]));
-
+function renderRoutePersistentSettingsRow(card){
   // Sync the persistent settings-row inputs' live values from state before
   // (re)inserting them — see the "persistent settings-row inputs" comment
   // near their declaration below for why these are never recreated by el().
@@ -3957,7 +3920,9 @@ function renderRouteCard(){
   ]);
   card.appendChild(settingsRow);
   card.appendChild(el("div", {style:"margin-bottom:12px;"}, [infoButton("Wetterwerte werden jeweils für den erwarteten Ankunftszeitpunkt an diesem Punkt berechnet.")]));
+}
 
+function renderRouteSourceTabs(card){
   {
     const tabs = [];
     if(state.connected){
@@ -4031,7 +3996,9 @@ function renderRouteCard(){
       card.appendChild(renderGpxUploadRow());
     }
   }
+}
 
+function renderRouteMapSection(card){
   // The map container is appended whenever we have coordinates at all —
   // including while weather is still loading — rather than only once
   // weatherAtRoute is populated. It's the same persistent routeMapContainer
@@ -4134,6 +4101,51 @@ function renderRouteCard(){
   } else if(state.selectedActivity){
     card.appendChild(el("div", {class:"empty-state", style:"margin-top:12px;"}, ["Für diese Aktivität liegt keine Streckenkarte vor."]));
   }
+}
+
+function renderRouteCard(){
+  const card = el("div", {class:"card"});
+
+  if(isShowingSegmentDetail()){
+    const bucket = segmentBucket("route");
+    const seg = bucket.list.find(s => s.id === state.selectedSegmentId);
+    if(!seg){
+      // Selection survived into a state where the "route" bucket no longer
+      // has this id (e.g. stale after a route change raced with a fetch) —
+      // recover by clearing it and falling through to the normal route card
+      // below instead of rendering an empty "Segment" shell (heading + back
+      // button + blank map, with nothing in between).
+      state.selectedSegmentId = null;
+      state.selectedSegmentSource = null;
+    } else {
+      card.appendChild(renderDetailHeader("Segment", "Zur Strecke", () => {
+        // Capture BEFORE clearing selectedSegmentId/Source below — reading
+        // them after would already be null. Mirrors selectSegment()'s own
+        // open-path scroll idiom (requestAnimationFrame + scrollIntoView),
+        // just pointed at the list row instead of the map, so closing the
+        // tall map+detail view lands the user back where they were instead
+        // of at whatever raw pixel offset the page reflowed to.
+        const segId = seg.id, source = "route";
+        state.selectedSegmentId = null; state.selectedSegmentSource = null;
+        render();
+        requestAnimationFrame(()=>{
+          document.getElementById(`segment-row-${source}-${segId}`)?.scrollIntoView({behavior:"smooth", block:"center"});
+        });
+      }));
+      card.appendChild(renderSegmentRow(seg, bucket, {clickable:false}));
+      card.appendChild(renderSegmentLeaderboard(seg));
+      card.appendChild(routeMapContainer);
+      return card;
+    }
+  }
+
+  card.appendChild(el("h2", {}, ["Strecke"]));
+
+  renderRoutePersistentSettingsRow(card);
+
+  renderRouteSourceTabs(card);
+
+  renderRouteMapSection(card);
 
   return card;
 }
