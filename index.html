@@ -8981,27 +8981,36 @@ function renderTrainerGoalBar(chosen, W, rp){
   ]));
   return card;
 }
-function renderTrainerDecisionDashboard(trainingState, weaknessData, opportunity){
+function renderTrainerDecisionDashboard(trainingState, weaknessData, opportunity, budgetsUnavailable){
   const card = el('div', {class:'card'});
   card.appendChild(el('h2',{},['Trainings-Dashboard']));
   if(weaknessData) card.appendChild(el('div',{style:'margin-bottom:10px;'},[collapsedResult(`Größter Hebel: ${weaknessData.headline}`, weaknessData.reason)]));
   card.appendChild(el('div',{style:'margin-bottom:6px; font-weight:600; font-size:13px;'},['Prioritäten & Wochenbudgets']));
-  TRAINING_CLASSES.filter(c=>c.priorityEligible).forEach(c=>{
-    const tier = trainingState.priorities[c.key] || 'MAINTENANCE';
-    const badge = PRIORITY_BADGE[tier] || PRIORITY_BADGE.MAINTENANCE;
-    const budget = trainingState.budgets[c.key];
-    const pct = (budget && budget.target>0) ? Math.max(0,Math.min(100, budget.done/budget.target*100)) : 0;
-    const row = el('div', {class:'bar-row'});
-    // Badge is a separate flex sibling, NOT nested inside .bar-label — that
-    // span has overflow:hidden/white-space:nowrap (see .bar-row .bar-label),
-    // which would clip the badge for anything longer than the shortest class
-    // names (e.g. "VO2max") once appended as a child of the truncating box.
-    row.appendChild(el('span', {class:'bar-label', title:c.label}, [c.label]));
-    row.appendChild(el('span', {style:`flex:0 0 auto; padding:1px 7px; border-radius:10px; font-size:10.5px; font-weight:600; color:${badge.fg}; background:${badge.bg};`}, [badge.label]));
-    row.appendChild(el('span',{class:'bar-track'},[el('span',{style:`display:block; height:100%; border-radius:var(--r-full); width:${pct}%; background:${badge.fg};`},[])]));
-    row.appendChild(el('span',{class:'bar-num'},[formatBudgetLine(budget)]));
-    card.appendChild(row);
-  });
+  if(budgetsUnavailable){
+    // weeklyClassProgress()/classNeglectWeeks() read results[].metrics.zoneTimes,
+    // which only ever exists on pp.results' device_watts-filtered rows (see
+    // loadProfilData()) -- always empty for HR-only riders, same root cause
+    // already fixed for trainerRiderContext()'s own fields ("Issue 4 fix",
+    // ~7083). Rather than showing confidently-wrong 0/target bars, say so.
+    card.appendChild(el('div',{class:'legend-note'},['Wochenbudgets sind für reine HF-Konten (ohne Leistungsmesser) aktuell nicht verfügbar – die Berechnung basiert auf watt-gemessenen Trainingszonen.']));
+  } else {
+    TRAINING_CLASSES.filter(c=>c.priorityEligible).forEach(c=>{
+      const tier = trainingState.priorities[c.key] || 'MAINTENANCE';
+      const badge = PRIORITY_BADGE[tier] || PRIORITY_BADGE.MAINTENANCE;
+      const budget = trainingState.budgets[c.key];
+      const pct = (budget && budget.target>0) ? Math.max(0,Math.min(100, budget.done/budget.target*100)) : 0;
+      const row = el('div', {class:'bar-row'});
+      // Badge is a separate flex sibling, NOT nested inside .bar-label — that
+      // span has overflow:hidden/white-space:nowrap (see .bar-row .bar-label),
+      // which would clip the badge for anything longer than the shortest class
+      // names (e.g. "VO2max") once appended as a child of the truncating box.
+      row.appendChild(el('span', {class:'bar-label', title:c.label}, [c.label]));
+      row.appendChild(el('span', {style:`flex:0 0 auto; padding:1px 7px; border-radius:10px; font-size:10.5px; font-weight:600; color:${badge.fg}; background:${badge.bg};`}, [badge.label]));
+      row.appendChild(el('span',{class:'bar-track'},[el('span',{style:`display:block; height:100%; border-radius:var(--r-full); width:${pct}%; background:${badge.fg};`},[])]));
+      row.appendChild(el('span',{class:'bar-num'},[formatBudgetLine(budget)]));
+      card.appendChild(row);
+    });
+  }
   if(opportunity){
     if(opportunity.suitable){
       const suitText = opportunity.suitability ? ` Streckeneignung: ${opportunity.suitability.score}/100.` : '';
@@ -9501,7 +9510,7 @@ function renderTrainerPage(){
   frag.appendChild(renderTrainerSummaryCards(rp.usingHr ? rp.blendedLoad : pp.trainingLoad, GOALS[chosen]?GOALS[chosen].label:chosen, chosen==='auto'));
   frag.appendChild(renderTrainerContextCards(rp));
   frag.appendChild(renderTrainerGoalBar(chosen, W, rp));
-  frag.appendChild(renderTrainerDecisionDashboard(trainingState, W, dashboardOpportunity));
+  frag.appendChild(renderTrainerDecisionDashboard(trainingState, W, dashboardOpportunity, rp.usingHr && !pp.results.length));
   frag.appendChild(renderTrainerClassPicker(tp, trainingState, recommendedClassKey));
   if(selectedClassObj){
     frag.appendChild(renderTrainerRouteCard(tp, selectedClassObj, todayRoute));
