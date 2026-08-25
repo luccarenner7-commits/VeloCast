@@ -7522,9 +7522,19 @@ function placeIntervalsOnRoute(route, spec, adj, classKey, config, options){
     ? (options.intersectionCandidates
         || detectIntersectionCandidates(route.points, config.constraints.common.intersectionTurnDeg, config.constraints.common.intersectionGapM))
     : [];
-  const tierOf = zoneSegs.map(s => (classKey && config)
-    ? evaluateSegmentForClass(s, classKey, config, { ignoreCurve, ignoreIntersections, intersections }).tier
-    : (s.type==='descent' || s.curvy ? 'unsuitable' : 'acceptable'));
+  const evalOf = zoneSegs.map(s => (classKey && config)
+    ? evaluateSegmentForClass(s, classKey, config, { ignoreCurve, ignoreIntersections, intersections })
+    : { tier: (s.type==='descent' || s.curvy ? 'unsuitable' : 'acceptable'), reasons: [] });
+  const tierOf = evalOf.map(e => e.tier);
+  // Nur echte Ablehnungsgründe (Steigung/Kurvigkeit/Kreuzung) sammeln, nicht
+  // die Abfahrten-Ausschlussmeldung (eigener früher return in
+  // evaluateSegmentForClass) und nicht Kapazitäts-Lücken aus packPass()
+  // (dort wird nie ein reasons-Eintrag erzeugt) -- beides bewusst außerhalb
+  // des Scopes.
+  const rejectedSegments = zoneSegs
+    .map((s, si) => ({ s, reasons: evalOf[si].reasons }))
+    .filter(({ s, reasons }) => s.type !== 'descent' && reasons && reasons.length)
+    .map(({ s, reasons }) => ({ startDist: s.startDist, endDist: s.endDist, reasons }));
 
   const assign = new Map();
   let qi = 0, placedCount = 0;
@@ -7600,7 +7610,7 @@ function placeIntervalsOnRoute(route, spec, adj, classKey, config, options){
 
   if(cDist > 0.5) steps.push(rseg(spec.cooldown.label, totalDist-cDist, totalDist, spec.cooldown.pct, spec.cooldown.note, 'cooldown', 'flat', 0));
 
-  return { steps, placedIntervalMin, targetIntervalMin, intervalCount: intervalCounter, targetCount: spec.reps.length };
+  return { steps, placedIntervalMin, targetIntervalMin, intervalCount: intervalCounter, targetCount: spec.reps.length, rejectedSegments };
 }
 
 function goalLabel(goal){
@@ -7659,9 +7669,14 @@ function generateRouteWorkout(goal, rp, route, learning, config, classKey, optio
   const placement = placeIntervalsOnRoute(route, spec, adj, classKey || null, config, options);
 
   if(placement.intervalCount === 0){
+    let noneText = `Die Route bietet kein ausreichend geeignetes Terrain (ideal oder akzeptabel) für „${goalLabel(goal)}" (nur Abfahrten, zu kurvig, außerhalb des Steigungsbands, oder die Route ist zu kurz). Die ganze Strecke wird stattdessen moderat gefahren.`;
+    if(placement.rejectedSegments && placement.rejectedSegments.length){
+      const bits = placement.rejectedSegments.map(r =>
+        `Bei km ${(r.startDist/1000).toFixed(1)}–${(r.endDist/1000).toFixed(1)}: ${r.reasons.join(' ')}`);
+      noneText += ' ' + bits.join(' ');
+    }
     return { title:'Streckenfahrt (keine passenden Abschnitte für Intervalle gefunden)', steps: placement.steps,
-      rationale:[{ type:'warn', title:'Keine passenden Abschnitte',
-        text:`Die Route bietet kein ausreichend geeignetes Terrain (ideal oder akzeptabel) für „${goalLabel(goal)}" (nur Abfahrten, zu kurvig, außerhalb des Steigungsbands, oder die Route ist zu kurz). Die ganze Strecke wird stattdessen moderat gefahren.` }],
+      rationale:[{ type:'warn', title:'Keine passenden Abschnitte', text: noneText }],
       adaptation:'Grundlage (Ersatz)', overridden:false, routeBased:true,
       totalDistanceM:route.totalDistanceM, intervalSegments:[] };
   }
@@ -7669,8 +7684,13 @@ function generateRouteWorkout(goal, rp, route, learning, config, classKey, optio
   const rationale = [{ type:'good', title: spec.title,
     text:`Ich habe ${placement.intervalCount} von ${placement.targetCount} geplanten ${spec.reps[0].label}-Wiederholungen auf dieser Route untergebracht – zuerst auf idealem Terrain, bei Bedarf auch auf nur akzeptablem. Dazwischen fährst du terrainabhängig weiter, wie bei einer echten Fahrt statt starrer Zeit-Intervalle.` }];
   if(placement.placedIntervalMin < placement.targetIntervalMin - 0.5){
-    rationale.push({ type:'warn', title:'Route reicht nicht für die volle Dosis',
-      text:`Von den geplanten ${Math.round(placement.targetIntervalMin)} harten Minuten passen nur ${Math.round(placement.placedIntervalMin)} auf diese Route (zu kurz, zu wenig geeignetes Terrain, oder zu kurvig für gleichmäßige Intervalle). Für die volle Einheit hilft eine längere/geradere Strecke oder das zeitbasierte Workout ohne Route.` });
+    let shortfallText = `Von den geplanten ${Math.round(placement.targetIntervalMin)} harten Minuten passen nur ${Math.round(placement.placedIntervalMin)} auf diese Route (zu kurz, zu wenig geeignetes Terrain, oder zu kurvig für gleichmäßige Intervalle). Für die volle Einheit hilft eine längere/geradere Strecke oder das zeitbasierte Workout ohne Route.`;
+    if(placement.rejectedSegments && placement.rejectedSegments.length){
+      const bits = placement.rejectedSegments.map(r =>
+        `Bei km ${(r.startDist/1000).toFixed(1)}–${(r.endDist/1000).toFixed(1)}: ${r.reasons.join(' ')}`);
+      shortfallText += ' ' + bits.join(' ');
+    }
+    rationale.push({ type:'warn', title:'Route reicht nicht für die volle Dosis', text: shortfallText });
   }
   if(Math.abs(adj-1) > 0.005) rationale.push({ type: adj<1 ? 'warn':'good', title:'Aus deiner Historie angepasst',
     text: adj<1
