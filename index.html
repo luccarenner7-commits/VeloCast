@@ -5581,18 +5581,33 @@ function renderProfilKernSection(frag){
     return { sec, cur:cv, prev:pv, diff, wkg: rp.weight ? cv/rp.weight : null };
   });
 
+  renderProfilKernMetricGrid(frag, rp, E, C, D);
+  renderProfilKernPowerCurveCard(frag, cur, prev);
+  renderProfilKernBestEffortsTable(frag, cmpRows);
+  renderProfilKernEfficiencyCard(frag, E);
+  renderProfilKernDurabilityCard(frag, D);
+  renderProfilKernClimbingCard(frag, C);
+  renderProfilKernWeaknessCard(frag, W);
+  renderProfilKernGearCard(frag, pp);
+}
+
+function renderProfilKernMetricGrid(frag, rp, E, C, D){
   frag.appendChild(el("div", {class:"metric-grid"}, [
     metricCard("Fahrertyp", rp.riderType, `5-Min / 20-Min = ${rp.ratio5_20?rp.ratio5_20.toFixed(2):'–'}`),
     metricCard("Aerobe Entkopplung", E && E.recentDec!=null ? E.recentDec.toFixed(1)+"%" : "–", E?E.verdict:"keine HF-Daten"),
     metricCard("Ermüdungsresistenz", D ? (D.recentAvg*100).toFixed(0)+"%" : "–", D?D.verdict:"keine langen Fahrten"),
     metricCard("Bestes Klettern", C && C.bestWkg ? C.bestWkg.toFixed(2)+" W/kg" : "–", C?`${C.count} Anstiege ≥3%`:"keine Anstiege erkannt")
   ]));
+}
 
+function renderProfilKernPowerCurveCard(frag, cur, prev){
   const pdCard = el("div", {class:"card"});
   pdCard.appendChild(h2WithInfo("Leistungs-Dauer-Kurve", `Höchste Durchschnittsleistung je Dauer (Mean Maximal Power), aus ${cur.rides} Fahrten der letzten 90 Tage${prev.rides>0?` (Vorjahr: ${prev.rides} Fahrten)`:' (kein Vorjahres-Vergleich – lade mehr Fahrten)'}. Logarithmische Zeitachse.`));
   pdCard.appendChild(el("div", {class:"chart-box"}, [el("canvas", {id:"velocastPdChart"})]));
   frag.appendChild(pdCard);
+}
 
+function renderProfilKernBestEffortsTable(frag, cmpRows){
   const tableCard = el("div", {class:"card"});
   tableCard.appendChild(el("h2", {}, ["Bestleistungen im Detail"]));
   tableCard.appendChild(dataTableNode(
@@ -5606,7 +5621,9 @@ function renderProfilKernSection(frag){
     ])
   ));
   frag.appendChild(tableCard);
+}
 
+function renderProfilKernEfficiencyCard(frag, E){
   if(E){
     const efCard = el("div", {class:"card"});
     efCard.appendChild(h2WithInfo("Effizienz & aerobe Entkopplung", "Blau: Watt/Herzschlag – steigt mit aerober Fitness. Amber: Entkopplung, Leistungs-Puls-Verhältnis 2. Fahrthälfte vs. 1. Nur Fahrten über 30 Min."));
@@ -5615,14 +5632,18 @@ function renderProfilKernSection(frag){
     if(E.weeklyEfSlope!=null) efCard.appendChild(el("div", {style:"margin-top:6px;"}, [infoButton(`Effizienz-Trend: ${E.weeklyEfSlope>0?'+':''}${(E.weeklyEfSlope*1000).toFixed(2)} mW/Schlag pro Woche.`)]));
     frag.appendChild(efCard);
   }
+}
 
+function renderProfilKernDurabilityCard(frag, D){
   if(D){
     const durCard = el("div", {class:"card"});
     durCard.appendChild(h2WithInfo("Ermüdungsresistenz", `Beste 10-Min-Leistung im letzten Drittel ÷ beste 10-Min-Leistung der ganzen Fahrt, aus ${D.rides.length} Fahrten über 90 Min. 100% = Fahrtdauer kostet nichts.`));
     durCard.appendChild(collapsedResult(D.verdict, D.why));
     frag.appendChild(durCard);
   }
+}
 
+function renderProfilKernClimbingCard(frag, C){
   if(C){
     const climbCard = el("div", {class:"card"});
     climbCard.appendChild(h2WithInfo("Kletterleistung",
@@ -5641,7 +5662,9 @@ function renderProfilKernSection(frag){
     )]));
     frag.appendChild(climbCard);
   }
+}
 
+function renderProfilKernWeaknessCard(frag, W){
   if(W && W.items.length){
     const wCard = el("div", {class:"card"});
     wCard.appendChild(h2WithInfo("Trainingsschwerpunkt (aus deinen Daten)", "Balken = Rückstand zu Referenzwerten, nicht absolutes Niveau – zeigt, wo am meisten Luft nach oben ist."));
@@ -5652,7 +5675,9 @@ function renderProfilKernSection(frag){
     });
     frag.appendChild(wCard);
   }
+}
 
+function renderProfilKernGearCard(frag, pp){
   if(pp.gear.length){
     const gearResets = loadGearResets();
     const gearCard = el("div", {class:"card"});
