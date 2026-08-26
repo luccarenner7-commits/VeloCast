@@ -2217,12 +2217,21 @@ function computeMmpFromStream(stream){
   const n = time.length;
   const avgDt = (time[n-1]-time[0])/(n-1);
   if(!avgDt || avgDt <= 0) return null;
+  // Duplicate-window guard: if the stream's own sampling interval is coarser
+  // than a target duration, windowSamples collapses to the same tiny number
+  // (often 1) for several short durations in a row -- e.g. avgDt=11s makes
+  // both "5s" and "15s" resolve to a single raw sample, so both would report
+  // the identical value under two different duration labels. Keep only the
+  // longest duration per distinct windowSamples so a coarse sample never
+  // masquerades as more than one (mis-labeled) short best effort.
+  const windows = MMP_DURATIONS_SEC.map(sec => ({ sec, windowSamples: Math.max(1, Math.round(sec/avgDt)) }));
   const mmp = {};
-  MMP_DURATIONS_SEC.forEach(sec => {
-    const windowSamples = Math.max(1, Math.round(sec/avgDt));
-    if(windowSamples > n) return;
-    const avg = bestWindowAvg(watts, windowSamples, 0, n);
-    if(avg != null) mmp[sec] = avg;
+  windows.forEach((w, i) => {
+    if(w.windowSamples > n) return;
+    const next = windows[i+1];
+    if(next && next.windowSamples === w.windowSamples) return; // superseded by a longer, equally-coarse duration
+    const avg = bestWindowAvg(watts, w.windowSamples, 0, n);
+    if(avg != null) mmp[w.sec] = avg;
   });
   return Object.keys(mmp).length ? mmp : null;
 }
@@ -9988,7 +9997,11 @@ function settingsFieldRow(path, def){
 function settingsFieldChip(path, def){
   const val = getByPath(TRAINING_CONFIG, path);
   const id = 'sf-' + path.replace(/\./g, '-');
-  const chipText = v => def.bool ? (v ? 'an' : 'aus') : (v + (def.unit ? ' ' + def.unit : ''));
+  const chipText = v => {
+    if(def.bool) return v ? 'an' : 'aus';
+    if(/(^|\.)gradient\./.test(path) && (v === -99 || v === 99)) return 'Unbegrenzt';
+    return v + (def.unit ? ' ' + def.unit : '');
+  };
 
   const chipV = el('div', {class:'v'}, [chipText(val)]);
   const chip = el('button', {type:'button', class:'stat-chip neutral', title:'Bearbeiten'}, [chipV, el('div', {class:'l'}, [def.label])]);
