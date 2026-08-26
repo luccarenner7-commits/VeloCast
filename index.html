@@ -672,6 +672,55 @@ function parseDuration(str){
 
 const savedSettings = loadSettings();
 
+// ---------- Deliberater Leistungstest ("Test"-Klasse) ----------
+// Fixe Dauern (45min/5s-Sprint bewusst außerhalb des Scopes) und die
+// bewusste Marge über dem aktuellen Bestwert je Dauer -- kürzere Tests
+// bekommen eine größere Marge, weil ihre Bestwerte von Versuch zu Versuch
+// stärker streuen als längere, stabilere Efforts. Platziert hier (statt bei
+// REFERENCE_RATIOS/TRAINING_CLASSES weiter unten im File), weil
+// loadConfirmedTests() direkt darunter TEST_DURATIONS_SEC schon beim Aufbau
+// von `let state = {...}` (state.confirmedTests) braucht -- ein
+// Vorwärtsverweis auf eine später im Skript deklarierte const würde dort mit
+// einem TDZ-ReferenceError abstürzen.
+const TEST_DURATIONS_SEC = [60, 300, 600, 1200];
+const TEST_DURATION_CLASS = { 60:'anaerobic', 300:'vo2max', 600:'vo2max', 1200:'threshold' };
+const TEST_MARGIN_PCT = { 60:0.06, 300:0.04, 600:0.03, 1200:0.02 };
+
+// Bestätigte Testergebnisse -- eigener, von PROFIL_ACTIVITY_CACHE_KEY (siehe
+// oben) unabhängiger localStorage-Key, gleiches Isolationsprinzip wie
+// HR_PROFILE_CACHE_KEY weiter unten im File: ein Profil-forceRefresh/
+// Cache-Trim darf eine bewusste Nutzerbestätigung nie wegwischen können.
+const CONFIRMED_TESTS_KEY = 'velocast_confirmed_tests';
+const CONFIRMED_TESTS_MAX = 200;
+function loadConfirmedTests(){
+  try{
+    const raw = localStorage.getItem(CONFIRMED_TESTS_KEY);
+    if(!raw) return {};
+    const parsed = JSON.parse(raw);
+    if(!parsed || typeof parsed !== 'object') return {};
+    const out = {};
+    Object.entries(parsed).forEach(([key, t]) => {
+      if(!t || typeof t !== 'object' || !t.rideId || !TEST_DURATIONS_SEC.includes(t.durationSec)) return;
+      out[key] = { ...t };
+    });
+    return out;
+  }catch(e){ return {}; }
+}
+function saveConfirmedTests(obj){
+  const attempt = (cap) => {
+    const entries = Object.values(obj).sort((a,b)=> new Date(b.confirmedAtIso) - new Date(a.confirmedAtIso)).slice(0, cap);
+    const trimmed = {}; entries.forEach(t => { trimmed[`${t.rideId}:${t.durationSec}`] = t; });
+    localStorage.setItem(CONFIRMED_TESTS_KEY, JSON.stringify(trimmed));
+  };
+  try{ attempt(CONFIRMED_TESTS_MAX); }catch(e){ try{ attempt(50); }catch(e2){} }
+}
+function saveConfirmedTest(entry){
+  const all = loadConfirmedTests();
+  all[`${entry.rideId}:${entry.durationSec}`] = entry;
+  saveConfirmedTests(all);
+  state.confirmedTests = all;
+}
+
 let state = {
   connected: false,
   athlete: null,
@@ -790,6 +839,14 @@ let state = {
   // while the PUT request is in flight; `error` holds the last failed
   // attempt's message (cleared on the next attempt).
   segmentStars: {},
+  // Bestätigte Leistungstests (s. Test-Klasse weiter unten) -- bewusst
+  // top-level, NICHT unter trainerPage/profilPage: eine Nutzerbestätigung
+  // muss unabhängig von der Trainer-Session-UI und von Profil-Reloads
+  // überleben (s. CONFIRMED_TESTS_KEY oben). NICHT von
+  // resetConnectionState() zurückgesetzt -- gleiche Kategorie wie
+  // segmentStars oben, deren lokale Bedeutung nichts mit dem gerade
+  // verbundenen Strava-Account zu tun hat.
+  confirmedTests: loadConfirmedTests(),
   // ---- Profil page (FTP/Formkurve/Profil-Kern) ----
   // Deliberately its own namespaced bucket rather than flat top-level fields
   // like the route/segments state above: it's a large, self-contained pile
@@ -860,6 +917,7 @@ let state = {
     goal: (savedSettings.trainerGoal && ["auto","ftp","vo2max","endurance","anaerobic","recovery"].includes(savedSettings.trainerGoal))
       ? savedSettings.trainerGoal : "auto",
     selectedClassKey: null, // TRAINING_CLASSES key chosen from the "Workout wählen" grid
+    selectedTestDurationSec: null, // one of TEST_DURATIONS_SEC, only meaningful when selectedClassKey==='test' -- default null, set to computeTestDueSignal()'s suggestion on first click of the Test chip (see renderTrainerClassPicker())
     workoutPreviewOpen: false, // <details> open/closed state for the workout-preview panel
     routeSource: "gpx", // "gpx" | "saved" - which picker tab is shown when no route is attached today
     routeError: null,
@@ -870,6 +928,7 @@ let state = {
     evalLoading: false,
     evalError: null,
     evalResult: null, // evaluateWorkout() output, or null
+    evalTestAchievedWatts: null, // computeMmpFromStream(stream)[workout.testDurationSec] for a classKey==='test' evaluation, or null -- see runTrainerEvaluation()
     lastWorkout: null, // {steps, rp, routeBased} for the deferred mountTrainerChart() call after render
     // HF-only LTHR auto-estimation pipeline (see loadHrLthrEstimate() near
     // trainerRiderContext()) — the full network fetch only ever runs lazily,
@@ -2168,6 +2227,11 @@ const POWER_ZONE_META = [
   { name:"Z7 Neuromuskulär",   color:"#c792ea", band:"high" }
 ];
 const CEILING_WINDOW_DAYS = 42;
+// Test-Klasse Staleness-Fenster (s. computeTestDueSignal() weiter unten) --
+// bewusst an dasselbe 42-Tage-Fenster gekoppelt, das auch die "aktueller
+// Bestwert"-Ceiling-Berechnung nutzt: ein Testwert gilt genau so lange als
+// aktuell wie ein normaler Bestwert überhaupt in die Ceiling einfließt.
+const TEST_STALENESS_DAYS = CEILING_WINDOW_DAYS;
 
 function fmtDurLabel(sec){ return sec % 60 === 0 ? (sec/60) + "min" : sec + "s"; }
 
@@ -3291,6 +3355,7 @@ function resetConnectionState(){
   // disconnect + reconnect as a different Strava account would keep the
   // previous account's LTHR estimate alive in state and feeding rp.lthr.
   state.trainerPage.selectedClassKey = null;
+  state.trainerPage.selectedTestDurationSec = null;
   state.trainerPage.workoutPreviewOpen = false;
   state.trainerPage.routeError = null;
   state.trainerPage.loadingRoute = false;
@@ -3299,6 +3364,7 @@ function resetConnectionState(){
   state.trainerPage.evalLoading = false;
   state.trainerPage.evalError = null;
   state.trainerPage.evalResult = null;
+  state.trainerPage.evalTestAchievedWatts = null;
   state.trainerPage.lastWorkout = null;
   state.trainerPage.hrProfile = { loading:false, loaded:false, error:null, estimate:null, source:null };
   // The in-memory reset above isn't enough on its own: syncCachedHrLthrEstimate()
@@ -6313,6 +6379,13 @@ const TRAINING_CLASSES = [
   { key:'anaerobic',    label:'Anaerobe Kapazität',                 zoneIdx:5, unit:'quality',  priorityEligible:true  },
   { key:'sprint',       label:'Sprint / Neuromuskulär',             zoneIdx:6, unit:'efforts',  priorityEligible:true  },
   { key:'longdistance', label:'Langstrecke / Ermüdungsresistenz',   zoneIdx:null, unit:'rides', priorityEligible:true  },
+  // Deliberater Leistungstest -- eigene Einheit statt in bestehende
+  // Intervalle eingebettet (s. Plan). zoneIdx:null (Präzedenzfall
+  // longdistance oben) + priorityEligible:false (Präzedenzfall recovery
+  // oben) verhindern zusammen, dass ein Test je automatisch als
+  // Tagesempfehlung erscheint oder in die normale Zonen-/Prioritäts-Buchhaltung
+  // einfließt -- er wird ausschließlich manuell über den "Test"-Chip gewählt.
+  { key:'test', label:'Test', zoneIdx:null, unit:'test', priorityEligible:false },
 ];
 function trainingClass(key){ return TRAINING_CLASSES.find(c=>c.key===key) || null; }
 // A manually chosen top-bar goal still maps onto one class and forces it to
@@ -6497,6 +6570,15 @@ function computeWeeklyBudgetTargets(priorities, config){
   TRAINING_CLASSES.forEach(c => {
     const tier = priorities[c.key] || 'MAINTENANCE';
     if(c.key === 'recovery') targets[c.key] = { unit:'minutes', amount: 0 };
+    // Verified crash point: without this branch, 'test' falls into the bare
+    // `else` below and does config[WEEKLY_QUALITY_TABLE_BY_CLASS['test']][tier]
+    // -- WEEKLY_QUALITY_TABLE_BY_CLASS has no 'test' entry, so that's
+    // undefined[tier], a TypeError that would crash the whole Trainer tab the
+    // moment 'test' entered TRAINING_CLASSES. amount:0 is a placeholder --
+    // formatBudgetLine() is never shown for 'test' (see
+    // renderTrainerClassPicker()'s isTest branch), so this value is only ever
+    // read defensively (reconcileWeeklyBudgets()), never displayed.
+    else if(c.key === 'test') targets[c.key] = { unit:'test', amount: 0 };
     else if(c.key === 'endurance') targets[c.key] = { unit:'minutes', amount: config.weeklyEnduranceMinutesByPriority[tier] };
     else if(c.key === 'sprint') targets[c.key] = { unit:'efforts', amount: config.weeklySprintEffortsByPriority[tier] };
     else if(c.key === 'longdistance') targets[c.key] = { unit:'rides', amount: config.weeklyLongRidesByPriority[tier] };
@@ -6638,7 +6720,7 @@ function pickIntendedTrainingClass(decisionState, results, todayIso, config, for
 }
 // Classes whose value doesn't depend on hitting specific terrain — any route
 // supports them, so they skip the segment-level suitability gate entirely.
-const SUITABILITY_EXEMPT_CLASSES = ['recovery', 'endurance', 'longdistance'];
+const SUITABILITY_EXEMPT_CLASSES = ['recovery', 'endurance', 'longdistance', 'test'];
 function computeTrainingOpportunity(decisionState, route, results, todayIso, config, rp, options){
   const forceRecovery = !!(rp && ((rp.acwr!=null && rp.acwr>1.5) || (rp.daysSinceHard!=null && rp.daysSinceHard<=1)));
   const intended = pickIntendedTrainingClass(decisionState, results, todayIso, config, forceRecovery);
@@ -7658,6 +7740,26 @@ const RPE_TARGET_BY_CLASS = {
   sprint:    { rpeTarget:10, rpeLabel:'RPE 10 – maximale Anstrengung' },
 };
 
+// Best current estimate for a rider's peak power at a given duration, used by
+// generateTestWorkout() below as the "current best" baseline the test target
+// is a margin above. Prefers a real measured value from rp.mmpCurve (built in
+// buildRiderProfile() from the same recent-90-day ride pool that feeds every
+// other best-value display in the app); falls back to deriving it from p20/
+// FTP via REFERENCE_RATIOS for a duration the rider simply hasn't produced a
+// measured best for yet (e.g. never done a genuine 1-minute all-out effort).
+// 1200s (20 min) is the one REFERENCE_RATIOS doesn't cover -- FTP_FACTORS'
+// own 20-min/0.95-factor convention already relates it to FTP directly, so
+// p20 itself (or ftp/0.95 if p20 is unavailable) is the right baseline there.
+function estimateCurrentBestForDuration(durationSec, rp){
+  if(rp.mmpCurve && rp.mmpCurve[durationSec] != null) return rp.mmpCurve[durationSec];
+  const ftpFactor20 = FTP_FACTORS.find(f=>f.sec===1200);
+  const p20 = rp.p20 ?? (rp.ftp!=null && ftpFactor20 ? rp.ftp/ftpFactor20.factor : null);
+  if(p20 == null) return null;
+  if(durationSec === 1200) return p20;
+  const ratio = REFERENCE_RATIOS[durationSec];
+  return ratio != null ? p20*ratio : null;
+}
+
 // A pure, terrain-independent description of a goal's interval structure —
 // reps, duration, target %FTP (or %LTHR/RPE in HF mode) and rest between
 // them. Route placement below packs this queue onto the attached route's
@@ -8379,6 +8481,119 @@ function generateTimeBasedWorkout(classKey, rp, learning){
   return { title, steps, rationale, adaptation, overridden:false, classKey };
 }
 
+// ---------- Trainer: deliberate performance test ("Test" class) ----------
+// Generates a single deliberate max-effort block at exactly one of
+// TEST_DURATIONS_SEC, targeting a conscious margin above the rider's current
+// best for that duration (estimateCurrentBestForDuration() above) -- never a
+// 1:1 repeat of the existing best (that could never register real
+// improvement) and never an undirected "just go all-out" (no target at all).
+// No `learning` parameter and NOT in LEARNABLE_GOALS: a one-off max test
+// has nothing in common with the repeated, comparable interval sessions the
+// adaptive-learning factor is calibrated against, so it must never feed or
+// read that factor (see runTrainerEvaluation()'s classKey==='test' guard).
+function generateTestWorkout(durationSec, rp){
+  const acwr = rp.acwr;
+  const overloaded = acwr!=null && acwr>1.5;
+  const rodeHardYesterday = rp.daysSinceHard!=null && rp.daysSinceHard<=1;
+  const seg = (name,minutes,pct,note,kind) => ({ name, minutes, pct, note: note||null, kind: kind||(pct>=0.85?'interval':'other') });
+
+  // Same overload/freshness safety net as generateTimeBasedWorkout()'s
+  // forceEasy branch above -- a maximal test on top of real fatigue wouldn't
+  // measure the rider's actual ceiling, only how tired they are, so it's
+  // swapped for a recovery ride instead of a deflated, misleading test.
+  if(overloaded || rodeHardYesterday){
+    return {
+      title: 'Entlastungsfahrt statt Test', adaptation: 'Erholung / Superkompensation',
+      steps: [seg('Einrollen',10,0.50,null,'warmup'), seg('Lockere Grundlage',45,0.62,'Ruhig, gleichmäßig, ohne Antritte','cruise'), seg('Ausrollen',8,0.48,null,'cooldown')],
+      rationale: [{ type: overloaded ? 'danger' : 'warn',
+        title: overloaded ? 'Deine Belastung ist zu hoch für einen Test' : 'Du bist gestern hart gefahren',
+        text: overloaded
+          ? `${rp.freshnessWhy} Ein maximaler Test auf diese Ermüdung draufzusetzen würde ohnehin keinen validen Wert liefern. Anpassung passiert in der Erholung.`
+          : `Deine letzte harte Einheit ist erst ${rp.daysSinceHard===0?'heute':'einen Tag'} her. Ein Test unter Resteermüdung würde deine echte Bestleistung nur unterschätzen.` }],
+      overridden: true, classKey: 'test', testDurationSec: durationSec, testTargetWatts: null,
+    };
+  }
+
+  const baseline = estimateCurrentBestForDuration(durationSec, rp);
+  if(baseline == null || !rp.ftp){
+    return {
+      title: 'Test nicht möglich', adaptation: 'Leistungsdaten fehlen', steps: [],
+      rationale: [{ type:'warn', title:'Kein Leistungswert verfügbar',
+        text:'Für ein Testziel braucht VeloCast einen aktuellen Leistungswert (FTP bzw. eine bisherige Bestleistung für diese Dauer). Ohne Leistungsmesser-Daten aus früheren Fahrten kann kein sinnvolles Testziel berechnet werden.' }],
+      overridden: false, classKey: 'test', testDurationSec: durationSec, testTargetWatts: null,
+    };
+  }
+
+  const margin = TEST_MARGIN_PCT[durationSec] ?? 0.03;
+  const targetWatts = Math.round(baseline*(1+margin));
+  const pct = targetWatts/rp.ftp;
+  const dur = fmtDurLabel(durationSec);
+  const minutes = durationSec/60;
+  // Only the two short durations (1/5 min) get an RPE target in HF mode --
+  // heart rate lags too far behind a 1-5 minute all-out effort to serve as a
+  // live target (same reasoning as VO2max/Anaerobic/Sprint's RPE_TARGET_BY_CLASS
+  // steps above). The 10/20-minute tests are long enough for HR to track the
+  // effort, so they keep a normal %LTHR-equivalent target -- same
+  // pct-multiplied-by-rp.lthr path the 'threshold' class already uses via
+  // stepTargetValue(), no separate calculation needed. Deliberately gated on
+  // durationSec, NOT on TEST_DURATION_CLASS[durationSec] (which maps 600s to
+  // 'vo2max' for a different purpose -- see computeTestDueSignal() below --
+  // and would incorrectly pull in an RPE target for the 10-minute test too).
+  const isShort = durationSec <= 300;
+  const targetStep = seg(`Test: ${dur} All-out`, minutes, pct, 'Maximal, möglichst gleichmäßig bis zum Ende durchhalten', 'interval');
+  if(rp.usingHr && isShort) Object.assign(targetStep, RPE_TARGET_BY_CLASS[TEST_DURATION_CLASS[durationSec]]);
+
+  const warmupMin = isShort ? 15 : 12;
+  const activation = isShort
+    ? seg('Aktivierung', durationSec===60?5:4, 0.85, durationSec===60?'3× 15s Antritte mit langer Pause':'3× 20s hart, je 40s locker', 'activation')
+    : seg('Aktivierung', 3, 0.80, '2× 30s auf Tempo', 'activation');
+
+  const steps = [
+    seg('Einrollen', warmupMin, 0.55, null, 'warmup'),
+    activation,
+    targetStep,
+    seg('Ausrollen', 10, 0.50, null, 'cooldown'),
+  ];
+
+  const rationale = [{ type:'good', title:'Warum dieses Ziel',
+    text: `Deine aktuell hinterlegte ${dur}-Bestleistung liegt bei ${Math.round(baseline)} W. Das Testziel liegt bewusst ${Math.round(margin*100)}% darüber bei ${targetWatts} W – erreichst oder überschreitest du es, hast du einen frischen, echten Bestwert gefahren. Bestätige den Test danach unten manuell über „Workout auswerten" – VeloCast erkennt eine hochgeladene Fahrt nicht automatisch als diesen Test.` }];
+
+  return { title:`Leistungstest: ${dur} All-out`, steps, rationale, adaptation:'Aktuelle Bestleistung bewusst neu ermitteln',
+    overridden:false, classKey:'test', testDurationSec:durationSec, testTargetWatts:targetWatts };
+}
+
+// For each of the 4 test durations: "due" when its mapped TRAINING_CLASSES
+// class (TEST_DURATION_CLASS) currently sits at HIGH/MEDIUM priority
+// (`relevant` -- a test only matters right now if the underlying capacity is
+// actually being trained) AND it hasn't been confirmed in >= TEST_STALENESS_DAYS
+// days, or never at all (`stale`). Purely additive/read-only over the
+// existing priority engine and state.confirmedTests -- computes no new
+// priorities or budgets of its own. Sorted by priority tier, then by staleness
+// (longest-unconfirmed first) so the single `suggestedDurationSec` picked for
+// the duration picker's default is the most urgent one.
+function computeTestDueSignal(pp, trainingState, todayIso){
+  const tierWeight = { HIGH:3, MEDIUM:2, LOW:1, MAINTENANCE:0 };
+  const today = parseIsoDateUTC(todayIso);
+  const confirmed = state.confirmedTests || {};
+  const entries = TEST_DURATIONS_SEC.map(durationSec => {
+    const cls = TEST_DURATION_CLASS[durationSec];
+    const tier = (trainingState.priorities && trainingState.priorities[cls]) || 'MAINTENANCE';
+    const relevant = tier === 'HIGH' || tier === 'MEDIUM';
+    const own = Object.values(confirmed).filter(t => t.durationSec === durationSec);
+    const latest = own.length ? own.reduce((a,b)=> new Date(a.confirmedAtIso) > new Date(b.confirmedAtIso) ? a : b) : null;
+    const daysSince = latest ? Math.floor((today - parseIsoDateUTC(latest.confirmedAtIso.slice(0,10))) / 86400000) : null;
+    const stale = daysSince == null || daysSince >= TEST_STALENESS_DAYS;
+    return { durationSec, classKey: cls, tier, relevant, daysSince, stale, due: relevant && stale };
+  }).sort((a,b) => {
+    const pa = tierWeight[a.tier]||0, pb = tierWeight[b.tier]||0;
+    if(pa !== pb) return pb-pa;
+    return (b.daysSince ?? Infinity) - (a.daysSince ?? Infinity);
+  });
+  const dueEntries = entries.filter(e => e.due);
+  const suggestedDurationSec = dueEntries.length ? dueEntries[0].durationSec : entries[0].durationSec;
+  return { entries, dueEntries, suggestedDurationSec };
+}
+
 // ---------- Trainer: route storage (per-day, today only used in Phase 3) ----------
 // Same slim-and-cap-by-day pattern as the Artifact's ROUTES_BY_DATE_KEY, own
 // "velocast_"-prefixed key so it can never collide with Phase 1/2's caches
@@ -8672,14 +8887,20 @@ function evaluateWorkout(stream, workout, rp){
   const mismatchPct = plannedTotal ? Math.abs(actualTotal-plannedTotal)/plannedTotal*100 : null;
 
   const v = complianceVerdict(complianceWeighted, usingHr);
-  const classCompliance = (workout && workout.classKey)
+  // 'test' is deliberately excluded here: it has no targetRangePct/
+  // targetRangePctLthr entry (see TRAINING_CONFIG), so summarizeClassCompliance()
+  // would always resolve range:null and inRangeMin:0 -- which would render as
+  // a permanent, misleading "0/X Min im Zielbereich" for every single test,
+  // pass or fail. The test's own pass/fail is shown separately (see
+  // renderTrainerAblaufCard()'s classKey==='test' confirmation block).
+  const classCompliance = (workout && workout.classKey && workout.classKey !== 'test')
     ? summarizeClassCompliance(perStep, workout.classKey, rp, TRAINING_CONFIG) : null;
   return { perStep, complianceWeighted, ...v, actualTotal, mismatchPct, isRoute, classCompliance };
 }
 async function runTrainerEvaluation(workout, rp, learnGoalKey){
   const tp = state.trainerPage;
   if(!tp.evalActivityId){ tp.evalError = 'Bitte eine Aktivität auswählen.'; render(); return; }
-  tp.evalLoading = true; tp.evalError = null; tp.evalResult = null; render();
+  tp.evalLoading = true; tp.evalError = null; tp.evalResult = null; tp.evalTestAchievedWatts = null; render();
   try{
     // fetchActivityPowerStreams() already requests heartrate alongside watts
     // (see its own comment), so the HF branch needs no separate fetch here.
@@ -8690,6 +8911,18 @@ async function runTrainerEvaluation(workout, rp, learnGoalKey){
       tp.evalError = rp.usingHr
         ? 'Diese Aktivität hat keine geeigneten Rohdaten-Streams (Herzfrequenzdaten nötig).'
         : 'Diese Aktivität hat keine geeigneten Rohdaten-Streams (Leistungsmesser nötig).';
+    } else if(workout.classKey === 'test'){
+      // A test isn't a LEARNABLE_GOALS member and must never feed
+      // recordEvaluation()'s per-goal adaptive-learning factor -- doing so
+      // would silently contaminate e.g. the FTP-interval adjustment factor
+      // with a one-off max-effort test result. The confirmed value instead
+      // reuses computeMmpFromStream() -- the exact same function that
+      // computes every random best value from a normal ride -- applied to
+      // the stream already fetched above, so there's no second calculation
+      // path and no drift risk between "test result" and "regular best".
+      const mmp = computeMmpFromStream(stream);
+      tp.evalTestAchievedWatts = (mmp && mmp[workout.testDurationSec] != null) ? mmp[workout.testDurationSec] : null;
+      tp.evalResult = evaluation;
     } else {
       recordEvaluation(learnGoalKey, tp.evalActivityId, evaluation);
       tp.evalResult = evaluation;
@@ -9199,7 +9432,7 @@ function renderTrainerGoalBar(chosen, rp){
   ]));
   return card;
 }
-function renderTrainerDecisionDashboard(trainingState, weaknessData, opportunity, budgetsUnavailable){
+function renderTrainerDecisionDashboard(trainingState, weaknessData, opportunity, budgetsUnavailable, testSignal){
   const card = el('div', {class:'card'});
   card.appendChild(el('h2',{},['Trainings-Dashboard']));
   if(weaknessData) card.appendChild(el('div',{style:'margin-bottom:10px;'},[calloutBox(null, `Größter Hebel: ${weaknessData.headline}`, weaknessData.reason)]));
@@ -9241,21 +9474,43 @@ function renderTrainerDecisionDashboard(trainingState, weaknessData, opportunity
         `Streckeneignung: ${opportunity.suitability?opportunity.suitability.score:0}/100. ${reasons.join(' ')}`)]));
     }
   }
+  if(testSignal && testSignal.dueEntries.length){
+    const labels = testSignal.dueEntries.map(e=>fmtDurLabel(e.durationSec)).join(', ');
+    card.appendChild(el('div',{style:'margin-top:10px;'},[calloutBox('warn', 'Test fällig',
+      `Für ${labels} liegt seit mindestens ${TEST_STALENESS_DAYS} Tagen kein bestätigter Test vor, obwohl das aktuell trainiert wird. Wähle unten den „Test"-Chip, um deinen Bestwert bewusst neu zu ermitteln.`)]));
+  }
   return card;
 }
-function renderTrainerClassPicker(tp, trainingState, recommendedClassKey){
+function renderTrainerClassPicker(tp, trainingState, recommendedClassKey, testSignal){
   const card = el('div', {class:'card'});
   card.appendChild(el('h2', {style:'display:flex; align-items:center; gap:8px;'}, ['Workout wählen', infoButton('Wähle die Trainingsart, die du fahren willst. „Empfohlen" markiert, was laut Priorität und Wochenbudget aktuell am meisten bringt.')]));
   const grid = el('div', {class:'class-picker'});
   TRAINING_CLASSES.forEach(c => {
+    const isTest = c.key === 'test';
     const tier = trainingState.priorities[c.key] || 'MAINTENANCE';
-    const badge = PRIORITY_BADGE[tier] || PRIORITY_BADGE.MAINTENANCE;
+    // The 'test' chip's weekly-budget tier is always MAINTENANCE
+    // (priorityEligible:false) and its formatBudgetLine() text would always
+    // read a meaningless "0/0" (see computeWeeklyBudgetTargets()'s test
+    // branch) -- both are replaced with a due/last-tested signal instead.
+    const testDue = isTest && testSignal && testSignal.dueEntries.length > 0;
+    const badge = testDue ? { label:'Fällig', bg:'var(--cross-bg)', fg:'var(--cross)' } : (PRIORITY_BADGE[tier] || PRIORITY_BADGE.MAINTENANCE);
     const budget = trainingState.budgets[c.key];
     const isRecommended = c.key === recommendedClassKey;
     const isSelected = c.key === tp.selectedClassKey;
+    let testMetaLine = null;
+    if(isTest && testSignal){
+      const withDate = testSignal.entries.filter(e=>e.daysSince!=null);
+      testMetaLine = withDate.length
+        ? `Zuletzt vor ${Math.min(...withDate.map(e=>e.daysSince))} Tag${Math.min(...withDate.map(e=>e.daysSince))===1?'':'en'}`
+        : 'Noch nie getestet';
+    }
     grid.appendChild(el('button', {
       type:'button', class:'class-pick-card' + (isSelected?' selected':''),
-      onclick: ()=>{ tp.selectedClassKey = c.key; tp.workoutPreviewOpen = true; tp.hammerheadResult = null; render(); }
+      onclick: ()=>{
+        tp.selectedClassKey = c.key; tp.workoutPreviewOpen = true; tp.hammerheadResult = null;
+        if(isTest && tp.selectedTestDurationSec == null && testSignal) tp.selectedTestDurationSec = testSignal.suggestedDurationSec;
+        render();
+      }
     }, [
       el('div', {class:'cpc-title'}, [
         el('span', {}, [c.label]),
@@ -9263,11 +9518,34 @@ function renderTrainerClassPicker(tp, trainingState, recommendedClassKey){
       ]),
       el('div', {class:'cpc-meta'}, [
         el('span', {class:'cpc-badge', style:`background:${badge.bg}; color:${badge.fg};`}, [badge.label]),
-        budget ? el('span', {class:'cpc-budget'}, [formatBudgetLine(budget)]) : ''
+        isTest
+          ? (testMetaLine ? el('span', {class:'cpc-budget'}, [testMetaLine]) : '')
+          : (budget ? el('span', {class:'cpc-budget'}, [formatBudgetLine(budget)]) : '')
       ])
     ]));
   });
   card.appendChild(grid);
+  return card;
+}
+// Small duration picker shown instead of renderTrainerRouteCard() whenever
+// the 'test' class is selected (a test always uses the time-based path --
+// see renderTrainerPage()'s effectiveRouteBased -- so there's no route
+// attachment UI to show here). Same pill styling as the existing GPX/
+// Gespeicherte-Route source tabs (.source-tab/.source-tabs), reused rather
+// than introducing new CSS for a one-off 4-option picker.
+function renderTrainerTestDurationPicker(tp, testSignal){
+  const card = el('div', {class:'card'});
+  card.appendChild(el('h2', {style:'display:flex; align-items:center; gap:8px;'}, ['Testdauer wählen', infoButton('Wähle, wie lange der Test-Abschnitt dauern soll. Der Zielwert wird aus deiner aktuellen Bestleistung für genau diese Dauer berechnet.')]));
+  const row = el('div', {class:'source-tabs'});
+  TEST_DURATIONS_SEC.forEach(sec => {
+    const active = tp.selectedTestDurationSec === sec;
+    const entry = testSignal && testSignal.entries.find(e=>e.durationSec===sec);
+    row.appendChild(el('div', {
+      class:'source-tab' + (active?' active':''),
+      onclick: ()=>{ tp.selectedTestDurationSec = sec; render(); }
+    }, [fmtDurLabel(sec) + (entry && entry.due ? ' •' : '')]));
+  });
+  card.appendChild(row);
   return card;
 }
 function renderTrainerRouteCard(tp, selectedClassObj, todayRoute){
@@ -9633,7 +9911,39 @@ function renderTrainerAblaufCard(tp, ctx){
     evalSection.appendChild(row);
     const resultBox = el('div', {});
     if(tp.evalError) resultBox.appendChild(calloutBox('warn', tp.evalError, ''));
-    else if(tp.evalResult) appendEvaluationResult(resultBox, tp.evalResult);
+    else if(tp.evalResult){
+      appendEvaluationResult(resultBox, tp.evalResult);
+      // Manual confirmation flow for the 'test' class -- VeloCast has no
+      // automatic link between a generated test and a later-uploaded Strava
+      // ride (FIT/ZWO export only, no live tracking), so the rider confirms
+      // themselves which evaluated ride actually was the test. Guarded on
+      // testTargetWatts!=null so this never shows for the forceEasy
+      // "Entlastungsfahrt statt Test" override or the "Test nicht möglich"
+      // empty-state, neither of which is a real test to confirm.
+      if(workout.classKey === 'test' && workout.testTargetWatts != null){
+        const achieved = tp.evalTestAchievedWatts;
+        const target = workout.testTargetWatts;
+        if(achieved == null){
+          resultBox.appendChild(calloutBox('warn', 'Kein auswertbarer Testabschnitt gefunden',
+            `Diese Fahrt enthält keinen ${fmtDurLabel(workout.testDurationSec)}-Leistungsabschnitt, der ausgewertet werden kann.`));
+        } else {
+          const passed = achieved >= target;
+          resultBox.appendChild(calloutBox(passed?'good':'warn', passed?'Test bestanden':'Test nicht bestanden',
+            `Beste ${fmtDurLabel(workout.testDurationSec)}-Leistung in dieser Fahrt: ${Math.round(achieved)} W (Ziel: ${target} W).`));
+          resultBox.appendChild(el('button', {class:'btn', style:'margin-top:8px;', onclick: ()=>{
+            const ride = state.profilPage.results.find(r=>String(r.id)===String(tp.evalActivityId));
+            saveConfirmedTest({
+              rideId: String(tp.evalActivityId), durationSec: workout.testDurationSec,
+              rideDateIso: toIsoDate(ride ? ride.date : new Date()),
+              rideName: (ride && ride.name) || 'Fahrt',
+              targetWatts: target, achievedWatts: Math.round(achieved), passed,
+              confirmedAtIso: new Date().toISOString()
+            });
+            render();
+          }}, ['Das war der Test']));
+        }
+      }
+    }
     evalSection.appendChild(resultBox);
   }
   body.appendChild(evalSection);
@@ -9705,25 +10015,48 @@ function renderTrainerPage(){
   const trainingState = computeTrainingDecisionState(pp.results, W, chosen, todayIso, TRAINING_CONFIG);
   const dashboardOpportunity = computeTrainingOpportunity(trainingState, routeBased?todayRoute.route:null, pp.results, todayIso, TRAINING_CONFIG, rp, {});
   const recommendedClassKey = dashboardOpportunity ? dashboardOpportunity.classKey : null;
+  // 'test' never reaches recommendedClassKey (pickIntendedTrainingClass()
+  // only ranks priorityEligible classes, and 'test' is deliberately not one),
+  // so this is purely about a rider MANUALLY choosing the Test chip below.
+  const testSignal = computeTestDueSignal(pp, trainingState, todayIso);
 
   if(tp.selectedClassKey && !trainingClass(tp.selectedClassKey)) tp.selectedClassKey = null;
   const selectedClassObj = tp.selectedClassKey ? trainingClass(tp.selectedClassKey) : null;
+  // A 'test' selection always uses the time-based path, regardless of
+  // whether a route happens to be attached today -- a deliberate test target
+  // has no business being warped onto arbitrary terrain via
+  // generateWorkoutForOpportunity()/placeIntervalsOnRoute(). Every
+  // routeBased-branching call below reads this instead of the raw
+  // `routeBased`, so the fix applies consistently start to finish (workout
+  // generation, metrics, zone breakdown, chart, route card vs. duration
+  // picker, .FIT/.ZWO export options).
+  const effectiveRouteBased = routeBased && tp.selectedClassKey !== 'test';
   const opportunity = tp.selectedClassKey
-    ? computeOpportunityForClass(trainingState, routeBased?todayRoute.route:null, tp.selectedClassKey, TRAINING_CONFIG, rp, {})
+    ? computeOpportunityForClass(trainingState, effectiveRouteBased?todayRoute.route:null, tp.selectedClassKey, TRAINING_CONFIG, rp, {})
     : null;
 
   let workout = null, workoutGoalKey = null;
   if(opportunity){
-    if(routeBased) workout = generateWorkoutForOpportunity(opportunity, rp, todayRoute.route, learning, TRAINING_CONFIG, {});
+    // Without this branch, opportunity.classKey==='test' would fall through
+    // to generateWorkoutForOpportunity()/generateTimeBasedWorkout(), whose
+    // TRAINING_CLASS_TO_GENERATOR_GOAL['test'] lookup is undefined and would
+    // silently fall back to 'endurance' -- a generic endurance ride instead
+    // of an actual test, with no error to signal the mismatch.
+    if(opportunity.classKey === 'test') workout = generateTestWorkout(tp.selectedTestDurationSec || TEST_DURATIONS_SEC[0], rp);
+    else if(effectiveRouteBased) workout = generateWorkoutForOpportunity(opportunity, rp, todayRoute.route, learning, TRAINING_CONFIG, {});
     else workout = generateTimeBasedWorkout(opportunity.classKey, rp, learning);
-    workoutGoalKey = workout && workout.classKey ? (TRAINING_CLASS_TO_GENERATOR_GOAL[workout.classKey]||null) : null;
+    // `|| workout.classKey` fallback only ever fires for 'test' (every other
+    // TRAINING_CLASSES key has a TRAINING_CLASS_TO_GENERATOR_GOAL entry) --
+    // lets goalLabel()'s trainingClass() fallback resolve it to "Test" for
+    // the .ZWO description/export instead of the literal string "null".
+    workoutGoalKey = workout && workout.classKey ? (TRAINING_CLASS_TO_GENERATOR_GOAL[workout.classKey]||workout.classKey) : null;
   }
   const workoutExists = !!workout;
   const hasWorkout = !!(workout && workout.steps && workout.steps.length);
-  tp.lastWorkout = hasWorkout ? { steps:workout.steps, rp, routeBased } : null;
-  const metrics = hasWorkout ? (routeBased ? estimateRouteWorkoutMetrics(workout.steps, rp) : workoutMetrics(workout.steps, rp)) : null;
-  const zoneBreakdown = hasWorkout ? workoutZoneBreakdown(workout.steps, routeBased, rp) : null;
-  const specificity = (hasWorkout && routeBased) ? computeSpecificityScore(workout, workoutGoalKey) : null;
+  tp.lastWorkout = hasWorkout ? { steps:workout.steps, rp, routeBased: effectiveRouteBased } : null;
+  const metrics = hasWorkout ? (effectiveRouteBased ? estimateRouteWorkoutMetrics(workout.steps, rp) : workoutMetrics(workout.steps, rp)) : null;
+  const zoneBreakdown = hasWorkout ? workoutZoneBreakdown(workout.steps, effectiveRouteBased, rp) : null;
+  const specificity = (hasWorkout && effectiveRouteBased) ? computeSpecificityScore(workout, workoutGoalKey) : null;
   const warnRationale = workoutExists ? (workout.rationale||[]).filter(r=>r.type==='warn'||r.type==='danger') : [];
   const goodRationale = workoutExists ? (workout.rationale||[]).filter(r=>r.type==='good') : [];
   const actualWeekZones = actualWeekZoneBreakdown(pp.results);
@@ -9733,13 +10066,14 @@ function renderTrainerPage(){
   frag.appendChild(renderTrainerSummaryCards(rp.usingHr ? rp.blendedLoad : pp.trainingLoad, GOALS[chosen]?GOALS[chosen].label:chosen, chosen==='auto'));
   frag.appendChild(renderTrainerContextCards(rp));
   frag.appendChild(renderTrainerGoalBar(chosen, rp));
-  frag.appendChild(renderTrainerDecisionDashboard(trainingState, W, dashboardOpportunity, rp.usingHr && !pp.results.length));
-  frag.appendChild(renderTrainerClassPicker(tp, trainingState, recommendedClassKey));
+  frag.appendChild(renderTrainerDecisionDashboard(trainingState, W, dashboardOpportunity, rp.usingHr && !pp.results.length, testSignal));
+  frag.appendChild(renderTrainerClassPicker(tp, trainingState, recommendedClassKey, testSignal));
   if(selectedClassObj){
-    frag.appendChild(renderTrainerRouteCard(tp, selectedClassObj, todayRoute));
-    frag.appendChild(renderTrainerWorkoutPreview(tp, { workout, workoutExists, hasWorkout, routeBased, rp, metrics, zoneBreakdown, specificity, workoutGoalKey, warnRationale, goodRationale }));
+    if(tp.selectedClassKey === 'test') frag.appendChild(renderTrainerTestDurationPicker(tp, testSignal));
+    else frag.appendChild(renderTrainerRouteCard(tp, selectedClassObj, todayRoute));
+    frag.appendChild(renderTrainerWorkoutPreview(tp, { workout, workoutExists, hasWorkout, routeBased: effectiveRouteBased, rp, metrics, zoneBreakdown, specificity, workoutGoalKey, warnRationale, goodRationale }));
   }
-  frag.appendChild(renderTrainerZonesCard(hasWorkout, zoneBreakdown, routeBased, actualWeekZones, rp));
+  frag.appendChild(renderTrainerZonesCard(hasWorkout, zoneBreakdown, effectiveRouteBased, actualWeekZones, rp));
   frag.appendChild(renderTrainerAblaufCard(tp, { workout, hasWorkout, rp, learning, learnGoalKey, analysisRides }));
   frag.appendChild(el('div',{class:'legend-note'},[`Trainingsempfehlungen sind aus deinen Daten abgeleitete Orientierung, kein Ersatz für individuelle Trainerbetreuung oder ärztliche Abklärung. Achte auf Signale deines Körpers, die in ${rp.usingHr?'Pulswerten':'Wattwerten'} nicht auftauchen.`]));
   return frag;
@@ -10047,6 +10381,22 @@ function settingsFieldChip(path, def){
 }
 
 function buildClassSettingsSection(c){
+  // 'test' deliberately has no constraints.byClass/targetRangePct entry (its
+  // target comes from the rider's own measured best + a fixed TEST_MARGIN_PCT,
+  // not from a tunable %FTP band or route-placement geometry) -- rendering
+  // the normal chip grid for it would read every field via getByPath() as
+  // `undefined` (silently returned, not a crash, since constraints.byClass.test
+  // itself is undefined) and show "undefined °" text throughout. Short-circuit
+  // with an explanatory note instead.
+  if(c.key === 'test'){
+    const body = el('div', {style:'margin-top:10px;'}, [
+      el('div', {class:'legend-note'}, ['Der Leistungstest hat keine Strecken-/Intervall-Einstellungen – das Testziel wird direkt aus deiner aktuellen Bestleistung je Dauer berechnet (siehe Trainer-Tab).'])
+    ]);
+    return el('details', {class:'tt-collapse tsettings-class'}, [
+      el('summary', {}, [el('h3', {class:'tsettings-group-title', style:'display:inline; margin:0;'}, [c.label])]),
+      body
+    ]);
+  }
   const basePath = `constraints.byClass.${c.key}`;
   const exempt = SUITABILITY_EXEMPT_CLASSES.includes(c.key);
   const body = el('div', {style:'margin-top:10px;'});
