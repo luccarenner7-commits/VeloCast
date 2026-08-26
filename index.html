@@ -9262,18 +9262,39 @@ function slugify(s){
 // power users see byte-identical chart output.
 function buildRouteWorkoutChart(workout, route, rp){
   const c = profilColors();
+  const steps = workout.steps;
+
+  // Gleiche Eignungs-Logik wie die "Optimal"/"Akzeptabel"-Tags in
+  // renderTrainerAblaufCard() (SUITABILITY_EXEMPT_CLASSES/gradientSuitability),
+  // hier auf die Höhenlinie angewandt statt auf einzelne Schritt-Zeilen.
+  // Nur Intervall-Schritte tragen eine Bewertung; alles andere (Aufwärmen,
+  // Verbindungsstücke, ...) bleibt in der neutralen Grundfarbe.
+  const suitabilityBand = !SUITABILITY_EXEMPT_CLASSES.includes(workout.classKey)
+    ? (TRAINING_CONFIG.constraints.byClass[workout.classKey] || {}).gradient : null;
+  const tierColorAtDistM = distM => {
+    if(!suitabilityBand) return null;
+    const step = steps.find(s => s.kind==='interval' && distM >= s.startDist && distM <= s.endDist);
+    if(!step || step.gradient==null) return null;
+    const tier = gradientSuitability(step.gradient, suitabilityBand);
+    return tier==='ideal' ? c.tail : tier==='acceptable' ? c.cross : null;
+  };
+
   const elevPts = [];
+  const elevTierColors = [];
   const STRIDE = Math.max(1, Math.floor(route.points.length/400));
-  for(let i=0;i<route.points.length;i+=STRIDE) elevPts.push({x:route.points[i].dist/1000, y:route.smoothed[i]});
+  for(let i=0;i<route.points.length;i+=STRIDE){
+    elevPts.push({x:route.points[i].dist/1000, y:route.smoothed[i]});
+    elevTierColors.push(tierColorAtDistM(route.points[i].dist));
+  }
   const lastIdx = route.points.length-1;
   elevPts.push({x:route.points[lastIdx].dist/1000, y:route.smoothed[lastIdx]});
+  elevTierColors.push(tierColorAtDistM(route.points[lastIdx].dist));
 
   const metric = rp.usingHr ? rp.lthr : rp.ftp;
   const unitLabel = rp.usingHr ? 'bpm' : 'W';
   const axisLabel = rp.usingHr ? 'Puls (bpm)' : 'Watt';
   const zoneFn = pct => stepZoneFor(pct, rp);
 
-  const steps = workout.steps;
   const pwrPts = [];
   steps.forEach(s=>{
     const w = Math.round(stepTargetValue(s.pct, rp));
@@ -9285,7 +9306,8 @@ function buildRouteWorkoutChart(workout, route, rp){
     type:'line',
     data:{ datasets:[
       { label:'Höhe', data:elevPts, yAxisID:'y', borderColor:c.chalkDim, backgroundColor:'rgba(152,161,174,0.18)',
-        borderWidth:1.5, pointRadius:0, fill:true, tension:.15 },
+        borderWidth:1.5, pointRadius:0, fill:true, tension:.15,
+        segment:{ borderColor:ctx=>elevTierColors[ctx.p0DataIndex] || c.chalkDim } },
       { label:'Zielleistung', data:pwrPts, yAxisID:'y2', borderWidth:2.5, pointRadius:0, fill:false,
         segment:{ borderColor:ctx=>{ const idx = Math.min(Math.floor(ctx.p0DataIndex/2), steps.length-1); return zoneFn(steps[idx].pct).color; } } },
     ]},
@@ -9702,6 +9724,16 @@ function renderTrainerWorkoutPreview(tp, ctx){
       body.appendChild(el('div', {style:'margin:-4px 0 10px;'}, [infoButton('Zwei Dateien: das Workout (Schritte/Ziele) und die Strecke (GPS-Track) separat – auf dem Gerät beide zusammen für die Fahrt auswählen, genau wie bei Hammerhead/Garmin/Wahoo üblich.')]));
     }
     body.appendChild(el('div',{class:'chart-box tall'},[el('canvas',{id:'velocastTrainerChart'})]));
+    // Gleiche Ampel wie die Tags in renderTrainerAblaufCard() -- nur für
+    // Klassen mit echter Steigungs-Eignungsprüfung (siehe
+    // SUITABILITY_EXEMPT_CLASSES), sonst wäre die Legende bedeutungslos.
+    if(routeBased && !SUITABILITY_EXEMPT_CLASSES.includes(workout.classKey)){
+      body.appendChild(el('div', {style:'margin-top:-4px; margin-bottom:8px;'}, [infoButton([
+        legendDot(cssVar('--tail'), 'Optimale Steigung'),
+        legendDot(cssVar('--cross'), 'Akzeptable Steigung'),
+        legendDot(cssVar('--chalk-dim'), 'Kein Intervall / neutral'),
+      ])]));
+    }
     if(!routeBased){
       // HF-Zweig: LTHR_ZONES statt ZONES, Referenzlinien-Punkt heißt "LTHR-Linie".
       const legendZones = rp.usingHr ? LTHR_ZONES : ZONES;
