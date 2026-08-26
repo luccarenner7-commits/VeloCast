@@ -6295,7 +6295,7 @@ const TRAINING_CONFIG = {
   // those stay on pure cumulative time / the existing synthetic effort-count
   // heuristic respectively.
   intervalDetection: {
-    graceSec: 8, // mirrors detectRideClimbs()'s GRACE_SEC
+    graceSec: 20, // generous enough for a real outdoor stop (traffic light, junction) without bridging two genuinely separate efforts
     minSecByClass: { tempo:480, threshold:480, vo2max:150, anaerobic:30 },
   },
   // Split per class (was one shared value for all four) so each class's
