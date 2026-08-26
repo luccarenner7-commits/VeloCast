@@ -2728,6 +2728,21 @@ const REFERENCE_RATIOS = { 60:1.72, 300:1.18, 600:1.06, 2700:0.965 };
 // disclaimer style as classBaselineScore below) for 5s sprint peak power
 // vs 1-minute power.
 const SPRINT_REFERENCE_RATIO = 1.55;
+// Wie oben: authored/reasoned estimates für die übrigen 5 Schwellenwerte in
+// detectWeaknesses(). Jeder hat zusätzlich einen "Severe Span" -- wie weit
+// die Abweichung reichen muss, damit score=100 erreicht wird. Bewusst pro
+// Kategorie einzeln gewählt statt eines globalen Faktors: ein einheitlicher
+// Faktor würde bei kleinen Referenzwerten (z.B. 4%) sofort sättigen.
+const FTP_RATIO_LIMIT = 1.30;
+const FTP_RATIO_SEVERE_SPAN = 0.20;
+const GREYZONE_LIMIT_PCT = 35;
+const GREYZONE_SEVERE_SPAN_PCT = 30;
+const HARD_INTENSITY_MIN_PCT = 4;
+const HARD_INTENSITY_SEVERE_SPAN_PCT = 4;
+const DECOUPLING_LIMIT_PCT = 5;
+const DECOUPLING_SEVERE_SPAN_PCT = 10;
+const DURABILITY_MIN_RATIO = 0.9;
+const DURABILITY_SEVERE_SPAN_RATIO = 0.3;
 
 function buildRiderProfile(pp, ftpAnalysis){
   const results = pp.results;
@@ -2785,14 +2800,19 @@ function detectWeaknesses(rp, zoneDist, efficiency, durability){
       const deficit = (ref-ratio)/ref*100;
       if(deficit > 3) items.push({
         area: s.label, goal: s.goal, score: Math.min(100, deficit*6),
+        numText: `${(ratio*100).toFixed(0)}% · Ziel ${(ref*100).toFixed(0)}%`,
         why: `Deine ${fmtDurLabel(s.sec)}-Leistung liegt bei ${(ratio*100).toFixed(0)}% deiner 20-Minuten-Leistung; typisch wären etwa ${(ref*100).toFixed(0)}%. Relativ zu deiner Schwelle fehlt hier Spitze.`
       });
     });
     const p5 = rp.p5;
-    if(p5 && p5/p20 > 1.30) items.push({
-      area:'Schwellenleistung (FTP)', goal:'ftp', score: Math.min(100,(p5/p20-1.30)*300),
-      why:`Deine 5-Minuten-Leistung liegt ${((p5/p20-1)*100).toFixed(0)}% über deiner 20-Minuten-Leistung — eine sehr steile Kurve. Deine Spitze ist gut, dein Unterbau hinkt hinterher: Schwellenarbeit ist der größte Hebel.`
-    });
+    if(p5 && p5/p20 > FTP_RATIO_LIMIT){
+      const excess = p5/p20 - FTP_RATIO_LIMIT;
+      items.push({
+        area:'Schwellenleistung (FTP)', goal:'ftp', score: Math.min(100, excess/FTP_RATIO_SEVERE_SPAN*100),
+        numText: `${(p5/p20*100).toFixed(0)}% · Grenze ${(FTP_RATIO_LIMIT*100).toFixed(0)}%`,
+        why:`Deine 5-Minuten-Leistung liegt ${((p5/p20-1)*100).toFixed(0)}% über deiner 20-Minuten-Leistung — eine sehr steile Kurve. Deine Spitze ist gut, dein Unterbau hinkt hinterher — mehr Schwellenarbeit würde das ausgleichen.`
+      });
+    }
   }
 
   // Sprint uses its own ratio (5s peak vs 1-min power) instead of vs-p20,
@@ -2803,31 +2823,49 @@ function detectWeaknesses(rp, zoneDist, efficiency, durability){
     const deficit = (SPRINT_REFERENCE_RATIO-ratio)/SPRINT_REFERENCE_RATIO*100;
     if(deficit > 3) items.push({
       area:'Sprintleistung (5 Sek.)', goal:'sprint', score: Math.min(100, deficit*6),
+      numText: `${(ratio*100).toFixed(0)}% · Ziel ${(SPRINT_REFERENCE_RATIO*100).toFixed(0)}%`,
       why:`Deine 5-Sekunden-Spitzenleistung liegt bei ${(ratio*100).toFixed(0)}% deiner 1-Minuten-Leistung; typisch wären etwa ${(SPRINT_REFERENCE_RATIO*100).toFixed(0)}%. Dir fehlt kurze, maximale Sprintpower obendrauf.`
     });
   }
 
   if(zoneDist && zoneDist.pct){
-    if(zoneDist.pct.grey > 35) items.push({
-      area:'Trainingsverteilung (Grauzone)', goal:'endurance',
-      score: Math.min(100,(zoneDist.pct.grey-35)*3),
-      why:`${zoneDist.pct.grey.toFixed(0)}% deiner Zeit liegt in Z3–Z4. Diese Grauzone erzeugt Ermüdung ohne den Reiz einer echten harten Einheit — mehr klar lockere Fahrten würden deine harten Tage besser machen.`
-    });
-    if(zoneDist.pct.high < 4) items.push({
-      area:'Intensitätsanteil', goal:'vo2max', score: Math.min(100,(4-zoneDist.pct.high)*18),
-      why:`Nur ${zoneDist.pct.high.toFixed(1)}% deiner Zeit liegt über der Schwelle. Ohne regelmäßige harte Reize bleibt deine Leistungsdecke, wo sie ist.`
+    if(zoneDist.pct.grey > GREYZONE_LIMIT_PCT){
+      const excess = zoneDist.pct.grey - GREYZONE_LIMIT_PCT;
+      items.push({
+        area:'Trainingsverteilung (Grauzone)', goal:'endurance',
+        score: Math.min(100, excess/GREYZONE_SEVERE_SPAN_PCT*100),
+        numText: `${zoneDist.pct.grey.toFixed(0)}% · Grenze ${GREYZONE_LIMIT_PCT}%`,
+        why:`${zoneDist.pct.grey.toFixed(0)}% deiner Zeit liegt in Z3–Z4. Diese Grauzone erzeugt Ermüdung ohne den Reiz einer echten harten Einheit — mehr klar lockere Fahrten würden deine harten Tage besser machen.`
+      });
+    }
+    if(zoneDist.pct.high < HARD_INTENSITY_MIN_PCT){
+      const deficitAbs = HARD_INTENSITY_MIN_PCT - zoneDist.pct.high;
+      items.push({
+        area:'Intensitätsanteil', goal:'vo2max',
+        score: Math.min(100, deficitAbs/HARD_INTENSITY_SEVERE_SPAN_PCT*100),
+        numText: `${zoneDist.pct.high.toFixed(1)}% · Ziel ≥${HARD_INTENSITY_MIN_PCT}%`,
+        why:`Nur ${zoneDist.pct.high.toFixed(1)}% deiner Zeit liegt über der Schwelle. Ohne regelmäßige harte Reize bleibt deine Leistungsdecke, wo sie ist.`
+      });
+    }
+  }
+
+  if(efficiency && efficiency.recentDec != null && efficiency.recentDec > DECOUPLING_LIMIT_PCT){
+    const excess = efficiency.recentDec - DECOUPLING_LIMIT_PCT;
+    items.push({
+      area:'Aerobe Entkopplung', goal:'endurance', score: Math.min(100, excess/DECOUPLING_SEVERE_SPAN_PCT*100),
+      numText: `${efficiency.recentDec.toFixed(1)}% · Grenze ${DECOUPLING_LIMIT_PCT}%`,
+      why:`Deine Herzfrequenz driftet um ${efficiency.recentDec.toFixed(1)}% nach oben, während die Leistung gleich bleibt. Das deutet auf eine Grundlage hin, die für deine aktuellen Fahrtdauern zu dünn ist.`
     });
   }
 
-  if(efficiency && efficiency.recentDec != null && efficiency.recentDec > 5) items.push({
-    area:'Aerobe Entkopplung', goal:'endurance', score: Math.min(100,(efficiency.recentDec-5)*9),
-    why:`Deine Herzfrequenz driftet um ${efficiency.recentDec.toFixed(1)}% nach oben, während die Leistung gleich bleibt. Das deutet auf eine Grundlage hin, die für deine aktuellen Fahrtdauern zu dünn ist.`
-  });
-
-  if(durability && durability.recentAvg < 0.9) items.push({
-    area:'Ermüdungsresistenz', goal:'endurance', score: Math.min(100,(0.9-durability.recentAvg)*350),
-    why:`Spät in langen Fahrten bleiben nur ${(durability.recentAvg*100).toFixed(0)}% deiner besten 10-Minuten-Leistung übrig. Deine Frischwerte übersetzen sich nicht in Leistung nach mehreren Stunden.`
-  });
+  if(durability && durability.recentAvg < DURABILITY_MIN_RATIO){
+    const deficitAbs = DURABILITY_MIN_RATIO - durability.recentAvg;
+    items.push({
+      area:'Ermüdungsresistenz', goal:'endurance', score: Math.min(100, deficitAbs/DURABILITY_SEVERE_SPAN_RATIO*100),
+      numText: `${(durability.recentAvg*100).toFixed(0)}% · Ziel ≥${(DURABILITY_MIN_RATIO*100).toFixed(0)}%`,
+      why:`Spät in langen Fahrten bleiben nur ${(durability.recentAvg*100).toFixed(0)}% deiner besten 10-Minuten-Leistung übrig. Deine Frischwerte übersetzen sich nicht in Leistung nach mehreren Stunden.`
+    });
+  }
 
   items.sort((a,b)=>b.score-a.score);
   const top = items[0] || null;
@@ -5698,7 +5736,7 @@ function renderProfilKernWeaknessCard(frag, W){
     wCard.appendChild(h2WithInfo("Trainingsschwerpunkt (aus deinen Daten)", "Balken = Rückstand zu Referenzwerten, nicht absolutes Niveau – zeigt, wo am meisten Luft nach oben ist."));
     wCard.appendChild(el("div", {style:"margin-bottom:10px;"}, [calloutBox(null, "Größter Hebel: "+W.headline, W.reason)]));
     W.items.slice(0,5).forEach((it,i) => {
-      wCard.appendChild(barRow(it.area, it.score, i===0?"var(--cross)":"var(--chalk-dim)", ""));
+      wCard.appendChild(barRow(it.area, it.score, i===0?"var(--cross)":"var(--chalk-dim)", it.numText || ""));
       wCard.appendChild(el("div", {class:"legend-note", style:"margin-top:-4px; margin-bottom:8px;"}, [it.why]));
     });
     frag.appendChild(wCard);
