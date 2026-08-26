@@ -1977,7 +1977,7 @@ async function fetchActivitiesPage(token, page, perPage){
 // real gradients (%) for the climb table — without it, climbs could only be
 // detected by vertical rate, not distance/gradient.
 async function fetchActivityPowerStreams(id, token){
-  const res = await fetch(`https://www.strava.com/api/v3/activities/${id}/streams?keys=time,watts,heartrate,altitude,distance&key_by_type=true`, {
+  const res = await fetch(`https://www.strava.com/api/v3/activities/${id}/streams?keys=time,watts,heartrate,altitude,distance,grade_smooth,velocity_smooth&key_by_type=true`, {
     headers:{ Authorization: "Bearer " + token }
   });
   if(!res.ok){
@@ -2025,8 +2025,10 @@ const PROFIL_ACTIVITY_CACHE_MAX = 400;
 // depends on that can't be backfilled without re-fetching the raw stream,
 // which itself isn't cached). Cache-hit rows without a matching
 // metricsVersion fall through to a real re-fetch instead of being reused
-// verbatim -- see the cache-hit check in loadProfilData().
-const PROFIL_METRICS_VERSION = 2;
+// verbatim -- see the cache-hit check in loadProfilData(). Bumped to 3 to
+// backfill `speedCal` (personalized gradient×power speed calibration, see
+// computeSpeedCalibrationFromStream()) onto every cached row.
+const PROFIL_METRICS_VERSION = 3;
 
 function loadProfilActivityCache(){
   try{
@@ -2883,6 +2885,10 @@ async function processProfilRide(a, token, weightKg, zonesRaw){
   const powerZonesNorm = Array.isArray(powerZonesRaw) ? powerZonesRaw.map(z=>({ max: z.max===-1 ? null : z.max })) : null;
   const metrics = computeStreamMetrics(stream, powerZonesNorm, weightKg);
   const climbs = detectRideClimbs(stream, weightKg);
+  // Ausgeschlossen bei 'unbestätigt' (dieselbe Plausibilitätsprüfung wie
+  // oben) -- eine unplausible FTP-Schätzung würde sonst die ganze
+  // Leistungs-Achse dieser Fahrt fürs Tempo-Modell verfälschen.
+  const speedCal = confidence !== 'unbestätigt' ? computeSpeedCalibrationFromStream(stream, est.ftp) : null;
 
   return { status:'ok', row: {
     id, date: new Date(a.start_date_local || a.start_date), name: a.name,
@@ -2891,7 +2897,7 @@ async function processProfilRide(a, token, weightKg, zonesRaw){
     avgWatts: a.average_watts!=null ? Math.round(a.average_watts) : null,
     mmp, intervalAvgHr:avgHr, intervalMaxHr:maxHr, hrSource,
     estFtp: est.ftp, basis: est.basis, confidence, weight, hrNote,
-    metrics, climbs, metricsVersion: PROFIL_METRICS_VERSION
+    metrics, climbs, speedCal, metricsVersion: PROFIL_METRICS_VERSION
   }};
 }
 
@@ -7189,7 +7195,8 @@ function trainerRiderContext(pp){
   // permanent "–" placeholders next to a working Frische/ACWR card -- the
   // rows already carry ctl/atl/tsb/formVerdict, computed identically to
   // pp.trainingLoad's (see buildBlendedTrainingLoad()'s own comment).
-  return { ...rp0, wPerKg, acwr, freshness, freshnessClass, freshnessWhy, hoursIn7, ridesIn7, daysSinceHard, daysSinceRide, lthr, lthrSource, usingHr, blendedLoad: usingHr ? load : null };
+  return { ...rp0, wPerKg, acwr, freshness, freshnessClass, freshnessWhy, hoursIn7, ridesIn7, daysSinceHard, daysSinceRide, lthr, lthrSource, usingHr, blendedLoad: usingHr ? load : null,
+    speedModel: computeSpeedModel(results) };
 }
 
 // rp.usingHr branches to a simplified hrTSS (TrainingPeaks methodology:
@@ -7448,14 +7455,104 @@ function computeRouteSuitability(route, classKey, config, options){
   return { score, workableKm: Math.round(workableKm*10)/10, reasons };
 }
 
-function estimateSpeedKmh(seg){
-  const g = seg && seg.gradient!=null ? seg.gradient : 0;
-  if(g >= 6) return 12; if(g >= 3) return 16; if(g >= 1) return 20;
-  if(g <= -4) return 42; if(g <= -1) return 32;
-  return 27;
+// Gleiche Test-Reihenfolge wie der ursprüngliche if-Chain (NICHT nach
+// numerischem Wert sortiert -- g>=6 wird vor g<=-4 geprüft usw.), damit die
+// Bucket-Zuordnung für estimateSpeedKmh()'s Fallback byte-identisch zum
+// bisherigen Verhalten bleibt. fallbackKmh greift, solange rp.speedModel für
+// diese Zelle noch keine ausreichend kalibrierten Daten hat (siehe
+// computeSpeedModel unten).
+const GRADIENT_BUCKETS = [
+  { test: g => g >= 6,  fallbackKmh: 12 },
+  { test: g => g >= 3,  fallbackKmh: 16 },
+  { test: g => g >= 1,  fallbackKmh: 20 },
+  { test: g => g <= -4, fallbackKmh: 42 },
+  { test: g => g <= -1, fallbackKmh: 32 },
+  { test: () => true,   fallbackKmh: 27 },
+];
+const GRADIENT_BUCKET_LABELS = ['Steiler Anstieg (≥6%)','Anstieg (3–6%)','Leichter Anstieg (1–3%)',
+  'Steile Abfahrt (≤-4%)','Abfahrt (-4…-1%)','Flach (-1…1%)'];
+function gradientBucketIndex(g){
+  const grad = g == null ? 0 : g;
+  for(let i=0;i<GRADIENT_BUCKETS.length;i++) if(GRADIENT_BUCKETS[i].test(grad)) return i;
+  return GRADIENT_BUCKETS.length - 1;
 }
-function estimateDistanceForMinutes(minutes, gradient){
-  return minutes*60 * (estimateSpeedKmh({ gradient })/3.6);
+// rp/seg.pct sind optional -- ohne rp.speedModel (oder ohne genug kalibrierte
+// Daten für diese Zelle) verhält sich das exakt wie die alte, feste Tabelle.
+function estimateSpeedKmh(seg, rp){
+  const g = seg && seg.gradient!=null ? seg.gradient : 0;
+  const gIdx = gradientBucketIndex(g);
+  const model = rp && rp.speedModel;
+  if(model){
+    if(rp.usingHr){
+      const row = model.gradientRows[gIdx];
+      if(row) return row.kmh;
+    } else if(seg && seg.pct != null){
+      const zIdx = ZONES.indexOf(zoneFor(seg.pct));
+      const cell = model.cells[gIdx*ZONES.length + zIdx];
+      if(cell) return cell.kmh;
+    }
+  }
+  return GRADIENT_BUCKETS[gIdx].fallbackKmh;
+}
+function estimateDistanceForMinutes(minutes, gradient, pct, rp){
+  return minutes*60 * (estimateSpeedKmh({ gradient, pct }, rp)/3.6);
+}
+// Bindet grade_smooth/velocity_smooth/watts einer Fahrt in ein Steigung ×
+// Leistungszone-Raster (siehe GRADIENT_BUCKETS/ZONES) -- pro Zelle [distM,
+// sec]. >30s-Lücken oder <1 m/s (Stopp/Ampel) werden übersprungen, damit ein
+// einzelner Stopp eine Zelle nicht künstlich nach unten zieht.
+// velocity_smooth/grade_smooth sind Stravas eigene geglättete Streams --
+// bewusst genutzt statt selbst aus Höhe/Distanz abgeleitet (vermeidet die
+// Rauschprobleme, die detectRideClimbs() für reine Steigungserkennung schon
+// mit eigener Glättung lösen musste). Einziger Aufrufer: processProfilRide().
+function computeSpeedCalibrationFromStream(stream, ftp){
+  const time = stream.time, watts = stream.watts, grade = stream.grade_smooth, vel = stream.velocity_smooth;
+  if(!Array.isArray(time) || !Array.isArray(watts) || !Array.isArray(grade) || !Array.isArray(vel) || !ftp) return null;
+  const n = Math.min(time.length, watts.length, grade.length, vel.length);
+  const cells = Array.from({length: GRADIENT_BUCKETS.length * ZONES.length}, () => [0, 0]); // [distM, sec]
+  for(let i=1; i<n; i++){
+    const dt = time[i] - time[i-1];
+    if(!(dt > 0) || dt > 30) continue;
+    if(vel[i] == null || vel[i] < 1) continue;
+    if(grade[i] == null || watts[i] == null) continue;
+    const gIdx = gradientBucketIndex(grade[i]);
+    const zIdx = ZONES.indexOf(zoneFor(watts[i]/ftp));
+    const cell = cells[gIdx*ZONES.length + zIdx];
+    cell[0] += vel[i]*dt; cell[1] += dt;
+  }
+  return cells;
+}
+// ~2 Minuten aufsummierte Fahrzeit über alle Fahrten hinweg, bevor eine Zelle
+// als kalibriert gilt statt auf den generischen Schätzwert zurückzufallen --
+// genug, um Rauschen auszumitteln, kurz genug, dass häufige Kombinationen
+// (flach/Grundlage, mittlere Anstiege bei Schwelle) nach wenigen Fahrten
+// kalibriert sind. Seltene Kombinationen (z.B. steile Abfahrt bei
+// Schwellenleistung) bleiben ggf. dauerhaft auf dem Fallback -- erwartet,
+// kein Bug.
+const SPEED_CAL_MIN_SEC = 120;
+function computeSpeedModel(results){
+  const cells = Array.from({length: GRADIENT_BUCKETS.length*ZONES.length}, () => [0,0]);
+  (results||[]).forEach(r => {
+    if(!Array.isArray(r.speedCal)) return;
+    r.speedCal.forEach((c,i) => { cells[i][0] += c[0]; cells[i][1] += c[1]; });
+  });
+  const cellModel = cells.map(([distM,sec], i) => {
+    const gIdx = Math.floor(i/ZONES.length);
+    return sec < SPEED_CAL_MIN_SEC
+      ? { kmh: GRADIENT_BUCKETS[gIdx].fallbackKmh, calibrated:false, sec }
+      : { kmh: distM/sec*3.6, calibrated:true, sec };
+  });
+  // Leistungsunabhängiger Steigungs-Rollup -- für HF-Modus, wo s.pct %LTHR
+  // statt %FTP ist und sich nicht ohne verfälschende Umrechnung derselben
+  // Spalten-Auswahl zuordnen lässt. Verliert die Leistungs-Auflösung, erfasst
+  // aber weiterhin den dominanten Fehler (Tabelle ist über alle Steigungen
+  // hinweg falsch, unabhängig von der Leistung).
+  const gradientRows = GRADIENT_BUCKETS.map((b, gIdx) => {
+    let distM=0, sec=0;
+    for(let z=0; z<ZONES.length; z++){ const c = cells[gIdx*ZONES.length+z]; distM+=c[0]; sec+=c[1]; }
+    return sec < SPEED_CAL_MIN_SEC ? { kmh:b.fallbackKmh, calibrated:false, sec } : { kmh: distM/sec*3.6, calibrated:true, sec };
+  });
+  return { cells: cellModel, gradientRows };
 }
 // Shared by placeIntervalsOnRoute() (initial step creation) and
 // extendCompressedIntervalsBackward() (re-labeling after a compressed
@@ -7620,12 +7717,12 @@ function buildIntervalSpec(goal, rp){
 // an attached route: climbs first in ride order, then flat sections for
 // whatever doesn't fit, so the route carries as much of the full time-based
 // prescription as its terrain allows. Descents never host hard efforts.
-function placeIntervalsOnRoute(route, spec, adj, classKey, config, options){
+function placeIntervalsOnRoute(route, spec, adj, classKey, config, options, rp){
   options = options || {};
   const totalDist = route.totalDistanceM;
-  let wDist = estimateDistanceForMinutes(spec.warmup.minutes, 0);
-  let aDist = spec.activation ? estimateDistanceForMinutes(spec.activation.minutes, 0) : 0;
-  let cDist = estimateDistanceForMinutes(spec.cooldown.minutes, 0);
+  let wDist = estimateDistanceForMinutes(spec.warmup.minutes, 0, spec.warmup.pct, rp);
+  let aDist = spec.activation ? estimateDistanceForMinutes(spec.activation.minutes, 0, spec.activation.pct, rp) : 0;
+  let cDist = estimateDistanceForMinutes(spec.cooldown.minutes, 0, spec.cooldown.pct, rp);
   const reserved = wDist + aDist + cDist;
   if(reserved > totalDist * 0.9){
     const scale = (totalDist*0.9) / Math.max(reserved, 1);
@@ -7684,7 +7781,7 @@ function placeIntervalsOnRoute(route, spec, adj, classKey, config, options){
       while(qi < queue.length){
         const block = queue[qi];
         if(block.kind==='interval' && placedCount >= maxPerSession) break;
-        let blockDist = estimateDistanceForMinutes(block.minutes, s.avgGradient);
+        let blockDist = estimateDistanceForMinutes(block.minutes, s.avgGradient, block.pct, rp);
         if(typeFilter==='climb' && block.kind==='interval' && used===0 &&
             capacity >= blockDist*0.5 && capacity <= blockDist*1.8){
           blockDist = capacity;
@@ -7743,7 +7840,7 @@ function placeIntervalsOnRoute(route, spec, adj, classKey, config, options){
         // below to detect and undo that compression by borrowing distance
         // from a preceding, unused cruise step. Temporary -- deleted again
         // once that pass has processed this step.
-        intervalStep.nominalDistM = estimateDistanceForMinutes(b.minutes, s.avgGradient);
+        intervalStep.nominalDistM = estimateDistanceForMinutes(b.minutes, s.avgGradient, b.pct, rp);
         intervalStep.baseLabel = baseLabel;
         intervalStep.counter = intervalCounter;
         steps.push(intervalStep);
@@ -7905,7 +8002,7 @@ function generateRouteWorkout(goal, rp, route, learning, config, classKey, optio
   }
 
   const spec = buildIntervalSpec(effectiveGoal, rp) || buildIntervalSpec('ftp', rp);
-  const placement = placeIntervalsOnRoute(route, spec, adj, classKey || null, config, options);
+  const placement = placeIntervalsOnRoute(route, spec, adj, classKey || null, config, options, rp);
 
   if(placement.intervalCount === 0){
     let noneText = `Die Route bietet kein ausreichend geeignetes Terrain (ideal oder akzeptabel) für „${goalLabel(goal)}" (nur Abfahrten, zu kurvig, außerhalb des Steigungsbands, oder die Route ist zu kurz). Die ganze Strecke wird stattdessen moderat gefahren.`;
@@ -7978,7 +8075,7 @@ function estimateRouteWorkoutMetrics(steps, rp){
   if(usingHr){
     let sumPctSec=0;
     steps.forEach(s=>{
-      const kmh = estimateSpeedKmh(s);
+      const kmh = estimateSpeedKmh(s, rp);
       const sec = Math.max(1, s.distanceM/1000/kmh*3600);
       totalSec += sec; sumPctSec += s.pct*sec; totalDistanceM += s.distanceM;
     });
@@ -7989,7 +8086,7 @@ function estimateRouteWorkoutMetrics(steps, rp){
   }
   let sumP4=0, sumP=0;
   steps.forEach(s=>{
-    const kmh = estimateSpeedKmh(s);
+    const kmh = estimateSpeedKmh(s, rp);
     const sec = Math.max(1, s.distanceM/1000/kmh*3600);
     const w = s.pct*metricValue;
     totalSec += sec; sumP4 += Math.pow(w,4)*sec; sumP += w*sec; totalDistanceM += s.distanceM;
@@ -8010,7 +8107,7 @@ function workoutZoneBreakdown(steps, routeBased, rp){
   (steps||[]).forEach(s=>{
     let minutes;
     if(routeBased){
-      const kmh = estimateSpeedKmh(s);
+      const kmh = estimateSpeedKmh(s, rp);
       minutes = (s.distanceM/1000/kmh*60) || 0;
     } else {
       minutes = s.minutes || 0;
@@ -8726,12 +8823,18 @@ function buildFit(workout, rp){
     u8(0x02);
     u16(i);
     fitString(stepName, FIT_STEP_NAME_LEN).forEach(u8);
-    if(s.distanceM != null){
-      u8(1);
+    if(!workout.routeBased && s.distanceM != null){
+      u8(1); // duration_type = distance
       u32(Math.max(100, Math.round(s.distanceM*100)));
     } else {
-      u8(0);
-      u32(Math.max(1000, Math.round(s.minutes*60*1000)));
+      u8(0); // duration_type = time
+      // Hammerhead Karoo unterstützt keine distanzbasierten Workout-Schritte
+      // (importiert sie live als zeitbasiert um) -- Routen-Workouts exportieren
+      // deshalb immer zeitbasiert. rseg()-Schritte tragen kein `minutes`, also
+      // die Dauer aus der platzierten distanceM über dasselbe Tempo-Modell
+      // zurückrechnen, mit dem sie überhaupt erst platziert wurde.
+      const durationSec = s.minutes != null ? s.minutes*60 : (s.distanceM/1000) / estimateSpeedKmh(s, rp) * 3600;
+      u32(Math.max(1000, Math.round(durationSec*1000)));
     }
     u8(targetType);
     u32(0);
@@ -8764,24 +8867,28 @@ function downsampleRoutePoints(pts, targetSpacingM){
   out.push(pts[pts.length-1]);
   return out;
 }
-function estimateElapsedSecondsForPoints(pts, segments){
+function estimateElapsedSecondsForPoints(pts, segments, rp){
   const t = new Array(pts.length).fill(0);
   let segIdx = 0, elapsed = 0;
   for(let i=1;i<pts.length;i++){
     while(segIdx < (segments.length-1) && pts[i].dist > segments[segIdx].endDist) segIdx++;
     const grad = segments[segIdx] ? segments[segIdx].avgGradient : 0;
-    const kmh = estimateSpeedKmh({ gradient: grad });
+    // Kein echtes Pro-Punkt-Leistungsziel für eine reine GPS-Track-ETA
+    // verfügbar -- 0.65 landet in "Ausdauer (Z2)", passend zur überwiegenden
+    // Grundlagenpace außerhalb platzierter Intervalle. Bewusste Näherung,
+    // kein echtes Ziel.
+    const kmh = estimateSpeedKmh({ gradient: grad, pct: 0.65 }, rp);
     const dM = pts[i].dist - pts[i-1].dist;
     elapsed += dM > 0 ? dM/1000/kmh*3600 : 0;
     t[i] = elapsed;
   }
   return t;
 }
-function buildCourseFit(route){
+function buildCourseFit(route, rp){
   const smoothed = route.smoothed || route.points.map(p=>p.ele||0);
   const withEle = route.points.map((p,i) => ({ lat:p.lat, lon:p.lon, dist:p.dist, ele: smoothed[i] }));
   const pts = downsampleRoutePoints(withEle, 20);
-  const times = estimateElapsedSecondsForPoints(pts, route.segments||[]);
+  const times = estimateElapsedSecondsForPoints(pts, route.segments||[], rp);
 
   const body = [];
   const u8=v=>body.push(v & 0xFF);
@@ -9240,7 +9347,7 @@ function renderTrainerWorkoutPreview(tp, ctx){
     if(routeBased){
       actions.appendChild(el('button', {class:'btn secondary', title:'GPS-Strecke als separate .FIT-Kursdatei', onclick:()=>{
         const todayRoute = getTrainerRouteForDate(todayIsoKey());
-        if(todayRoute && todayRoute.route) downloadBlob(buildCourseFit(todayRoute.route), base+'-strecke.fit', 'application/octet-stream');
+        if(todayRoute && todayRoute.route) downloadBlob(buildCourseFit(todayRoute.route, rp), base+'-strecke.fit', 'application/octet-stream');
       }}, ['.FIT (Strecke)']));
     } else if(rp.usingHr){
       // Zwift's .ZWO format has no native HF-target element (plan §4 row 5)
@@ -10062,6 +10169,39 @@ function buildEquipmentModeCard(){
   return card;
 }
 
+// Rein informativ, keine editierbaren Werte -- das Tempo-Modell wird
+// automatisch aus der Fahrhistorie berechnet (siehe computeSpeedModel()),
+// nicht manuell gepflegt.
+function buildSpeedCalibrationSection(){
+  const results = state.profilPage.results || [];
+  const model = computeSpeedModel(results);
+  const card = el('div', {class:'card'});
+  card.appendChild(el('h2', {style:'display:flex; align-items:center; gap:8px;'}, [
+    'Persönliches Tempo-Modell',
+    infoButton('Wie schnell du auf verschiedenen Steigungen bei unterschiedlicher Leistung tatsächlich fährst, aus deinen eigenen Strava-Fahrten berechnet. Blass dargestellte Felder haben noch zu wenig eigene Daten und nutzen einen generischen Schätzwert. Bestimmt, wie viel Streckendistanz ein zeitbasiertes Intervall auf einer Route beansprucht.')
+  ]));
+  const totalSec = model.cells.reduce((s,c)=>s+c.sec, 0);
+  if(totalSec < SPEED_CAL_MIN_SEC){
+    card.appendChild(el('div', {class:'legend-note'}, ['Noch nicht genug Fahrten für eine persönliche Kalibrierung — Schätzwerte werden verwendet.']));
+    return card;
+  }
+  const details = el('details', {class:'tt-collapse'});
+  details.appendChild(el('summary', {}, [el('h3', {class:'tsettings-group-title', style:'display:inline; margin:0;'}, ['Tabelle anzeigen'])]));
+  const body = el('div', {style:'margin-top:10px;'});
+  GRADIENT_BUCKETS.forEach((b, gIdx) => {
+    const chips = el('div', {class:'stat-chips'}, ZONES.map((z, zIdx) => {
+      const cell = model.cells[gIdx*ZONES.length + zIdx];
+      return statChip(Math.round(cell.kmh)+' km/h', z.name, cell.calibrated ? null : 'opacity:0.55;');
+    }));
+    body.appendChild(el('div', {class:'tsettings-group'}, [
+      el('h3', {class:'tsettings-group-title'}, [GRADIENT_BUCKET_LABELS[gIdx]]), chips
+    ]));
+  });
+  details.appendChild(body);
+  card.appendChild(details);
+  return card;
+}
+
 function renderEinstellungenPage(){
   const frag = document.createDocumentFragment();
 
@@ -10093,6 +10233,8 @@ function renderEinstellungenPage(){
   ROUTE_GEN_SETTINGS_FIELDS.forEach(def => routeGenCard.appendChild(settingsFieldRow(def.path, def)));
   routeGenCard.appendChild(el('button', {class:'btn secondary', style:'margin-top:8px;', onclick: ()=>{ resetConfigSlice('routeGeneration'); render(); }}, ['Zurücksetzen']));
   frag.appendChild(routeGenCard);
+
+  frag.appendChild(buildSpeedCalibrationSection());
 
   frag.appendChild(el('div', {style:'margin-top:4px;'}, [infoButton('Diese Einstellungen betreffen ausschließlich die Trainer-Trainingsempfehlungen und Streckenanalyse — unabhängig von der Punktabstand-Einstellung im Strecke-Tab.')]));
 
