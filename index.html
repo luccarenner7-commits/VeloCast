@@ -9873,7 +9873,20 @@ function renderTrainerAblaufCard(tp, ctx){
       const targetText = s.rpeLabel ? s.rpeLabel
         : `${Math.round(stepTargetValue(s.pct, rp))} ${rp.usingHr ? 'bpm' : 'W'} · ${Math.round(s.pct*100)}%`;
       const row = el('div', {class:'step', style:`border-left-color:${z.color};`});
-      row.appendChild(el('span',{class:'step-name'},[ s.name + (s.note?' – '+s.note:'') ]));
+      const nameWrap = el('span', {style:'display:inline-flex; align-items:center; gap:6px; flex-wrap:wrap;'});
+      nameWrap.appendChild(el('span',{class:'step-name'},[ s.name + (s.note?' – '+s.note:'') ]));
+      // Eignung wird bewusst hier neu berechnet statt bei der Platzierung
+      // (placeIntervalsOnRoute()) mitgeschrieben: s.gradient kann sich danach
+      // noch ändern (extendCompressedIntervalsBackward() mischt Steigung
+      // beim rückwärtigen Verlängern), und die Anzeige soll immer zur
+      // tatsächlich gezeigten Steigung passen, nicht zu einem veralteten Wert.
+      if(s.kind==='interval' && workout.routeBased && s.gradient!=null && !SUITABILITY_EXEMPT_CLASSES.includes(workout.classKey)){
+        const band = (TRAINING_CONFIG.constraints.byClass[workout.classKey] || {}).gradient;
+        const tier = band ? gradientSuitability(s.gradient, band) : null;
+        if(tier==='ideal') nameWrap.appendChild(el('span',{class:'tag tail mini'},['Optimal']));
+        else if(tier==='acceptable') nameWrap.appendChild(el('span',{class:'tag cross mini'},['Akzeptabel']));
+      }
+      row.appendChild(nameWrap);
       row.appendChild(el('span',{class:'step-meta'},[ `${amount} · ${targetText}${gradText}` ]));
       stepsBox.appendChild(row);
     });
