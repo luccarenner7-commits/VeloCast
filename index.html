@@ -5374,12 +5374,6 @@ function calloutBox(cls, title, body){
     el("div", {class:"callout-body"}, [body])
   ]);
 }
-// Ersetzt calloutBox() an Stellen, die komplett hinter (i) verschwinden --
-// bündelt Titel+Text einmal konsistent für infoButton(), statt an jeder
-// Call-Site denselben Node-Aufbau zu wiederholen.
-function collapsedResult(title, body){
-  return infoButton([el('div', {style:'font-weight:600; margin-bottom:4px;'}, [title]), el('div', {}, [body])]);
-}
 function barRow(label, pct, color, numText, qualityPct){
   const clampedPct = Math.max(0,Math.min(100,pct||0));
   const fill = qualityPct==null
@@ -5504,7 +5498,8 @@ function renderProfilFtpSection(frag){
   frag.appendChild(chartCard);
 
   const interpCard = el("div", {class:"card"});
-  const paras = ["FTP ist ein Maximalwert: Trend & Prognose zeigen die rollierende 42-Tage-Bestleistung (höchster bestätigter Schätzwert der letzten 6 Wochen, aus 5-/10-/20-Min-Bestleistungen, per HF-Zeitfenster bestätigt)."];
+  const genericIntro = "FTP ist ein Maximalwert: Trend & Prognose zeigen die rollierende 42-Tage-Bestleistung (höchster bestätigter Schätzwert der letzten 6 Wochen, aus 5-/10-/20-Min-Bestleistungen, per HF-Zeitfenster bestätigt).";
+  const paras = [];
   if(a && a.weeklySlope!=null) paras.push(a.weeklySlope>0 ? `Trend: +${a.weeklySlope.toFixed(1)} W/Woche.` : (a.weeklySlope<0 ? `Trend: −${Math.abs(a.weeklySlope).toFixed(1)} W/Woche.` : "Bestwert stabil."));
   if(fl>0) paras.push(`⚠ ${fl} Aktivität${fl===1?'':'en'} unbestätigt, aus Trend ausgeschlossen.`);
   if(a && currentFtp!=null && a.modelToday!=null){
@@ -5513,7 +5508,8 @@ function renderProfilFtpSection(frag){
       : (gap>0 ? `Gesetzter FTP liegt ${gap} W über dem Modell.` : `Gesetzter FTP liegt ${Math.abs(gap)} W unter dem Modell.`));
   }
   if(a && a.forecast8!=null) paras.push(`Prognose: ca. ${a.forecast8} W in 8 Wochen (4 Wo.: ${a.forecast4} W, 12 Wo.: ${a.forecast12} W), lineare Extrapolation.`);
-  interpCard.appendChild(h2WithInfo("Einordnung", paras.map(p => el('div',{style:'margin-bottom:6px;'},[p]))));
+  interpCard.appendChild(h2WithInfo("Einordnung", genericIntro));
+  paras.forEach(p => interpCard.appendChild(el('div',{style:'margin-bottom:6px;'},[p])));
   frag.appendChild(interpCard);
 
   const actCard = el("div", {class:"card"});
@@ -5561,9 +5557,9 @@ function renderProfilFormSection(frag){
 
   const meaningCard = el("div", {class:"card"});
   meaningCard.appendChild(el("h2", {}, ["Was das bedeutet"]));
-  const formResults = [collapsedResult(L.formVerdict, L.formWhy)];
-  if(L.rampWeekly>7) formResults.push(collapsedResult("Steiler Formaufbau", `Deine Fitness steigt um ${L.rampWeekly.toFixed(1)} CTL-Punkte pro Woche. Über 5–7 pro Woche gilt als aggressiv – nachhaltig ist das nur mit konsequenten Entlastungswochen.`));
-  meaningCard.appendChild(el("div", {style:"display:flex; flex-wrap:wrap; gap:8px;"}, formResults));
+  const formResults = [calloutBox(L.formClass, L.formVerdict, L.formWhy)];
+  if(L.rampWeekly>7) formResults.push(calloutBox('warn', "Steiler Formaufbau", `Deine Fitness steigt um ${L.rampWeekly.toFixed(1)} CTL-Punkte pro Woche. Über 5–7 pro Woche gilt als aggressiv – nachhaltig ist das nur mit konsequenten Entlastungswochen.`));
+  meaningCard.appendChild(el("div", {style:"display:flex; flex-direction:column; gap:8px;"}, formResults));
   frag.appendChild(meaningCard);
 
   if(Z && Z.weeks.length){
@@ -5590,7 +5586,7 @@ function renderProfilFormSection(frag){
       polCard.appendChild(barRow("Grauzone (Z3–Z4)", Z.pct.grey, cc.cross, Z.pct.grey.toFixed(1)+"%"));
       polCard.appendChild(barRow("Hart (Z5+)", Z.pct.high, cc.head, Z.pct.high.toFixed(1)+"%"));
     }
-    polCard.appendChild(el("div", {style:"margin-top:12px;"}, [collapsedResult(Z.verdict, Z.why)]));
+    polCard.appendChild(el("div", {style:"margin-top:12px;"}, [calloutBox(Z.verdictClass, Z.verdict, Z.why)]));
     frag.appendChild(polCard);
   }
 }
@@ -5659,8 +5655,8 @@ function renderProfilKernEfficiencyCard(frag, E){
     const efCard = el("div", {class:"card"});
     efCard.appendChild(h2WithInfo("Effizienz & aerobe Entkopplung", "Blau: Watt/Herzschlag – steigt mit aerober Fitness. Amber: Entkopplung, Leistungs-Puls-Verhältnis 2. Fahrthälfte vs. 1. Nur Fahrten über 30 Min."));
     efCard.appendChild(el("div", {class:"chart-box short"}, [el("canvas", {id:"velocastEfChart"})]));
-    efCard.appendChild(el("div", {style:"margin-top:12px;"}, [collapsedResult(E.verdict, E.why)]));
-    if(E.weeklyEfSlope!=null) efCard.appendChild(el("div", {style:"margin-top:6px;"}, [infoButton(`Effizienz-Trend: ${E.weeklyEfSlope>0?'+':''}${(E.weeklyEfSlope*1000).toFixed(2)} mW/Schlag pro Woche.`)]));
+    efCard.appendChild(el("div", {style:"margin-top:12px;"}, [calloutBox(E.verdictClass, E.verdict, E.why)]));
+    if(E.weeklyEfSlope!=null) efCard.appendChild(el("div", {class:"legend-note", style:"margin-top:6px;"}, [`Effizienz-Trend: ${E.weeklyEfSlope>0?'+':''}${(E.weeklyEfSlope*1000).toFixed(2)} mW/Schlag pro Woche.`]));
     frag.appendChild(efCard);
   }
 }
@@ -5669,7 +5665,7 @@ function renderProfilKernDurabilityCard(frag, D){
   if(D){
     const durCard = el("div", {class:"card"});
     durCard.appendChild(h2WithInfo("Ermüdungsresistenz", `Beste 10-Min-Leistung im letzten Drittel ÷ beste 10-Min-Leistung der ganzen Fahrt, aus ${D.rides.length} Fahrten über 90 Min. 100% = Fahrtdauer kostet nichts.`));
-    durCard.appendChild(collapsedResult(D.verdict, D.why));
+    durCard.appendChild(calloutBox(D.verdictClass, D.verdict, D.why));
     frag.appendChild(durCard);
   }
 }
@@ -5678,9 +5674,10 @@ function renderProfilKernClimbingCard(frag, C){
   if(C){
     const climbCard = el("div", {class:"card"});
     climbCard.appendChild(h2WithInfo("Kletterleistung",
-      `W/kg auf Anstiegen ≥3% Steigung, über 4 Min.${C.weeklySlope!=null?` Trend: ${C.weeklySlope>0?'+':''}${C.weeklySlope.toFixed(3)} W/kg/Woche.`:''} Anstiege werden aus Höhen- und Leistungsdaten erkannt (keine Strava-Segmentnamen).`
+      "W/kg auf Anstiegen ≥3% Steigung, über 4 Min. Anstiege werden aus Höhen- und Leistungsdaten erkannt (keine Strava-Segmentnamen)."
     ));
     climbCard.appendChild(el("div", {class:"chart-box short"}, [el("canvas", {id:"velocastClimbChart"})]));
+    if(C.weeklySlope!=null) climbCard.appendChild(el("div", {class:"legend-note", style:"margin-top:-4px; margin-bottom:8px;"}, [`Trend: ${C.weeklySlope>0?'+':''}${C.weeklySlope.toFixed(3)} W/kg/Woche.`]));
     climbCard.appendChild(el("div", {style:"margin-top:12px;"}, [dataTableNode(
       ["Steigung","Dauer","Watt","W/kg","Datum"],
       C.best.slice(0,10).map(cl => [
@@ -5699,10 +5696,10 @@ function renderProfilKernWeaknessCard(frag, W){
   if(W && W.items.length){
     const wCard = el("div", {class:"card"});
     wCard.appendChild(h2WithInfo("Trainingsschwerpunkt (aus deinen Daten)", "Balken = Rückstand zu Referenzwerten, nicht absolutes Niveau – zeigt, wo am meisten Luft nach oben ist."));
-    wCard.appendChild(el("div", {style:"margin-bottom:10px;"}, [collapsedResult("Größter Hebel: "+W.headline, W.reason)]));
+    wCard.appendChild(el("div", {style:"margin-bottom:10px;"}, [calloutBox(null, "Größter Hebel: "+W.headline, W.reason)]));
     W.items.slice(0,5).forEach((it,i) => {
       wCard.appendChild(barRow(it.area, it.score, i===0?"var(--cross)":"var(--chalk-dim)", ""));
-      wCard.appendChild(el("div", {style:"margin-top:-4px; margin-bottom:8px;"}, [infoButton(it.why)]));
+      wCard.appendChild(el("div", {class:"legend-note", style:"margin-top:-4px; margin-bottom:8px;"}, [it.why]));
     });
     frag.appendChild(wCard);
   }
@@ -9134,7 +9131,7 @@ function renderTrainerContextCards(rp){
   }
   return grid;
 }
-function renderTrainerGoalBar(chosen, W, rp){
+function renderTrainerGoalBar(chosen, rp){
   const card = el('div', {class:'card'});
   const field = el('div', {});
   field.appendChild(el('label', {for:'trainerGoalSelect'}, ['Trainingsziel']));
@@ -9150,16 +9147,15 @@ function renderTrainerGoalBar(chosen, W, rp){
   });
   field.appendChild(select);
   card.appendChild(field);
-  card.appendChild(el('div', {class:'legend-note', style:'margin-top:8px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;'}, [
-    `Aus deinen letzten ${rp.sampleSize} Fahrten.`,
-    chosen==='auto' && W ? collapsedResult(`🎯 Größter Hebel: ${W.headline}`, 'Details im Profil-Tab.') : ''
+  card.appendChild(el('div', {class:'legend-note', style:'margin-top:8px;'}, [
+    `Aus deinen letzten ${rp.sampleSize} Fahrten.`
   ]));
   return card;
 }
 function renderTrainerDecisionDashboard(trainingState, weaknessData, opportunity, budgetsUnavailable){
   const card = el('div', {class:'card'});
   card.appendChild(el('h2',{},['Trainings-Dashboard']));
-  if(weaknessData) card.appendChild(el('div',{style:'margin-bottom:10px;'},[collapsedResult(`Größter Hebel: ${weaknessData.headline}`, weaknessData.reason)]));
+  if(weaknessData) card.appendChild(el('div',{style:'margin-bottom:10px;'},[calloutBox(null, `Größter Hebel: ${weaknessData.headline}`, weaknessData.reason)]));
   card.appendChild(el('div',{style:'margin-bottom:6px; font-weight:600; font-size:13px;'},['Prioritäten & Wochenbudgets']));
   if(budgetsUnavailable){
     // weeklyClassProgress()/classNeglectWeeks() read results[].metrics.zoneTimes,
@@ -9190,11 +9186,11 @@ function renderTrainerDecisionDashboard(trainingState, weaknessData, opportunity
     if(opportunity.suitable){
       const suitText = opportunity.suitability ? ` Streckeneignung: ${opportunity.suitability.score}/100.` : '';
       const safetyText = opportunity.forceRecovery ? ' Sicherheitsnetz aktiv: Belastung/Ermüdung überschreiben die normale Priorität.' : '';
-      card.appendChild(el('div',{style:'margin-top:10px;'},[collapsedResult(`Warum ${opportunity.className} heute?`,
+      card.appendChild(el('div',{style:'margin-top:10px;'},[calloutBox('good', `Warum ${opportunity.className} heute?`,
         (opportunity.forceRecovery?'Sicherheitsnetz':`Priorität ${(PRIORITY_BADGE[opportunity.priority]||{}).label||opportunity.priority}`) + '.' + suitText + safetyText)]));
     } else {
       const reasons = (opportunity.suitability && opportunity.suitability.reasons) || [];
-      card.appendChild(el('div',{style:'margin-top:10px;'},[collapsedResult(`Route ungeeignet für ${opportunity.className}`,
+      card.appendChild(el('div',{style:'margin-top:10px;'},[calloutBox('danger', `Route ungeeignet für ${opportunity.className}`,
         `Streckeneignung: ${opportunity.suitability?opportunity.suitability.score:0}/100. ${reasons.join(' ')}`)]));
     }
   }
@@ -9302,6 +9298,11 @@ function renderTrainerWorkoutPreview(tp, ctx){
       warnRationale.forEach(r => warnRow.appendChild(calloutBox(r.type==='danger'?'danger':'warn', r.title, r.text)));
       body.appendChild(warnRow);
     }
+    if(goodRationale.length){
+      const goodRow = el('div', {style:'display:flex; flex-direction:column; gap:8px; margin-bottom:10px;'});
+      goodRationale.forEach(r => goodRow.appendChild(calloutBox('good', r.title, r.text)));
+      body.appendChild(goodRow);
+    }
     if(!hasWorkout){
       details.appendChild(body);
       card.appendChild(details);
@@ -9375,7 +9376,6 @@ function renderTrainerWorkoutPreview(tp, ctx){
     } else {
       body.appendChild(el('div', {style:'margin:-4px 0 10px;'}, [infoButton('Zwei Dateien: das Workout (Schritte/Ziele) und die Strecke (GPS-Track) separat – auf dem Gerät beide zusammen für die Fahrt auswählen, genau wie bei Hammerhead/Garmin/Wahoo üblich.')]));
     }
-    if(goodRationale.length) body.appendChild(el('div',{style:'margin-bottom:10px;'},[infoButton(goodRationale.map(r=>r.text).join(' '))]));
     body.appendChild(el('div',{class:'chart-box tall'},[el('canvas',{id:'velocastTrainerChart'})]));
     if(!routeBased){
       // HF-Zweig: LTHR_ZONES statt ZONES, Referenzlinien-Punkt heißt "LTHR-Linie".
@@ -9439,8 +9439,8 @@ function renderTrainerZonesCard(hasWorkout, zoneBreakdown, routeBased, actualWee
     appendZoneBars(card, zoneBreakdown);
   }
   card.appendChild(el('div', {style:'display:flex; align-items:center; gap:var(--space-2); font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:16px 0 4px;'}, [
-    'Diese Woche, gefahren',
-    actualWeekZones.rides>0 ? infoButton(`${actualWeekZones.rides} Fahrt${actualWeekZones.rides===1?'':'en'} seit Montag, aus deinen echten Aktivitäten (${usingHr ? 'Stravas 7 Leistungszonen aus deinen Fahrten mit Wattdaten – nur Fahrten mit Leistungsmesser zählen hier, unabhängig vom aktuellen Modus.' : 'Stravas 7 Zonen statt der 6 App-Zonen oben.'}). Der helle Bereich in Tempo/Schwelle/VO2max/Anaerob zeigt, welcher Anteil davon lange genug am Stück in der Zone war, um als hochwertiges Intervall fürs Wochenbudget zu zählen.`) : ''
+    actualWeekZones.rides>0 ? `Diese Woche, gefahren – ${actualWeekZones.rides} Fahrt${actualWeekZones.rides===1?'':'en'} seit Montag` : 'Diese Woche, gefahren',
+    actualWeekZones.rides>0 ? infoButton(`Aus deinen echten Aktivitäten (${usingHr ? 'Stravas 7 Leistungszonen aus deinen Fahrten mit Wattdaten – nur Fahrten mit Leistungsmesser zählen hier, unabhängig vom aktuellen Modus.' : 'Stravas 7 Zonen statt der 6 App-Zonen oben.'}). Der helle Bereich in Tempo/Schwelle/VO2max/Anaerob zeigt, welcher Anteil davon lange genug am Stück in der Zone war, um als hochwertiges Intervall fürs Wochenbudget zu zählen.`) : ''
   ]));
   if(actualWeekZones.rides>0){
     appendZoneBars(card, actualWeekZones, true);
@@ -9455,15 +9455,15 @@ function renderClassComplianceNoteEl(cc){
   const metricLabel = cc.usingHr ? 'LTHR' : 'FTP';
   const rangeText = cc.range ? ` (Zielbereich ${Math.round(cc.range.min*100)}–${Math.round(cc.range.max*100)}% ${metricLabel})` : '';
   return el('div',{class:'legend-note', style:'margin-top:10px;'},[
-    infoButton(`${label}-Budget aus dieser Fahrt: ${cc.inRangeMin}/${cc.plannedMin} min im Zielbereich${rangeText}, ${cc.remainingMin} min außerhalb.`)
+    `${label}-Budget aus dieser Fahrt: ${cc.inRangeMin}/${cc.plannedMin} min im Zielbereich${rangeText}, ${cc.remainingMin} min außerhalb.`
   ]);
 }
 function appendEvaluationResult(box, ev){
   if(ev.mismatchPct!=null && ev.mismatchPct>15){
-    box.appendChild(collapsedResult(`${ev.isRoute?'Streckenlänge':'Dauer'} weicht ab`,
+    box.appendChild(calloutBox('warn', `${ev.isRoute?'Streckenlänge':'Dauer'} weicht ab`,
       `Die Aktivität ist ${ev.mismatchPct.toFixed(0)}% ${ev.isRoute?'länger/kürzer als die hochgeladene Route':'länger/kürzer als das geplante Workout'} – der Abgleich kann dadurch ungenau sein.`));
   }
-  box.appendChild(collapsedResult(ev.verdict, ev.why));
+  box.appendChild(calloutBox(ev.verdictClass, ev.verdict, ev.why));
   const rows = ev.perStep.filter(s=>s.kind==='interval');
   if(rows.length){
     box.appendChild(el('div',{style:'margin-top:10px;'},[dataTableNode(
@@ -9685,7 +9685,7 @@ function renderTrainerPage(){
 
   frag.appendChild(renderTrainerSummaryCards(rp.usingHr ? rp.blendedLoad : pp.trainingLoad, GOALS[chosen]?GOALS[chosen].label:chosen, chosen==='auto'));
   frag.appendChild(renderTrainerContextCards(rp));
-  frag.appendChild(renderTrainerGoalBar(chosen, W, rp));
+  frag.appendChild(renderTrainerGoalBar(chosen, rp));
   frag.appendChild(renderTrainerDecisionDashboard(trainingState, W, dashboardOpportunity, rp.usingHr && !pp.results.length));
   frag.appendChild(renderTrainerClassPicker(tp, trainingState, recommendedClassKey));
   if(selectedClassObj){
