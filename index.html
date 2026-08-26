@@ -923,6 +923,13 @@ let state = {
     routeSource: "gpx", // "gpx" | "saved" - which picker tab is shown when no route is attached today
     routeError: null,
     loadingRoute: false, // true while a saved-Strava-route attachment fetch is in flight
+    // Top-Strecken suitability ranking (see renderTopRoutesCard()/
+    // ensureTopRouteCandidatesFetched()) — separate from loadingRoute/
+    // routeError above, since this is a batch scan over many candidate
+    // routes/activities, not the single-route attach flow.
+    topRoutesLoading: false,
+    topRoutesError: null,
+    topRoutesFetchedCount: 0,
     exportDistanceMode: false, // "plan by km instead of minutes" toggle, FIT-only, non-route workouts only
     hammerheadResult: null, // {ok, name} | {ok:false, message} after "Send to Hammerhead", or null
     evalActivityId: null,
@@ -1891,6 +1898,19 @@ async function fetchActivityStreams(id, token){
     headers:{ Authorization: "Bearer " + token }
   });
   if(!res.ok) throw new Error("Höhendaten nicht verfügbar (" + res.status + ")");
+  return res.json();
+}
+
+// fetchActivityStreams() above deliberately only asks for altitude+distance
+// (elevation charts don't need coordinates). analyzeRoute()'s curvature and
+// intersection detection need real lat/lon, though — a third narrow fetcher
+// rather than widening fetchActivityStreams, matching the file's existing
+// one-fetcher-per-key-set convention (see fetchActivityPowerStreams below).
+async function fetchActivityGeoStreams(id, token){
+  const res = await fetch(`https://www.strava.com/api/v3/activities/${id}/streams?keys=latlng,altitude,distance&key_by_type=true`, {
+    headers:{ Authorization: "Bearer " + token }
+  });
+  if(!res.ok) throw new Error("Streckendaten nicht verfügbar (" + res.status + ")");
   return res.json();
 }
 
@@ -8744,6 +8764,21 @@ function handleTrainerGpxFile(file){
   }).catch(()=>{ tp.routeError = 'Datei konnte nicht gelesen werden.'; render(); });
 }
 
+// Shared by attachSavedStravaRouteToTrainer() below and the Top-Strecken
+// batch scan (ensureTopRouteCandidatesFetched()) — both need to turn a raw
+// latlng/altitude/distance stream triple into analyzeRoute()'s {lat,lon,ele,
+// dist(meters)} point shape. distance is preferred straight from the stream
+// when Strava provides one of matching length; otherwise it's derived from
+// latlng via the same haversine cumulative-distance pass used everywhere
+// else in the app (buildCumulativeDistances(), km->m).
+function streamsToPts(latlng, altitude, distance){
+  if(!Array.isArray(latlng) || latlng.length < 2) throw new Error('Für diese Strecke sind keine GPS-Punkte verfügbar.');
+  const cumM = (Array.isArray(distance) && distance.length === latlng.length)
+    ? distance
+    : buildCumulativeDistances(latlng).map(km=>km*1000);
+  return latlng.map((p,i)=>({ lat:p[0], lon:p[1], ele: Array.isArray(altitude)?altitude[i]:null, dist: cumM[i] }));
+}
+
 // Saved/planned Strava route — reuses fetchRouteStreams() (already used by
 // the Strecke page's elevation profile) directly, reading its latlng stream
 // too (which normalizeStreams() drops) instead of adding a second fetcher.
@@ -8755,15 +8790,7 @@ async function attachSavedStravaRouteToTrainer(route){
     const raw = await fetchRouteStreams(route.id, state.accessToken);
     const byType = {};
     (Array.isArray(raw)?raw:[]).forEach(s => { if(s && s.type) byType[s.type] = s.data; });
-    const latlng = byType.latlng, altitude = byType.altitude, distance = byType.distance;
-    if(!Array.isArray(latlng) || latlng.length < 2) throw new Error('Für diese Route sind keine GPS-Punkte verfügbar.');
-    let cumM;
-    if(Array.isArray(distance) && distance.length === latlng.length){
-      cumM = distance;
-    } else {
-      cumM = buildCumulativeDistances(latlng).map(km=>km*1000);
-    }
-    const pts = latlng.map((p,i)=>({ lat:p[0], lon:p[1], ele: Array.isArray(altitude)?altitude[i]:null, dist: cumM[i] }));
+    const pts = streamsToPts(byType.latlng, byType.altitude, byType.distance);
     const analyzed = analyzeRoute(pts);
     if(!analyzed || analyzed.totalDistanceM < 300) throw new Error('Route zu kurz oder unbrauchbar (unter 300 m).');
     saveTrainerRouteForDate(todayIsoKey(), route.name || 'Route', pts);
@@ -8772,6 +8799,163 @@ async function attachSavedStravaRouteToTrainer(route){
     tp.routeError = (e && e.message) || String(e);
   }
   tp.loadingRoute = false;
+  tp.workoutPreviewOpen = true;
+  render();
+}
+
+// ---------- Trainer: Top-Strecken suitability ranking ----------
+// Own cache, isolated from TRAINER_ROUTES_KEY above (that one is "today's
+// attached route", a single slot per calendar date that gets overwritten on
+// every attach — wrong shape for "every candidate route/activity the
+// ranking UI has ever fetched streams for"). Same slim-and-cap convention
+// as every other cache in the file (see loadAktivitaetenListCache() etc.):
+// defensive parse, sort-by-recency-then-slice on save, smaller fallback cap
+// on quota errors. Stores raw slimmed points, never a computed score —
+// TRAINING_CONFIG's gradient bands can be overridden any time in
+// Einstellungen, so a cached score would go silently stale while cached
+// points (route geometry) never do; the score is recomputed live on every
+// render instead (cheap, synchronous, no network).
+const TOP_ROUTES_CACHE_KEY = 'velocast_top_routes_cache';
+const TOP_ROUTES_CACHE_MAX = 150;
+function loadTopRoutesCache(){
+  try{
+    const raw = localStorage.getItem(TOP_ROUTES_CACHE_KEY);
+    if(!raw) return {};
+    const parsed = JSON.parse(raw);
+    if(!parsed || typeof parsed !== 'object') return {};
+    const out = {};
+    Object.entries(parsed).forEach(([id, entry]) => {
+      if(!entry || !Array.isArray(entry.points) || entry.points.length < 2) return;
+      out[id] = entry;
+    });
+    return out;
+  }catch(e){ return {}; }
+}
+function saveTopRoutesCache(cacheObj){
+  const attempt = (cap) => {
+    const entries = Object.entries(cacheObj)
+      .sort((a,b) => (b[1].cachedAt||0) - (a[1].cachedAt||0))
+      .slice(0, cap);
+    const trimmed = {};
+    entries.forEach(([id, e]) => { trimmed[id] = e; });
+    localStorage.setItem(TOP_ROUTES_CACHE_KEY, JSON.stringify(trimmed));
+  };
+  try{ attempt(TOP_ROUTES_CACHE_MAX); }
+  catch(e){ try{ attempt(40); }catch(e2){ /* cache is a speed optimization, not required */ } }
+}
+function saveTopRouteCacheEntry(id, entry){
+  const all = loadTopRoutesCache();
+  all[id] = entry;
+  saveTopRoutesCache(all);
+}
+
+// In-memory, per-session — mirrors trainerRouteAnalysisCache above, but
+// keyed by candidate id instead of date. Lets switching training-class
+// chips re-score every candidate (computeRouteSuitability(), cheap) without
+// re-running analyzeRoute() on all of them again on every render.
+const topRouteAnalysisCache = new Map();
+function getAnalyzedTopRoute(id){
+  if(topRouteAnalysisCache.has(id)) return topRouteAnalysisCache.get(id);
+  const cached = loadTopRoutesCache()[id];
+  let result = null;
+  if(cached){
+    try{ result = analyzeRoute(cached.points); }catch(e){ result = null; }
+  }
+  topRouteAnalysisCache.set(id, result);
+  return result;
+}
+
+// Recency cap on the activity side of the candidate pool: state.stravaRoutes
+// is already capped by Strava at per_page=30, so this bounds a first-ever
+// "Strecken bewerten" click to at most ~50 stream fetches instead of one per
+// ride ever completed. A ride from months ago is rarely the relevant
+// suggestion for tomorrow's interval session anyway.
+const TOP_ROUTES_ACTIVITY_LOOKBACK = 20;
+
+// Combines saved Strava routes (state.stravaRoutes, in-memory only, needs
+// ensureStravaRoutesLoaded() to have run) with recently completed rides.
+// Reads the activity list straight from its on-disk cache
+// (loadAktivitaetenListCache()) rather than state.aktivitaetenPage.items —
+// that field is only populated once the Aktivitäten tab has actually loaded
+// in this session, whereas the on-disk cache persists across sessions and
+// needs no extra fetch to read. Filtered to RIDE_SPORT_TYPES, same
+// a.sport_type||a.type fallback already used at the other three call sites
+// of that Set.
+function buildTopRouteCandidates(){
+  const routeCandidates = state.stravaRoutes.map(r => ({
+    id: 'route-' + r.id, sourceType: 'route', name: r.name || 'Route',
+    dateIso: null, raw: r
+  }));
+  const activityCache = loadAktivitaetenListCache();
+  const activityCandidates = Object.values(activityCache)
+    .filter(a => a && RIDE_SPORT_TYPES.has(a.sport_type || a.type))
+    .sort(byStartDateDesc)
+    .slice(0, TOP_ROUTES_ACTIVITY_LOOKBACK)
+    .map(a => ({
+      id: 'activity-' + a.id, sourceType: 'activity', name: a.name || 'Aktivität',
+      dateIso: a.start_date_local || a.start_date, raw: a
+    }));
+  return [...routeCandidates, ...activityCandidates];
+}
+
+// Diffs buildTopRouteCandidates() against what's already cached and fetches
+// exactly the missing ones — geometry never goes stale, so "already cached"
+// never needs re-fetching regardless of age. Sequential for-await loop,
+// render() after EACH item, same discipline as loadSegmentExtras() (the
+// established pattern in this file for a button-triggered batch of Strava
+// calls with incremental per-item UI feedback). Per-candidate failures
+// (deleted route -> 404, no GPS stream, too short) are skipped silently,
+// same as loadSegmentExtras()'s per-segment try/catch — one bad candidate
+// must not abort the rest of the scan.
+async function ensureTopRouteCandidatesFetched(){
+  const tp = state.trainerPage;
+  const candidates = buildTopRouteCandidates();
+  const cached = loadTopRoutesCache();
+  const missing = candidates.filter(c => !cached[c.id]);
+  tp.topRoutesFetchedCount = candidates.length - missing.length;
+  for(const c of missing){
+    try{
+      let pts;
+      if(c.sourceType === 'route'){
+        const raw = await fetchRouteStreams(c.raw.id, state.accessToken);
+        const byType = {};
+        (Array.isArray(raw)?raw:[]).forEach(s => { if(s && s.type) byType[s.type] = s.data; });
+        pts = streamsToPts(byType.latlng, byType.altitude, byType.distance);
+      } else {
+        const raw = await fetchActivityGeoStreams(c.raw.id, state.accessToken);
+        const byType = normalizeStreams(raw);
+        pts = streamsToPts(byType.latlng, byType.altitude, byType.distance);
+      }
+      const analyzed = analyzeRoute(pts);
+      if(!analyzed || analyzed.totalDistanceM < 300) throw new Error('zu kurz');
+      saveTopRouteCacheEntry(c.id, {
+        sourceType: c.sourceType, name: c.name, dateIso: c.dateIso,
+        distanceM: analyzed.totalDistanceM, points: slimTrainerRoutePoints(pts), cachedAt: Date.now()
+      });
+      topRouteAnalysisCache.delete(c.id);
+    }catch(e){
+      // skip this candidate, see comment above
+    }
+    tp.topRoutesFetchedCount++;
+    render();
+  }
+  tp.topRoutesLoading = false;
+  render();
+}
+
+// Attaches an already-scored Top-Strecken candidate as today's trainer
+// route — same end state as attachSavedStravaRouteToTrainer() above
+// (saveTrainerRouteForDate + invalidateTrainerRouteCache), but sourced from
+// the already-cached (already-slimmed) points instead of a fresh fetch:
+// the whole point of scoring candidates ahead of time is that attaching one
+// costs zero additional network calls.
+function attachTopRouteCandidate(candidate){
+  const tp = state.trainerPage;
+  const cached = loadTopRoutesCache()[candidate.id];
+  if(!cached){ tp.routeError = 'Strecke nicht mehr im Cache verfügbar — bitte neu bewerten.'; render(); return; }
+  saveTrainerRouteForDate(todayIsoKey(), cached.name, cached.points);
+  invalidateTrainerRouteCache(todayIsoKey());
+  tp.routeError = null;
   tp.workoutPreviewOpen = true;
   render();
 }
@@ -9619,6 +9803,83 @@ function renderTrainerTestDurationPicker(tp, testSignal){
   card.appendChild(row);
   return card;
 }
+// Ranked Top-Strecken suitability list for the currently selected training
+// class — a decision aid shown ABOVE the manual attach card below, since
+// "here's what's optimal" belongs before "here's how to pick something
+// else". Not rendered for SUITABILITY_EXEMPT_CLASSES: gradient-band scoring
+// is meaningless for recovery/endurance/longdistance (any terrain is fine
+// by design) and 'test' already has its own dedicated route-free UI
+// (renderTrainerTestDurationPicker) — this is also enforced structurally at
+// the renderTrainerPage() call site, this check just makes it safe to call
+// renderTopRoutesCard() directly too.
+const TOP_ROUTES_TOP_N = 5;
+function renderTopRoutesCard(tp, classKey){
+  if(SUITABILITY_EXEMPT_CLASSES.includes(classKey)) return null;
+  // Saved routes are only ever fetched lazily (see ensureStravaRoutesLoaded()'s
+  // own guard against duplicate/parallel fetches) — normally triggered by
+  // opening the Strecke page's "Routes" tab, but a user who opens Trainer
+  // first in a fresh session would otherwise silently see zero saved-route
+  // candidates with no indication why. Same call-inside-render trigger
+  // pattern already used for e.g. ensureElevationProfile().
+  ensureStravaRoutesLoaded();
+  const card = el('div', {class:'card'});
+  card.appendChild(el('h2', {style:'display:flex; align-items:center; gap:8px;'}, [
+    'Top-Strecken',
+    infoButton('Deine gespeicherten Strava-Routen und zuletzt gefahrenen Strecken, bewertet danach, wie gut ihr Höhenprofil zur gewählten Trainingsklasse passt. Ergebnis kommt aus derselben Steigungs-Analyse, die auch die Intervall-Platzierung auf einer angehängten Strecke nutzt.')
+  ]));
+
+  const candidates = buildTopRouteCandidates();
+  if(!candidates.length){
+    card.appendChild(el('div', {class:'empty-state'}, ['Keine gespeicherten Routen oder Fahrten gefunden.']));
+    return card;
+  }
+  const cache = loadTopRoutesCache();
+  const uncachedCount = candidates.filter(c => !cache[c.id]).length;
+
+  const scored = candidates
+    .map(c => {
+      const analyzed = getAnalyzedTopRoute(c.id);
+      if(!analyzed) return null;
+      const suitability = computeRouteSuitability(analyzed, classKey, TRAINING_CONFIG, {});
+      return { candidate: c, analyzed, suitability };
+    })
+    .filter(Boolean)
+    .sort((a,b) => b.suitability.score - a.suitability.score)
+    .slice(0, TOP_ROUTES_TOP_N);
+
+  if(scored.length){
+    const list = el('div', {style:'margin-top:8px; display:flex; flex-direction:column; gap:8px;'});
+    scored.forEach(({candidate, analyzed, suitability})=>{
+      const sourceLabel = candidate.sourceType === 'route' ? 'Route'
+        : `Aktivität vom ${new Date(candidate.dateIso).toLocaleDateString('de-DE', {day:'2-digit', month:'2-digit'})}`;
+      list.appendChild(el('div', {class:'activity', style:'cursor:pointer;', onclick: ()=>attachTopRouteCandidate(candidate)}, [
+        el('div', {}, [
+          el('div', {class:'name'}, [candidate.name]),
+          el('div', {class:'meta'}, [`${sourceLabel} · ${(analyzed.totalDistanceM/1000).toFixed(1)} km`])
+        ]),
+        el('div', {class:'stat-chips'}, [
+          statChip(String(Math.round(suitability.score)), 'Eignung'),
+          statChip(suitability.workableKm.toFixed(1), 'km geeignet')
+        ])
+      ]));
+    });
+    card.appendChild(list);
+  } else if(!tp.topRoutesLoading){
+    card.appendChild(el('div', {class:'legend-note', style:'margin-top:8px;'}, ['Noch keine Strecken bewertet.']));
+  }
+
+  if(tp.topRoutesLoading){
+    card.appendChild(el('div', {class:'loading', style:'margin-top:8px;'}, [`Strecken werden bewertet… (${tp.topRoutesFetchedCount}/${candidates.length})`]));
+  } else if(uncachedCount > 0){
+    card.appendChild(el('button', {class:'btn secondary', style:'margin-top:8px;', onclick: ()=>{
+      tp.topRoutesLoading = true; tp.topRoutesError = null; render();
+      ensureTopRouteCandidatesFetched();
+    }}, [`Strecken bewerten (${uncachedCount})`]));
+  }
+  if(tp.topRoutesError) card.appendChild(el('div', {class:'error', style:'margin-top:10px;'}, [tp.topRoutesError]));
+  return card;
+}
+
 function renderTrainerRouteCard(tp, selectedClassObj, todayRoute){
   const card = el('div', {class:'card'});
   card.appendChild(el('h2', {}, [`Strecke für „${selectedClassObj.label}"`]));
@@ -10164,7 +10425,11 @@ function renderTrainerPage(){
   frag.appendChild(renderTrainerClassPicker(tp, trainingState, recommendedClassKey, testSignal));
   if(selectedClassObj){
     if(tp.selectedClassKey === 'test') frag.appendChild(renderTrainerTestDurationPicker(tp, testSignal));
-    else frag.appendChild(renderTrainerRouteCard(tp, selectedClassObj, todayRoute));
+    else {
+      const topRoutesCard = renderTopRoutesCard(tp, tp.selectedClassKey);
+      if(topRoutesCard) frag.appendChild(topRoutesCard);
+      frag.appendChild(renderTrainerRouteCard(tp, selectedClassObj, todayRoute));
+    }
     frag.appendChild(renderTrainerWorkoutPreview(tp, { workout, workoutExists, hasWorkout, routeBased: effectiveRouteBased, rp, metrics, zoneBreakdown, specificity, workoutGoalKey, warnRationale, goodRationale }));
   }
   frag.appendChild(renderTrainerZonesCard(hasWorkout, zoneBreakdown, effectiveRouteBased, actualWeekZones, rp));
