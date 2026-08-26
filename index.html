@@ -731,7 +731,8 @@ let state = {
   activities: [],
   selectedActivity: null,
   routePoints: [], // [{lat,lon,bearing,distanceKm,arrivalTime}] - sampled points used for wind markers
-  fullRouteCoords: [], // [[lat,lon], ...] full-resolution line for the map
+  fullRouteCoords: [], // [[lat,lon], ...] full-resolution line for the map, always forward direction as loaded
+  routeReversed: false, // preview-only: show fullRouteCoords traveled backward, for comparing wind in both directions
   weatherAtRoute: [], // aligned with routePoints
   startTime: defaultStartTime(),
   avgSpeedKmh: savedSettings.avgSpeedKmh || 25,
@@ -3632,6 +3633,7 @@ async function selectActivity(activity){
   state.elevationProfile = null;
   state.windFieldPoints = null;
   state.climbIndex = 0;
+  state.routeReversed = false;
   resetRouteSegments();
   render();
   if(!activity.map || !activity.map.summary_polyline){
@@ -3651,18 +3653,38 @@ async function selectActivity(activity){
   await loadRouteWeather();
 }
 
+// The coordinate order actually driving routePoints/the map line: normally
+// just fullRouteCoords, but reversed in place when routeReversed is on
+// (preview toggle, see toggleRouteReversed()) — fullRouteCoords itself is
+// never mutated, so switching back is always exact.
+function activeRouteCoords(){
+  return state.routeReversed ? state.fullRouteCoords.slice().reverse() : state.fullRouteCoords;
+}
+
 // Re-samples routePoints from the already-loaded fullRouteCoords — used
-// whenever Punktabstand changes, and after loading a GPX file or a saved
-// Strava route, since the full coordinate list doesn't need to change,
-// just how it's sliced into wind-sample points. Deliberately does NOT touch
-// elevationProfile/windFieldPoints/routeSegments — Punktabstand changing
-// doesn't change which route is loaded, so none of those need to reset.
+// whenever Punktabstand or the reversed-direction toggle changes, and after
+// loading a GPX file or a saved Strava route, since the full coordinate list
+// doesn't need to change, just how it's sliced into wind-sample points.
+// Deliberately does NOT touch elevationProfile/windFieldPoints/routeSegments
+// — none of those are direction-dependent, so none of them need to reset.
 function recomputeRoutePoints(){
   if(!state.fullRouteCoords.length) return;
-  const cumDist = buildCumulativeDistances(state.fullRouteCoords);
-  state.routePoints = pickRoutePoints(state.fullRouteCoords, cumDist, state.routePointDistanceKm);
+  const coords = activeRouteCoords();
+  const cumDist = buildCumulativeDistances(coords);
+  state.routePoints = pickRoutePoints(coords, cumDist, state.routePointDistanceKm);
   render();
   loadRouteWeather();
+}
+
+// Flips the wind-preview direction: recomputes routePoints (bearing +
+// distance-from-start both naturally flip once the underlying coord order
+// is reversed) and re-fetches weather, since arrival time per point shifts
+// with the new distance-from-start. Preview-only — never mutates
+// fullRouteCoords, so this is freely reversible and doesn't affect anything
+// else that reads the loaded route.
+function toggleRouteReversed(){
+  state.routeReversed = !state.routeReversed;
+  recomputeRoutePoints();
 }
 
 function selectRouteSourceTab(tab){
@@ -3688,6 +3710,7 @@ async function selectStravaRoute(route){
   state.elevationProfile = null;
   state.windFieldPoints = null;
   state.climbIndex = 0;
+  state.routeReversed = false;
   resetRouteSegments();
   render();
   const poly = route.map && (route.map.polyline || route.map.summary_polyline);
@@ -3740,6 +3763,7 @@ async function loadGpxFile(file){
   state.selectedActivity = { name: file.name.replace(/\.gpx$/i, ""), isGpx: true };
   state.windFieldPoints = null;
   state.climbIndex = 0;
+  state.routeReversed = false;
   resetRouteSegments();
   state.fullRouteCoords = track.coords;
   state.elevationProfile = track.eles.every(e => e != null)
@@ -4136,6 +4160,8 @@ function renderRouteMapSection(card){
     }
     const weatherReady = state.routePoints.length && state.weatherAtRoute.length;
     if(weatherReady){
+      card.appendChild(renderToggleSwitch(state.routeReversed, "Strecke umgekehrt anzeigen (Wind-Vergleich)", toggleRouteReversed));
+
       const mix = computeWindMix();
       if(mix){
         // Hero percentages above a thin pill bar: the three numbers are the
@@ -4445,7 +4471,10 @@ function mountSegmentView(map, layers, segId, isNewRoute){
 }
 
 function mountFullRouteView(map, layers, isNewRoute){
-  const coords = state.fullRouteCoords;
+  // Must match whatever coord order routePoints was built from (see
+  // recomputeRoutePoints()) — pts[i].idx indexes into that same array, used
+  // below to slice the colored wind segments and to place direction chevrons.
+  const coords = activeRouteCoords();
   const latlngs = coords.map(c=>[c[0], c[1]]);
 
   // faint base line — carries the route where no wind data covers it
