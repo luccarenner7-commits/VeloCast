@@ -2347,14 +2347,18 @@ function computeStreamMetrics(stream, powerZones, weightKg){
 
   const avgPower = watts.reduce((a,b)=>a+(b||0),0)/n;
 
+  const zoneIndexFor = w => {
+    let zi = powerZones.findIndex(z => z.max == null || w <= z.max);
+    if(zi < 0) zi = powerZones.length-1;
+    if(zi >= POWER_ZONE_META.length) zi = POWER_ZONE_META.length-1;
+    return zi;
+  };
+
   const zoneTimes = new Array(POWER_ZONE_META.length).fill(0);
   const sampleZoneIdx = new Array(n).fill(-1);
   if(Array.isArray(powerZones) && powerZones.length){
     for(let i=0;i<n;i++){
-      const w = watts[i]||0;
-      let zi = powerZones.findIndex(z => z.max == null || w <= z.max);
-      if(zi < 0) zi = powerZones.length-1;
-      if(zi >= zoneTimes.length) zi = zoneTimes.length-1;
+      const zi = zoneIndexFor(watts[i]||0);
       zoneTimes[zi] += dt;
       sampleZoneIdx[i] = zi;
     }
@@ -2362,17 +2366,19 @@ function computeStreamMetrics(stream, powerZones, weightKg){
 
   // Weekly-budget-only gate (weeklyClassProgress()/trainedOnDate()): for
   // classes representing genuine sustained intervals (tempo/threshold/
-  // vo2max/anaerobic), a contiguous span of time-in-zone -- with a short
-  // grace-period tolerance for brief dips, mirroring detectRideClimbs()'s
-  // start/lastClimbingIdx state machine below -- must clear a minimum
-  // duration before it counts. zoneTimes above (used by charts) stays pure
-  // cumulative time, unchanged; this is a separate parallel array that
-  // starts as a copy of it, so classes without a gate (recovery/endurance/
-  // sprint/longdistance) end up byte-identical to zoneTimes automatically.
+  // vo2max/anaerobic), a contiguous span of time-in-zone -- with a generous
+  // grace-period tolerance for brief dips (traffic lights, corners, a few
+  // seconds of coasting -- routine outdoor riding, not just indoor noise),
+  // mirroring detectRideClimbs()'s start/lastClimbingIdx state machine below
+  // -- must clear a minimum duration before it counts. zoneTimes above (used
+  // by charts) stays pure cumulative time, unchanged; this is a separate
+  // parallel array that starts as a copy of it, so classes without a gate
+  // (recovery/endurance/sprint/longdistance) end up byte-identical to
+  // zoneTimes automatically.
   const intervalZoneTimes = zoneTimes.slice();
   if(Array.isArray(powerZones) && powerZones.length){
     const idCfg = (typeof TRAINING_CONFIG !== 'undefined' && TRAINING_CONFIG.intervalDetection) || {};
-    const graceSec = idCfg.graceSec ?? 8;
+    const graceSec = idCfg.graceSec ?? 20;
     const minSecByClass = idCfg.minSecByClass || { tempo:480, threshold:480, vo2max:150, anaerobic:30 };
     const classList = (typeof TRAINING_CLASSES !== 'undefined') ? TRAINING_CLASSES : [];
     Object.keys(minSecByClass).forEach(classKey => {
@@ -5368,10 +5374,17 @@ function calloutBox(cls, title, body){
 function collapsedResult(title, body){
   return infoButton([el('div', {style:'font-weight:600; margin-bottom:4px;'}, [title]), el('div', {}, [body])]);
 }
-function barRow(label, pct, color, numText){
+function barRow(label, pct, color, numText, qualityPct){
+  const clampedPct = Math.max(0,Math.min(100,pct||0));
+  const fill = qualityPct==null
+    ? el("span", {style:`display:block; height:100%; width:100%; background:${color}; border-radius:var(--r-full);`}, [])
+    : el("span", {style:"position:relative; display:block; height:100%; width:100%;"}, [
+        el("span", {style:`position:absolute; inset:0; background:${color}; opacity:0.35;`}, []),
+        el("span", {style:`position:absolute; inset:0; width:${Math.max(0,Math.min(100,qualityPct))}%; background:${color};`}, [])
+      ]);
   return el("div", {class:"bar-row"}, [
     el("span", {class:"bar-label"}, [label]),
-    el("span", {class:"bar-track"}, [ el("span", {style:`display:block; height:100%; width:${Math.max(0,Math.min(100,pct||0))}%; background:${color}; border-radius:var(--r-full);`}, []) ]),
+    el("span", {class:"bar-track"}, [ el("span", {style:`display:block; height:100%; width:${clampedPct}%;`}, [fill]) ]),
     el("span", {class:"bar-num"}, [numText])
   ]);
 }
@@ -8017,16 +8030,34 @@ function actualWeekZoneBreakdown(results){
   const monday = new Date(now); monday.setDate(now.getDate()-day); monday.setHours(0,0,0,0);
   const nextMonday = new Date(monday); nextMonday.setDate(monday.getDate()+7);
   const secs = POWER_ZONE_META.map(()=>0);
+  const qualitySecs = POWER_ZONE_META.map(()=>0);
   let totalSec = 0, rides = 0;
   (results||[]).forEach(r => {
     const d = new Date(r.date);
     if(d < monday || d >= nextMonday) return;
     if(!r.metrics || !Array.isArray(r.metrics.zoneTimes)) return;
     rides++;
-    r.metrics.zoneTimes.forEach((t,i)=>{ if(i<secs.length){ secs[i]+=t; totalSec+=t; } });
+    // Same fallback as weeklyClassProgress()/trainedOnDate(): cached rows
+    // computed before intervalZoneTimes existed just fall back to the raw
+    // zoneTimes, i.e. read as 100% quality rather than 0%.
+    const qzt = Array.isArray(r.metrics.intervalZoneTimes) ? r.metrics.intervalZoneTimes : r.metrics.zoneTimes;
+    r.metrics.zoneTimes.forEach((t,i)=>{
+      if(i>=secs.length) return;
+      secs[i]+=t; totalSec+=t;
+      qualitySecs[i] += qzt[i]||0;
+    });
   });
+  // Quality-% is only meaningful for classes with an actual minimum-duration
+  // gate (TRAINING_CONFIG.intervalDetection) -- for ungated zones (recovery/
+  // endurance/sprint) intervalZoneTimes is byte-identical to zoneTimes, so
+  // the ratio would always read 100 and say nothing; null there means "don't
+  // show the overlay" (see appendZoneBars/barRow).
+  const gatedZoneIdx = new Set(TRAINING_CLASSES
+    .filter(c => c.zoneIdx!=null && TRAINING_CONFIG.intervalDetection.minSecByClass[c.key]!=null)
+    .map(c => c.zoneIdx));
   const zones = POWER_ZONE_META.map((z,i)=>({ name:z.name, color:z.color, minutes: secs[i]/60,
-    pct: totalSec>0 ? secs[i]/totalSec*100 : 0 }));
+    pct: totalSec>0 ? secs[i]/totalSec*100 : 0,
+    qualityPct: (gatedZoneIdx.has(i) && secs[i]>0) ? qualitySecs[i]/secs[i]*100 : null }));
   return { zones, totalMin: totalSec/60, rides, weekStart: monday };
 }
 
@@ -9278,10 +9309,11 @@ function renderTrainerWorkoutPreview(tp, ctx){
   card.appendChild(details);
   return card;
 }
-function appendZoneBars(card, breakdown){
+function appendZoneBars(card, breakdown, showQuality){
   if(breakdown.totalMin<=0.05){ card.appendChild(el('div',{class:'legend-note'},['Keine Zonendaten.'])); return; }
   breakdown.zones.filter(z=>z.minutes>0.05).forEach(z=>{
-    card.appendChild(barRow(z.name, z.pct, z.color, `${Math.round(z.minutes)} min · ${z.pct.toFixed(0)}%`));
+    const q = showQuality ? z.qualityPct : null;
+    card.appendChild(barRow(z.name, z.pct, z.color, `${Math.round(z.minutes)} min · ${z.pct.toFixed(0)}%`, q));
   });
 }
 function renderTrainerZonesCard(hasWorkout, zoneBreakdown, routeBased, actualWeekZones, rp){
@@ -9301,10 +9333,10 @@ function renderTrainerZonesCard(hasWorkout, zoneBreakdown, routeBased, actualWee
   }
   card.appendChild(el('div', {style:'display:flex; align-items:center; gap:var(--space-2); font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:16px 0 4px;'}, [
     'Diese Woche, gefahren',
-    actualWeekZones.rides>0 ? infoButton(`${actualWeekZones.rides} Fahrt${actualWeekZones.rides===1?'':'en'} seit Montag, aus deinen echten Aktivitäten (${usingHr ? 'Stravas 7 Leistungszonen aus deinen Fahrten mit Wattdaten – nur Fahrten mit Leistungsmesser zählen hier, unabhängig vom aktuellen Modus.' : 'Stravas 7 Zonen statt der 6 App-Zonen oben.'})`) : ''
+    actualWeekZones.rides>0 ? infoButton(`${actualWeekZones.rides} Fahrt${actualWeekZones.rides===1?'':'en'} seit Montag, aus deinen echten Aktivitäten (${usingHr ? 'Stravas 7 Leistungszonen aus deinen Fahrten mit Wattdaten – nur Fahrten mit Leistungsmesser zählen hier, unabhängig vom aktuellen Modus.' : 'Stravas 7 Zonen statt der 6 App-Zonen oben.'}). Der helle Bereich in Tempo/Schwelle/VO2max/Anaerob zeigt, welcher Anteil davon lange genug am Stück in der Zone war, um als hochwertiges Intervall fürs Wochenbudget zu zählen.`) : ''
   ]));
   if(actualWeekZones.rides>0){
-    appendZoneBars(card, actualWeekZones);
+    appendZoneBars(card, actualWeekZones, true);
   } else {
     card.appendChild(el('div',{class:'legend-note'},['Noch keine Fahrten diese Woche.']));
   }
