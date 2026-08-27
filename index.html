@@ -547,12 +547,18 @@
   .cpc-budget{ font-family:'IBM Plex Mono', monospace; font-size:10.5px; color:var(--chalk-dim); }
 
   /* Generated-workout step list ("Ablauf & Analyse"), one row per step,
-     left-border tinted by that step's %FTP zone (see zoneFor()). */
+     left-border tinted by that step's %FTP zone (see zoneFor()). .step-pos
+     is the running position (km into the route, or elapsed minutes for a
+     time-based workout) at which this step begins -- a fixed-width rail so
+     the numbers line up down the list instead of competing with the name
+     for space. */
   .workout-steps{ display:flex; flex-direction:column; gap:var(--space-2); }
   .step{
-    border-left:3px solid var(--line); padding:6px 10px; display:flex; justify-content:space-between;
-    gap:10px; flex-wrap:wrap; background:var(--asphalt); border-radius:0 var(--r-sm) var(--r-sm) 0;
+    border-left:3px solid var(--line); padding:6px 10px; display:flex; align-items:baseline;
+    gap:10px; background:var(--asphalt); border-radius:0 var(--r-sm) var(--r-sm) 0;
   }
+  .step-pos{ flex:0 0 40px; text-align:right; font-family:'IBM Plex Mono', monospace; font-size:10px; color:var(--chalk-dim); opacity:0.7; white-space:nowrap; }
+  .step-body{ flex:1 1 auto; min-width:0; display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }
   .step-name{ font-size:12.5px; color:var(--chalk); }
   .step-meta{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); white-space:nowrap; }
 
@@ -10252,6 +10258,11 @@ function renderTrainerAblaufCard(tp, ctx){
     // (VO2max/Anaerob/Sprint im HF-Modus, s.rpeLabel gesetzt) wird die
     // RPE-Stufe statt einer bpm-Zahl/% gezeigt -- s.pct ist dort nur noch
     // Backing-Wert für die Zonenfarbe links, kein angezeigtes Ziel mehr.
+    // Läuft die kumulierte Position (km bei einer Strecken-Vorschau, sonst
+    // verstrichene Minuten) parallel zur Schrittliste mit, damit jede Zeile
+    // zeigt, wo im Workout man sich zu Beginn dieses Schritts befindet --
+    // nicht nur, wie lang der Schritt selbst ist.
+    let runningDistM = 0, runningMin = 0;
     workout.steps.forEach(s=>{
       const z = stepZoneFor(s.pct, rp);
       const amount = s.distanceM!=null ? `${(s.distanceM/1000).toFixed(2)} km` : (s.minutes<1 ? `${Math.round(s.minutes*60)} s` : `${s.minutes} min`);
@@ -10259,9 +10270,19 @@ function renderTrainerAblaufCard(tp, ctx){
       const gradText = showGrad ? ` · Ø ${s.gradient>0?'+':''}${s.gradient.toFixed(1)}%` : '';
       const targetText = s.rpeLabel ? s.rpeLabel
         : `${Math.round(stepTargetValue(s.pct, rp))} ${rp.usingHr ? 'bpm' : 'W'} · ${Math.round(s.pct*100)}%`;
+      // s.name trägt für Intervall-/Verbindungsschritte bereits "(X km[, Y%])"
+      // (siehe intervalStepName() / die "Verbindung (…)"-Labels) -- unverändert
+      // gelassen, weil Export (.FIT/.ZWO) und Auswertungstabelle denselben
+      // Namen weiterverwenden. Hier nur für die Anzeige gestrippt, da die
+      // Zahl gleich danach in step-meta nochmal steht (die eigentliche
+      // "zu viel Text"-Redundanz).
+      const displayName = s.name.replace(/ \([\d.]+\s*km(?:,\s*-?[\d.]+%)?\)$/, '');
+      const posLabel = workout.routeBased ? `${(runningDistM/1000).toFixed(1)} km` : `${Math.round(runningMin)} min`;
       const row = el('div', {class:'step', style:`border-left-color:${z.color};`});
+      row.appendChild(el('span', {class:'step-pos'}, [posLabel]));
+      const stepBody = el('div', {class:'step-body'});
       const nameWrap = el('span', {style:'display:inline-flex; align-items:center; gap:6px; flex-wrap:wrap;'});
-      nameWrap.appendChild(el('span',{class:'step-name'},[ s.name + (s.note?' – '+s.note:'') ]));
+      nameWrap.appendChild(el('span',{class:'step-name'},[ displayName + (s.note?' – '+s.note:'') ]));
       // Eignung wird bewusst hier neu berechnet statt bei der Platzierung
       // (placeIntervalsOnRoute()) mitgeschrieben: s.gradient kann sich danach
       // noch ändern (extendCompressedIntervalsBackward() mischt Steigung
@@ -10273,9 +10294,12 @@ function renderTrainerAblaufCard(tp, ctx){
         if(tier==='ideal') nameWrap.appendChild(el('span',{class:'tag tail mini'},['Optimal']));
         else if(tier==='acceptable') nameWrap.appendChild(el('span',{class:'tag cross mini'},['Akzeptabel']));
       }
-      row.appendChild(nameWrap);
-      row.appendChild(el('span',{class:'step-meta'},[ `${amount} · ${targetText}${gradText}` ]));
+      stepBody.appendChild(nameWrap);
+      stepBody.appendChild(el('span',{class:'step-meta'},[ `${amount} · ${targetText}${gradText}` ]));
+      row.appendChild(stepBody);
       stepsBox.appendChild(row);
+      runningDistM += (s.distanceM||0);
+      runningMin += (s.minutes||0);
     });
     body.appendChild(stepsBox);
   } else {
