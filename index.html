@@ -2265,12 +2265,12 @@ const POWER_ZONE_META = [
   { name:"Z6 Anaerob",         color:"#f2766b", band:"high" },
   { name:"Z7 Neuromuskulär",   color:"#c792ea", band:"high" }
 ];
-const CEILING_WINDOW_DAYS = 42;
+const CEILING_WINDOW_DAYS = 365;
 // Test-Klasse Staleness-Fenster (s. computeTestDueSignal() weiter unten) --
-// bewusst an dasselbe 42-Tage-Fenster gekoppelt, das auch die "aktueller
-// Bestwert"-Ceiling-Berechnung nutzt: ein Testwert gilt genau so lange als
-// aktuell wie ein normaler Bestwert überhaupt in die Ceiling einfließt.
-const TEST_STALENESS_DAYS = CEILING_WINDOW_DAYS;
+// bewusst eigenständig statt an CEILING_WINDOW_DAYS gekoppelt: ein
+// Leistungstest soll nach 42 Tagen als fällig gelten, unabhängig davon, wie
+// lang das Fenster für die FTP-/Potential-Bestwert-Ceiling ist.
+const TEST_STALENESS_DAYS = 42;
 
 function fmtDurLabel(sec){ return sec % 60 === 0 ? (sec/60) + "min" : sec + "s"; }
 
@@ -2883,8 +2883,8 @@ function buildRiderProfile(pp, ftpAnalysis){
   const zonesRaw = pp.zonesRaw || {};
   const today = new Date();
   const daysAgo = d => (today-d)/86400000;
-  const recent90 = results.filter(r=>daysAgo(r.date)<=90);
-  const pool = recent90.length>=3 ? recent90 : results;
+  const recentWindow = results.filter(r=>daysAgo(r.date)<=CEILING_WINDOW_DAYS);
+  const pool = recentWindow.length>=3 ? recentWindow : results;
 
   const mmpCurve = {};
   pool.forEach(r => r.mmp && Object.entries(r.mmp).forEach(([sec,w])=>{
@@ -3922,44 +3922,53 @@ async function loadRouteWeather(){
 }
 
 // Fetches per-segment weather + Strava detail (PR, KOM/QOM, elevation,
-// effort count) for a list of segments into the given bucket's weather/
-// details maps. Shared by both segment sources (see segmentBucket()) — the
+// effort count) + PR watts (for the "Potential"-Chip, see buildPotentialChip())
+// for a list of segments into the given bucket's weather/details/prWatts
+// maps. Shared by both segment sources (see segmentBucket()) — the
 // starred-segments flow calls this from loadActivitiesAndSegments(), the
 // ride-completed-segments flow from ensureRideSegments() below. For the
 // ride-completed bucket the `details` fetched here still matters even
 // though computeSegmentStatChips() prefers the richer per-ride effort data
 // for its stat chips — mountSegmentView() needs detail.map.polyline to draw
-// the segment's own path when it's clicked into the map detail view.
+// the segment's own path when it's clicked into the map detail view; its
+// `prWatts` is already filled in by ensureRideSegments() before this runs,
+// so fetchSegmentPrWatts() below is a no-op there (no extra fetch).
 // `limit` caps how many of `list`'s segments get fetched, if given — both
 // call sites now pass Infinity (starred and ride-completed alike), since
 // capping here silently drops segments past the cap, which is exactly the
 // bug this parameter used to cause for "Meine Segmente" when a starred list
 // grew past 12.
+// Weather/detail are fetched in parallel per segment (prWatts needs detail's
+// pr_activity_id first, so it stays a third sequential step); render() is
+// called once after the whole list instead of once per segment — a
+// re-render per segment (up to 30 on a starred list, each rebuilding the
+// full DOM + remounting the route map) was the cause of visible jank right
+// after connecting.
 async function loadSegmentExtras(list, bucket, limit){
   if(limit === undefined) limit = Infinity;
   for(const seg of list.slice(0, limit)){
-    if(seg.start_latlng){
-      try{
-        const w = await fetchWeather(seg.start_latlng[0].toFixed(4), seg.start_latlng[1].toFixed(4));
-        bucket.weather[seg.id] = w;
-      }catch(e){
-        bucket.weather[seg.id] = null;
-      }
-    }
-    try{
-      bucket.details[seg.id] = await fetchSegmentDetail(seg.id, state.accessToken);
-    }catch(e){
-      bucket.details[seg.id] = null;
-    }
-    render();
+    const weatherPromise = seg.start_latlng
+      ? fetchWeather(seg.start_latlng[0].toFixed(4), seg.start_latlng[1].toFixed(4)).catch(()=>null)
+      : Promise.resolve(undefined);
+    const detailPromise = fetchSegmentDetail(seg.id, state.accessToken).catch(()=>null);
+    const [weather, detail] = await Promise.all([weatherPromise, detailPromise]);
+    if(seg.start_latlng) bucket.weather[seg.id] = weather;
+    bucket.details[seg.id] = detail;
+    await fetchSegmentPrWatts(seg, bucket);
   }
+  render();
 }
 
 // PR power isn't in the segment summary — it takes a whole extra activity
-// fetch per segment to find it, so we only do this on demand (when a
-// segment is clicked) instead of eagerly for all visible segments, to keep
-// Strava API usage down.
-async function ensureSegmentPrWatts(seg, bucket){
+// fetch per segment to find it. loadSegmentExtras() above now fetches this
+// eagerly (in its own per-segment iteration, after `details` is set) for
+// every visible segment; this stays a separate function purely for
+// selectSegment()'s on-demand retry path — after a real Strava disconnect/
+// reconnect or a page load that skipped loadSegmentExtras, prWatts[seg.id]
+// may still be undefined when a segment is clicked, and that click needs to
+// trigger its own render() once the fetch resolves (loadSegmentExtras
+// batches its render() for the whole list instead).
+async function fetchSegmentPrWatts(seg, bucket){
   if(bucket.prWatts[seg.id] !== undefined) return;
   const detail = bucket.details[seg.id];
   const prActivityId = detail && detail.athlete_segment_stats && detail.athlete_segment_stats.pr_activity_id;
@@ -3973,6 +3982,11 @@ async function ensureSegmentPrWatts(seg, bucket){
   }catch(e){
     bucket.prWatts[seg.id] = null;
   }
+}
+
+async function ensureSegmentPrWatts(seg, bucket){
+  if(bucket.prWatts[seg.id] !== undefined) return;
+  await fetchSegmentPrWatts(seg, bucket);
   render();
 }
 
@@ -4786,9 +4800,14 @@ function buildXomChip(xomTime, prSeconds, label){
 // ersten "Trainingsdaten laden" null -- dann liefert das still null zurück
 // und der Chip wird schlicht weggelassen (keine Meldung, kein Auto-Fetch,
 // gleiche Konvention wie andere teure/optionale Zusatzdaten im Code).
-// >100% ist zulässig (nicht gekappt): die MMP-Kurve deckt nur die letzten 90
-// Tage ab, ein älterer Segment-PR kann darüber liegen -- das ist eine
-// echte Aussage, kein Rechenfehler.
+// >100% ist zulässig (nicht gekappt): die MMP-Kurve deckt nur die letzten
+// CEILING_WINDOW_DAYS Tage ab, ein älterer Segment-PR kann darüber liegen --
+// das ist eine echte Aussage, kein Rechenfehler.
+// Farbe nutzt --tail/--cross (die App-weite Gut/Mittel-Ampel, z.B.
+// Terrain-Match, Status-Badges) statt der KOM/QOM-Lila-Töne (--kom-near/
+// --kom-mid) -- die bedeuten "nah an einem Strava-Rekord", ein anderes
+// Konzept als "eigenes Potential ausgeschöpft", und dieselbe Farbe für beide
+// sorgte für Verwirrung.
 function buildPotentialChip(watts, durationSec){
   if(watts == null || durationSec == null) return null;
   const rp = state.profilPage.riderProfile;
@@ -4796,8 +4815,8 @@ function buildPotentialChip(watts, durationSec){
   if(best == null || best <= 0) return null;
   const pct = Math.round((watts/best) * 100);
   let style = null;
-  if(pct >= 95) style = "color:var(--kom-near); background:var(--kom-near-bg);";
-  else if(pct >= 85) style = "color:var(--kom-mid); background:var(--kom-mid-bg);";
+  if(pct >= 95) style = "color:var(--tail); background:var(--tail-bg);";
+  else if(pct >= 85) style = "color:var(--cross); background:var(--cross-bg);";
   return {value: `${pct}%`, label: "Potential", style};
 }
 
@@ -9065,12 +9084,12 @@ function buildTopRouteCandidates(){
 // Diffs buildTopRouteCandidates() against what's already cached and fetches
 // exactly the missing ones — geometry never goes stale, so "already cached"
 // never needs re-fetching regardless of age. Sequential for-await loop,
-// render() after EACH item, same discipline as loadSegmentExtras() (the
-// established pattern in this file for a button-triggered batch of Strava
-// calls with incremental per-item UI feedback). Per-candidate failures
-// (deleted route -> 404, no GPS stream, too short) are skipped silently,
-// same as loadSegmentExtras()'s per-segment try/catch — one bad candidate
-// must not abort the rest of the scan.
+// render() after EACH item — this one is a manual, button-triggered scan
+// where incremental per-item progress is worth showing, unlike
+// loadSegmentExtras() (batches its render() to avoid re-rendering during an
+// automatic on-load fetch of up to 30 segments). Per-candidate failures
+// (deleted route -> 404, no GPS stream, too short) are skipped silently —
+// one bad candidate must not abort the rest of the scan.
 async function ensureTopRouteCandidatesFetched(){
   const tp = state.trainerPage;
   const candidates = buildTopRouteCandidates();
