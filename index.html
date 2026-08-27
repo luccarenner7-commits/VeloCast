@@ -599,6 +599,12 @@
   .tsettings-group{ margin-top:12px; }
   .tsettings-group:first-child{ margin-top:0; }
   .tsettings-group-title{ font-family:'Space Grotesk', sans-serif; font-size:12px; font-weight:600; color:var(--chalk-dim); margin:0 0 8px; }
+  /* Changelog page (renderChangelogPage): one date group per entry, same
+     heading recipe as .tsettings-group-title but under its own name since
+     this isn't part of the Trainer-settings area. */
+  .changelog-group{ margin-top:18px; }
+  .changelog-group:first-child{ margin-top:0; }
+  .changelog-date{ font-family:'Space Grotesk', sans-serif; font-size:12px; font-weight:600; color:var(--chalk-dim); margin:0 0 8px; }
   .tsettings-chip-item{ display:inline-flex; align-items:center; gap:var(--space-2); }
   .tsettings-chip-input{ display:inline-flex; align-items:center; gap:5px; }
   .tsettings-chip-input .tsettings-unit{ min-width:0; }
@@ -3191,8 +3197,47 @@ const NAV_ITEMS = [
   {id:"profil", label:"Profil"},
   {id:"aktivitaeten", label:"Aktivitäten"},
   {id:"trainer", label:"Trainer"},
-  {id:"einstellungen", label:"Einstellungen"}
+  {id:"einstellungen", label:"Einstellungen"},
+  {id:"changelog", label:"Änderungen"}
 ];
+
+// ---------- changelog ----------
+// Manually curated, not generated from git log: commit messages describe the
+// implementation ("Cleanup phase 6: split renderProfilKernSection into 8
+// named card functions"), not what a rider actually experiences. Only
+// user-visible changes go here, in plain German, newest date first. Dates
+// are pre-formatted strings (not parsed via `new Date('YYYY-MM-DD')`, which
+// reads as UTC midnight and can display a day early in timezones west of
+// UTC) -- see the many `.toLocaleDateString('de-DE', ...)` call sites
+// elsewhere in this file for the same displayed format.
+const CHANGELOG_SEEN_KEY = 'velocast_changelog_seen';
+const CHANGELOG = [
+  { date:'27.08.2026', items:[
+    '„Meine Segmente" zeigt jetzt wirklich alle mit Stern markierten Segmente an (vorher war bei 12 Schluss).',
+    'Anstiegs-Erkennung erkennt jetzt auch bei mehreren kurzen Unterbrechungen hintereinander einen durchgehenden Anstieg.',
+    'Trainer: Höhenprofil färbt sich durchgehend nach Streckeneignung für die gewählte Trainingsklasse.',
+    'Ablauf & Analyse: aufgeräumte Schritt-Liste mit fortlaufender Positionsangabe.',
+    'Größerer App-Container auf Desktop-Bildschirmen (Mobil unverändert).',
+  ]},
+  { date:'26.08.2026', items:[
+    'Neue „Top-Strecken"-Karte im Trainer-Tab: schlägt automatisch die am besten passenden gespeicherten und gefahrenen Strecken für die gewählte Trainingsklasse vor.',
+    'Neuer Umkehr-Schalter auf der Strecke-Seite, um eine Strecke in beide Richtungen zu vergleichen (z. B. für die Windrichtung).',
+    'Workout-Vorschau: Höhenprofil und einzelne Intervalle zeigen jetzt farblich, wie gut die Steigung zur Trainingsklasse passt.',
+    'Neue Trainingsklasse „Test" für gezielte Bestleistungstests.',
+    'Schwächen-Erkennung: Bewertungen sind jetzt untereinander vergleichbar, inklusive Erwartungswert je Balken.',
+    'Wochenzonen-Balken zeigen jetzt zusätzlich, welcher Anteil der Zeit in einer Zone als echtes Intervall fürs Wochenbudget zählt.',
+    'Toleranz für kurze Unterbrechungen (Ampel, Kurve) bei der Intervall-Erkennung großzügiger gestaltet.',
+  ]},
+];
+function hasUnseenChangelog(){
+  if(!CHANGELOG.length) return false;
+  let seen = null;
+  try{ seen = localStorage.getItem(CHANGELOG_SEEN_KEY); }catch(e){}
+  return seen !== CHANGELOG[0].date;
+}
+function markChangelogSeen(){
+  try{ localStorage.setItem(CHANGELOG_SEEN_KEY, CHANGELOG[0].date); }catch(e){}
+}
 
 function hamburgerIconSvg(){
   // stroke="var(--chalk)" resolves against the SVG's computed style once it's
@@ -3245,8 +3290,11 @@ function renderNavDrawer(){
   });
   const items = NAV_ITEMS.map(item => el("div", {
     class: "nav-item" + (state.activePage === item.id ? " active" : ""),
-    onclick: ()=>{ state.activePage = item.id; close(); }
-  }, [item.label]));
+    onclick: ()=>{ state.activePage = item.id; if(item.id === "changelog") markChangelogSeen(); close(); }
+  }, item.id === "changelog" && hasUnseenChangelog()
+      ? [item.label, el("span", {class:"dot on", style:"margin-left:6px; margin-right:0;"}, [])]
+      : [item.label]
+  ));
   // Bottom-of-drawer utility actions — only meaningful while connected
   // (nothing to log out of / no app permissions to review otherwise), so
   // they're appended conditionally after the page-nav items rather than
@@ -3435,6 +3483,8 @@ function render(){
     app.appendChild(renderTrainerPage());
   } else if(state.activePage === "einstellungen"){
     app.appendChild(renderEinstellungenPage());
+  } else if(state.activePage === "changelog"){
+    app.appendChild(renderChangelogPage());
   } else if(!state.connected && !state.fullRouteCoords.length){
     // Without any login there's no activity list or segments — but a loaded
     // GPX route still needs the route card + map, not the plain connect
@@ -11065,6 +11115,24 @@ function buildSpeedCalibrationSection(){
   details.appendChild(body);
   card.appendChild(details);
   return card;
+}
+
+function renderChangelogPage(){
+  const frag = document.createDocumentFragment();
+  const card = el('div', {class:'card'});
+  card.appendChild(el('h2', {style:'margin:0 0 4px;'}, ['Änderungen']));
+  card.appendChild(el('div', {class:'legend-note', style:'margin-top:0; margin-bottom:4px;'}, ['Was sich zuletzt in VeloCast getan hat.']));
+  CHANGELOG.forEach(group => {
+    const groupEl = el('div', {class:'changelog-group'}, [
+      el('h3', {class:'changelog-date'}, [group.date]),
+    ]);
+    group.items.forEach(text => {
+      groupEl.appendChild(el('div', {class:'legend-note', style:'margin-top:0; margin-bottom:6px;'}, [`– ${text}`]));
+    });
+    card.appendChild(groupEl);
+  });
+  frag.appendChild(card);
+  return frag;
 }
 
 function renderEinstellungenPage(){
