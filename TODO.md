@@ -8,3 +8,4 @@ Ideen und offene Punkte, die nicht sofort umgesetzt wurden.
 - [ ] **Website-Version für Mobil/Desktop anpassen** — responsives Layout differenzieren statt eine Version für beide.
 - [ ] **Top-3-Strecken-Anzeige fürs heutige Workout verbessern** — bestehende Top-Strecken-Karte im Trainer-Tab (renderTopRoutesCard) optisch/inhaltlich aufwerten.
 - [ ] **Segmentjäger-Modus** — neue Funktion, Details noch offen.
+- [ ] **Changelog-Tab** — neuer Tab in der Navigation, der die letzten Änderungen/Updates an VeloCast auflistet, damit man auch ohne Git-Log nachvollziehen kann, was sich zuletzt getan hat. Details (Format, wie weit zurück, manuell gepflegt vs. aus Commits generiert) noch offen.
