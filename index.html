@@ -6506,7 +6506,8 @@ const TRAINING_CONFIG = {
   suitability: { minAcceptable: 55 },
   constraints: {
     common: {
-      maxInterruptionM: 100,
+      maxInterruptionM: 300,
+      maxInterruptionDescentPct: -1.5,
       intersectionTurnDeg: 135,
       intersectionGapM: 7,
       curveDensityThresholdDegPerKm: 350,
@@ -7551,6 +7552,50 @@ function analyzeRoute(pts, config){
              startIdx:seg.startIdx, endIdx:seg.endIdx, avgCurviness, curvy: avgCurviness > curvyThreshold };
   });
 
+  // Bridges a short, non-descending interruption between two climb segments
+  // (e.g. a brief false-flat mid-mountain that dips under
+  // climbGradientThresholdPct just long enough to get its own segment) back
+  // into one continuous climb. Without this, a sustained climb that never
+  // actually loses elevation gets fragmented into pieces too short
+  // individually to ever hold a class's minIntervalMin (see
+  // placeIntervalsOnRoute) -- even though riding it never feels like the
+  // climb ended. Only climb-gap-climb triples qualify, gated on BOTH the
+  // gap's length (maxInterruptionM) and how much it actually descends
+  // (maxInterruptionDescentPct) -- a real descent between two climbs (steeper
+  // than the tolerance) is genuinely separate terrain and stays split
+  // regardless of how short it is. The merge is additionally rejected if the
+  // bridged span's own recomputed average gradient would fall back under
+  // climbGradientThresholdPct -- guards against the edge case of two
+  // borderline-climb segments joined by a gap that's within tolerance but
+  // still drags the combined average down. Runs to a fixed point since one
+  // merge can create a new climb-gap-climb adjacency with whatever follows.
+  const maxGapM = config.constraints.common.maxInterruptionM;
+  const maxGapDescentPct = config.constraints.common.maxInterruptionDescentPct;
+  const bridged = rawTyped;
+  if(maxGapM > 0){
+    let mergedAny = true;
+    while(mergedAny){
+      mergedAny = false;
+      for(let i=1;i<bridged.length-1;i++){
+        const prev = bridged[i-1], gap = bridged[i], next = bridged[i+1];
+        if(prev.type!=='climb' || next.type!=='climb' || gap.type==='climb') continue;
+        if(gap.distanceM > maxGapM || gap.avgGradient < maxGapDescentPct) continue;
+        const distanceM = next.endDist - prev.startDist;
+        const elevChangeM = prev.elevChangeM + gap.elevChangeM + next.elevChangeM;
+        const avgGradient = distanceM > 0 ? elevChangeM/distanceM*100 : 0;
+        if(avgGradient < CLIMB_TH) continue;
+        const avgCurviness = distanceM > 0
+          ? (prev.avgCurviness*prev.distanceM + gap.avgCurviness*gap.distanceM + next.avgCurviness*next.distanceM)/distanceM
+          : 0;
+        const mergedSeg = { type:'climb', startDist:prev.startDist, endDist:next.endDist, distanceM, elevChangeM, avgGradient,
+          startIdx:prev.startIdx, endIdx:next.endIdx, avgCurviness, curvy: avgCurviness > curvyThreshold };
+        bridged.splice(i-1, 3, mergedSeg);
+        mergedAny = true;
+        break;
+      }
+    }
+  }
+
   // Der Merge oben entfernt nur zu kurze Zwischenabschnitte, indem sie in den
   // jeweils vorherigen Roh-Abschnitt aufgenommen werden; der Typ jedes
   // gemergten Abschnitts wird danach aus dessen tatsächlichem Höhenprofil neu
@@ -7565,7 +7610,7 @@ function analyzeRoute(pts, config){
   // zwangsläufig in derselben Spanne -- der Typ muss danach nicht neu geprüft
   // werden.
   const segments = [];
-  rawTyped.forEach(seg => {
+  bridged.forEach(seg => {
     const prev = segments[segments.length-1];
     if(prev && prev.type === seg.type){
       const distanceM = prev.distanceM + seg.distanceM;
@@ -10567,9 +10612,16 @@ const COMMON_SETTINGS_FIELDS = [
     up:'Strecken müssen kurviger sein, um ausgeschlossen zu werden – mehr geschwungenes Terrain bleibt nutzbar.',
     down:'Schon mäßig kurvige Abschnitte werden ausgeschlossen – weniger Terrain bleibt nutzbar.',
     example:'Von 350 auf 500 erhöht: eine leicht geschwungene Landstraße gilt jetzt nicht mehr als „kurvig".' },
-  { path:'constraints.common.maxInterruptionM', label:'Max. tolerierte Unterbrechung', unit:'m', step:10,
-    help:'Gedacht für eine feinere, punktgenaue Bewertung innerhalb eines Segments – aktuell noch nicht in die Intervall-Platzierung eingebunden.',
-    example:'Ändert derzeit nichts Sichtbares, unabhängig vom eingestellten Wert – bleibt aber editierbar für später.', inert:true },
+  { path:'constraints.common.maxInterruptionM', label:'Anstiegs-Unterbrechung: Max. Länge', unit:'m', step:10,
+    help:'Ein kurzes, nicht wirklich abfallendes Stück zwischen zwei Anstiegs-Abschnitten (z.B. eine flache Verschnaufpause mitten im Berg) wird bis zu dieser Länge noch als Teil desselben durchgehenden Anstiegs gewertet, statt den Anstieg in zwei zu kurze Stücke zu zerteilen.',
+    up:'Auch längere Verschnaufpausen mitten im Anstieg werden noch überbrückt – Anstiege bleiben eher als ein Stück erhalten.',
+    down:'Nur noch sehr kurze Unterbrechungen werden überbrückt – Anstiege werden eher in mehrere kürzere Abschnitte zerteilt.',
+    example:'Von 100 auf 300 erhöht: eine 200m lange, fast flache Passage mitten in einem Anstieg unterbricht ihn jetzt nicht mehr.' },
+  { path:'constraints.common.maxInterruptionDescentPct', label:'Anstiegs-Unterbrechung: Max. Gefälle', unit:'%', step:0.5,
+    help:'Eine Unterbrechung zwischen zwei Anstiegs-Abschnitten wird nur überbrückt (siehe „Max. Länge" oben), wenn sie im Schnitt nicht stärker abfällt als dieser Wert – ein echtes Gefälle trennt den Anstieg weiterhin, egal wie kurz es ist.',
+    up:'Näher an 0 → nur noch nahezu flache Unterbrechungen werden überbrückt, echte kleine Gegengefälle trennen den Anstieg.',
+    down:'Weiter negativ → auch spürbar abfallende Unterbrechungen werden noch überbrückt.',
+    example:'Von -1.5 auf -0.5 erhöht: eine Unterbrechung mit -1% Gefälle trennt den Anstieg jetzt wieder in zwei Stücke.' },
 ];
 
 const ROUTE_GEN_SETTINGS_FIELDS = [
