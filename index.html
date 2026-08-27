@@ -133,7 +133,13 @@
     background: var(--asphalt);
     min-height:100vh;
   }
+  /* 720px was a mobile-era leftover -- on any desktop window it left huge
+     empty gutters either side. Widening this never affects phones: a phone
+     viewport is always narrower than even the smallest step below, so
+     max-width simply never engages there. */
   .app{ max-width: 720px; margin: 0 auto; padding: 28px 20px 60px; }
+  @media (min-width:900px){ .app{ max-width: 900px; } }
+  @media (min-width:1200px){ .app{ max-width: 1080px; } }
 
   .brand{ display:flex; align-items:baseline; justify-content:space-between; margin-bottom: 22px; }
   .brand .brand-left{ display:flex; align-items:baseline; gap:12px; }
