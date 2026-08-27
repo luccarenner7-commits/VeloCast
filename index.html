@@ -2339,6 +2339,28 @@ function computeMmpFromStream(stream){
   return Object.keys(mmp).length ? mmp : null;
 }
 
+// Log-log-Interpolation zwischen den zwei nächstgelegenen MMP-Stützpunkten,
+// da Segmentzeiten (z.B. 4:47) fast nie exakt auf einen der 14
+// MMP_DURATIONS_SEC-Werte fallen. Außerhalb des verfügbaren Bereichs wird
+// auf den Randwert geklemmt (flache Extrapolation) statt zu extrapolieren --
+// z.B. hat ein 90-Sekunden-Segment kein verlässliches Analogon, wenn die
+// kürzeste vorhandene MMP-Messung 2 Minuten ist.
+function estimatePowerCurveAt(durationSec, mmpCurve){
+  if(!mmpCurve) return null;
+  const pts = MMP_DURATIONS_SEC.filter(s => mmpCurve[s] != null).map(s => [s, mmpCurve[s]]);
+  if(pts.length < 2) return null;
+  if(durationSec <= pts[0][0]) return pts[0][1];
+  if(durationSec >= pts[pts.length-1][0]) return pts[pts.length-1][1];
+  for(let i=0; i<pts.length-1; i++){
+    const [d0,p0] = pts[i], [d1,p1] = pts[i+1];
+    if(durationSec >= d0 && durationSec <= d1){
+      const t = (Math.log(durationSec)-Math.log(d0)) / (Math.log(d1)-Math.log(d0));
+      return Math.exp(Math.log(p0) + t*(Math.log(p1)-Math.log(p0)));
+    }
+  }
+  return null;
+}
+
 function estimateFtpFromMmp(mmp){
   if(!mmp) return null;
   const candidates = FTP_FACTORS.filter(f => mmp[f.sec] != null)
@@ -4703,6 +4725,8 @@ function computeSegmentStatChips(seg, bucket){
     if(pr != null) hero.push({value: fmtDuration(pr), label:"PR"});
     const prWatts = bucket.prWatts[seg.id];
     if(prWatts) secondary.push(`${prWatts.measured ? "" : "~"}${prWatts.watts} W`);
+    const potential = prWatts ? buildPotentialChip(prWatts.watts, pr) : null;
+    if(potential) hero.push(potential);
     if(detail.xoms && detail.xoms.kom) hero.push(buildXomChip(detail.xoms.kom, pr, "KOM"));
     if(detail.xoms && detail.xoms.qom) hero.push(buildXomChip(detail.xoms.qom, pr, "QOM"));
     if(detail.total_elevation_gain != null) secondary.push(`${Math.round(detail.total_elevation_gain)} Hm`);
@@ -4757,6 +4781,26 @@ function buildXomChip(xomTime, prSeconds, label){
   return {value: `${xomTime}`, label: chipLabel, style};
 }
 
+// "Genutztes Potential": Segment-Ø-Watt als Anteil der auf die gleiche Dauer
+// interpolierten MMP-Bestleistung. state.profilPage.riderProfile ist vor dem
+// ersten "Trainingsdaten laden" null -- dann liefert das still null zurück
+// und der Chip wird schlicht weggelassen (keine Meldung, kein Auto-Fetch,
+// gleiche Konvention wie andere teure/optionale Zusatzdaten im Code).
+// >100% ist zulässig (nicht gekappt): die MMP-Kurve deckt nur die letzten 90
+// Tage ab, ein älterer Segment-PR kann darüber liegen -- das ist eine
+// echte Aussage, kein Rechenfehler.
+function buildPotentialChip(watts, durationSec){
+  if(watts == null || durationSec == null) return null;
+  const rp = state.profilPage.riderProfile;
+  const best = estimatePowerCurveAt(durationSec, rp && rp.mmpCurve);
+  if(best == null || best <= 0) return null;
+  const pct = Math.round((watts/best) * 100);
+  let style = null;
+  if(pct >= 95) style = "color:var(--kom-near); background:var(--kom-near-bg);";
+  else if(pct >= 85) style = "color:var(--kom-mid); background:var(--kom-mid-bg);";
+  return {value: `${pct}%`, label: "Potential", style};
+}
+
 // This ride's own time on the segment, plus the same all-time KOM/QOM delta
 // chips the starred list uses — pulled straight from the activity's
 // segment_efforts (see ensureRideSegments()), no extra fetches. Split into
@@ -4785,6 +4829,8 @@ function computeRideEffortStatChips(effort, prWatts, detail){
     });
   }
   if(prWatts) secondary.push(`${prWatts.measured ? "" : "~"}${prWatts.watts} W`);
+  const potential = prWatts && effort.elapsed_time != null ? buildPotentialChip(prWatts.watts, effort.elapsed_time) : null;
+  if(potential) hero.push(potential);
   if(effort.kom_rank) secondary.push(`Platz ${effort.kom_rank} (Effort)`);
   if(detail){
     const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
