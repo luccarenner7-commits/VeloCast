@@ -3593,7 +3593,7 @@ async function loadActivitiesAndSegments(){
   state.loading.segments = true; render();
   try{
     state.segments = await fetchStarredSegments(state.accessToken);
-    await loadSegmentExtras(state.segments, segmentBucket("starred"));
+    await loadSegmentExtras(state.segments, segmentBucket("starred"), Infinity);
   }catch(e){ state.error = e.message; }
   state.loading.segments = false;
   render();
@@ -3858,15 +3858,13 @@ async function loadRouteWeather(){
 // though computeSegmentStatChips() prefers the richer per-ride effort data
 // for its stat chips — mountSegmentView() needs detail.map.polyline to draw
 // the segment's own path when it's clicked into the map detail view.
-// `limit` caps how many of `list`'s segments get fetched — defaults to 12
-// to preserve the starred-segments flow's existing behavior (keeps Strava
-// API usage bounded for a page that can have many starred segments). The
-// ride-completed flow passes Infinity: "Abgeschlossene Segmente" exists
-// specifically to show everything actually completed on the ride, so
-// capping it here would silently drop segments past the 12th — the exact
-// bug this parameter exists to avoid reintroducing.
+// `limit` caps how many of `list`'s segments get fetched, if given — both
+// call sites now pass Infinity (starred and ride-completed alike), since
+// capping here silently drops segments past the cap, which is exactly the
+// bug this parameter used to cause for "Meine Segmente" when a starred list
+// grew past 12.
 async function loadSegmentExtras(list, bucket, limit){
-  if(limit === undefined) limit = 12;
+  if(limit === undefined) limit = Infinity;
   for(const seg of list.slice(0, limit)){
     if(seg.start_latlng){
       try{
@@ -4849,13 +4847,10 @@ function visibleSegmentList(list){
 }
 
 // Sorting UI has existed on the "Meine Segmente" (starred) page for a while,
-// keyed off state.segmentSortBy — the 12-item cap here is unrelated to
-// sorting itself (it predates the sort dropdown) and is preserved as-is.
-// Irrelevant segments are filtered out BEFORE the cap (not after), so a
-// hidden segment never occupies one of the 12 slots at the expense of a
-// still-relevant one further down the list.
+// keyed off state.segmentSortBy. No cap — shows every starred segment, same
+// as sortedRouteSegments() shows every completed one.
 function sortedVisibleSegments(bucket){
-  return sortSegmentsBy(visibleSegmentList(bucket.list).slice(0, 12), bucket, state.segmentSortBy);
+  return sortSegmentsBy(visibleSegmentList(bucket.list), bucket, state.segmentSortBy);
 }
 
 // Same sorting, no cap — used by "Abgeschlossene Segmente" (see
@@ -5322,10 +5317,9 @@ function renderRouteSegmentsCard(){
     ()=>{ state.hideIrrelevantSegments = !state.hideIrrelevantSegments; saveSettings(); render(); }
   ));
 
-  // No cap here (unlike sortedVisibleSegments()'s starred-only slice(0,12)):
-  // ensureRideSegments()/loadSegmentExtras() above now fetch every completed
-  // segment for this ride, so the card must show all of them too — that's
-  // the whole point of "Abgeschlossene Segmente".
+  // No cap — ensureRideSegments()/loadSegmentExtras() above fetch every
+  // completed segment for this ride, so the card must show all of them too —
+  // that's the whole point of "Abgeschlossene Segmente".
   const list = sortedRouteSegments(bucket);
   list.forEach(seg => card.appendChild(renderSegmentRow(seg, bucket)));
   return card;
