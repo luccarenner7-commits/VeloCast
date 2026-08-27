@@ -9549,18 +9549,25 @@ function buildRouteWorkoutChart(workout, route, rp){
   const steps = workout.steps;
 
   // Gleiche Eignungs-Logik wie die "Optimal"/"Akzeptabel"-Tags in
-  // renderTrainerAblaufCard() (SUITABILITY_EXEMPT_CLASSES/gradientSuitability),
-  // hier auf die Höhenlinie angewandt statt auf einzelne Schritt-Zeilen.
-  // Nur Intervall-Schritte tragen eine Bewertung; alles andere (Aufwärmen,
-  // Verbindungsstücke, ...) bleibt in der neutralen Grundfarbe.
+  // renderTrainerAblaufCard() (gradientSuitability() gegen die Steigungs-Bänder
+  // der gewählten Klasse), aber durchgehend über das ganze Streckenprofil
+  // angewandt statt nur auf bereits platzierte Intervall-Schritte -- so bleibt
+  // die Höhenlinie auch dann informativ eingefärbt, wenn placeIntervalsOnRoute()
+  // auf einem Abschnitt kein Intervall unterbringen konnte (z.B. ein zu kurzer
+  // Anstieg), und wird nicht durch die Zufälligkeit der Platzierung mit
+  // ausgeblendet. Quelle ist route.segments (die durchgehende analyzeRoute()-
+  // Typisierung des ganzen Tracks), nicht workout.steps. Für
+  // SUITABILITY_EXEMPT_CLASSES bleibt die Linie bewusst neutral -- deren
+  // Steigungs-Band ist per Definition -99..99 ("jedes Terrain geeignet"), eine
+  // Einfärbung wäre dort nur durchgehend grün und ohne Aussage.
   const suitabilityBand = !SUITABILITY_EXEMPT_CLASSES.includes(workout.classKey)
     ? (TRAINING_CONFIG.constraints.byClass[workout.classKey] || {}).gradient : null;
   const tierColorAtDistM = distM => {
     if(!suitabilityBand) return null;
-    const step = steps.find(s => s.kind==='interval' && distM >= s.startDist && distM <= s.endDist);
-    if(!step || step.gradient==null) return null;
-    const tier = gradientSuitability(step.gradient, suitabilityBand);
-    return tier==='ideal' ? c.tail : tier==='acceptable' ? c.cross : null;
+    const seg = (route.segments||[]).find(s => distM >= s.startDist && distM <= s.endDist);
+    if(!seg || seg.avgGradient==null) return null;
+    const tier = gradientSuitability(seg.avgGradient, suitabilityBand);
+    return tier==='ideal' ? c.tail : tier==='acceptable' ? c.cross : c.head;
   };
 
   const elevPts = [];
