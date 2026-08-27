@@ -6520,6 +6520,7 @@ const TRAINING_CONFIG = {
     common: {
       maxInterruptionM: 300,
       maxInterruptionDescentPct: -1.5,
+      bridgeMinAvgGradientPct: 2.0,
       intersectionTurnDeg: 135,
       intersectionGapM: 7,
       curveDensityThresholdDegPerKm: 350,
@@ -7510,6 +7511,31 @@ function detectIntersectionCandidates(pts, thresholdDeg, minGapM){
   }
   return out;
 }
+// Collapses directly-adjacent segments that share a type into one, weighting
+// avgGradient/avgCurviness by distance. Used twice inside analyzeRoute():
+// once right before the climb-bridging pass (so a gap that's really two
+// adjacent same-type raw fragments -- e.g. two "flat" pieces split by a
+// sub-30m wobble -- becomes one before the bridge looks for a climb-X-climb
+// triple, since otherwise the bridge never even considers it) and once after
+// (to catch same-type adjacencies the bridge's own splicing can create).
+function consolidateSameType(list, curvyThreshold){
+  const out = [];
+  list.forEach(seg => {
+    const prev = out[out.length-1];
+    if(prev && prev.type === seg.type){
+      const distanceM = prev.distanceM + seg.distanceM;
+      const elevChangeM = prev.elevChangeM + seg.elevChangeM;
+      const avgGradient = distanceM > 0 ? elevChangeM/distanceM*100 : 0;
+      const avgCurviness = distanceM > 0
+        ? (prev.avgCurviness*prev.distanceM + seg.avgCurviness*seg.distanceM)/distanceM : 0;
+      Object.assign(prev, { endDist:seg.endDist, endIdx:seg.endIdx, distanceM, elevChangeM, avgGradient,
+                             avgCurviness, curvy: avgCurviness > curvyThreshold });
+    } else {
+      out.push({ ...seg });
+    }
+  });
+  return out;
+}
 function analyzeRoute(pts, config){
   config = config || TRAINING_CONFIG;
   const rg = config.routeGeneration;
@@ -7575,15 +7601,25 @@ function analyzeRoute(pts, config){
   // gap's length (maxInterruptionM) and how much it actually descends
   // (maxInterruptionDescentPct) -- a real descent between two climbs (steeper
   // than the tolerance) is genuinely separate terrain and stays split
-  // regardless of how short it is. The merge is additionally rejected if the
-  // bridged span's own recomputed average gradient would fall back under
-  // climbGradientThresholdPct -- guards against the edge case of two
-  // borderline-climb segments joined by a gap that's within tolerance but
-  // still drags the combined average down. Runs to a fixed point since one
-  // merge can create a new climb-gap-climb adjacency with whatever follows.
+  // regardless of how short it is. Pre-consolidating same-type neighbours
+  // (below) before this runs matters: a gap that's really two adjacent
+  // "flat" raw fragments split by sub-30m noise would otherwise never even
+  // present as a single climb-X-climb triple for this loop to consider. The
+  // merge is additionally rejected if the bridged span's own recomputed
+  // average gradient would fall back under bridgeMinAvgGradientPct -- a
+  // DEDICATED, usually-lower threshold from climbGradientThresholdPct on
+  // purpose: climbGradientThresholdPct also drives point classification and
+  // per-segment retyping everywhere else on the route, so reusing it here
+  // would make a shallow-but-real interruption between two genuine climbs
+  // (which necessarily drags the bridged span's own average below the
+  // point-level climb threshold -- that's the whole reason this bridge
+  // exists) impossible to ever bridge without also reclassifying terrain on
+  // every other route. Runs to a fixed point since one merge can create a
+  // new climb-gap-climb adjacency with whatever follows.
   const maxGapM = config.constraints.common.maxInterruptionM;
   const maxGapDescentPct = config.constraints.common.maxInterruptionDescentPct;
-  const bridged = rawTyped;
+  const bridgeMinAvgGradientPct = config.constraints.common.bridgeMinAvgGradientPct;
+  const bridged = consolidateSameType(rawTyped, curvyThreshold);
   if(maxGapM > 0){
     let mergedAny = true;
     while(mergedAny){
@@ -7595,7 +7631,7 @@ function analyzeRoute(pts, config){
         const distanceM = next.endDist - prev.startDist;
         const elevChangeM = prev.elevChangeM + gap.elevChangeM + next.elevChangeM;
         const avgGradient = distanceM > 0 ? elevChangeM/distanceM*100 : 0;
-        if(avgGradient < CLIMB_TH) continue;
+        if(avgGradient < bridgeMinAvgGradientPct) continue;
         const avgCurviness = distanceM > 0
           ? (prev.avgCurviness*prev.distanceM + gap.avgCurviness*gap.distanceM + next.avgCurviness*next.distanceM)/distanceM
           : 0;
@@ -7608,34 +7644,15 @@ function analyzeRoute(pts, config){
     }
   }
 
-  // Der Merge oben entfernt nur zu kurze Zwischenabschnitte, indem sie in den
-  // jeweils vorherigen Roh-Abschnitt aufgenommen werden; der Typ jedes
-  // gemergten Abschnitts wird danach aus dessen tatsächlichem Höhenprofil neu
-  // berechnet (oben). Das kann dazu führen, dass zwei direkt benachbarte
-  // Abschnitte zufällig wieder denselben Typ bekommen, ohne je zu einem
-  // Abschnitt verschmolzen worden zu sein -- sichtbar z.B. als mehrere
-  // aufeinanderfolgende "Verbindung"-Schritte mit identischer Ziel-Leistung
-  // im exportierten Workout, da baselinePctForSegment() nur nach `type`
-  // unterscheidet. Zweiter Durchgang: direkt benachbarte, gleich-typige
-  // Abschnitte zu einem zusammenfassen. Der gewichtete Mittelwert zweier
-  // Gradienten, die beide in derselben Klassifikations-Spanne liegen, bleibt
-  // zwangsläufig in derselben Spanne -- der Typ muss danach nicht neu geprüft
-  // werden.
-  const segments = [];
-  bridged.forEach(seg => {
-    const prev = segments[segments.length-1];
-    if(prev && prev.type === seg.type){
-      const distanceM = prev.distanceM + seg.distanceM;
-      const elevChangeM = prev.elevChangeM + seg.elevChangeM;
-      const avgGradient = distanceM > 0 ? elevChangeM/distanceM*100 : 0;
-      const avgCurviness = distanceM > 0
-        ? (prev.avgCurviness*prev.distanceM + seg.avgCurviness*seg.distanceM)/distanceM : 0;
-      Object.assign(prev, { endDist:seg.endDist, endIdx:seg.endIdx, distanceM, elevChangeM, avgGradient,
-                             avgCurviness, curvy: avgCurviness > curvyThreshold });
-    } else {
-      segments.push({ ...seg });
-    }
-  });
+  // Same-type consolidation runs a second time here (see consolidateSameType
+  // above the pre-bridge call) to catch adjacencies the bridge's own
+  // splicing can create, and also the pre-existing case this pass always
+  // handled: two directly-adjacent merged segments that happen to land on
+  // the same type without ever going through the bridge at all -- visible
+  // e.g. as several consecutive "Verbindung" steps with identical target
+  // power in an exported workout, since baselinePctForSegment() only
+  // distinguishes by `type`.
+  const segments = consolidateSameType(bridged, curvyThreshold);
 
   let totalElevGainM = 0;
   for(let i=1;i<n;i++){ const d = smoothed[i]-smoothed[i-1]; if(d>0) totalElevGainM += d; }
@@ -10659,6 +10676,11 @@ const COMMON_SETTINGS_FIELDS = [
     up:'Näher an 0 → nur noch nahezu flache Unterbrechungen werden überbrückt, echte kleine Gegengefälle trennen den Anstieg.',
     down:'Weiter negativ → auch spürbar abfallende Unterbrechungen werden noch überbrückt.',
     example:'Von -1.5 auf -0.5 erhöht: eine Unterbrechung mit -1% Gefälle trennt den Anstieg jetzt wieder in zwei Stücke.' },
+  { path:'constraints.common.bridgeMinAvgGradientPct', label:'Anstiegs-Unterbrechung: Mindest-Ø-Steigung', unit:'%', step:0.1,
+    help:'Wie steil der überbrückte Anstieg (beide Rampen + Unterbrechung zusammen) im Schnitt mindestens noch sein muss, damit die Überbrückung gilt – eigener, meist niedrigerer Wert als die normale Anstiegs-Schwelle, weil eine echte Verschnaufpause den Durchschnitt der ganzen Spanne zwangsläufig unter diese Schwelle drückt.',
+    up:'Der überbrückte Gesamt-Anstieg muss im Schnitt steiler sein – weniger Überbrückungen kommen zustande, Anstiege mit langer flacher Verschnaufpause bleiben eher getrennt.',
+    down:'Auch im Schnitt flachere überbrückte Anstiege gelten noch als ein Stück – mehr Verschnaufpausen werden überbrückt.',
+    example:'Von 2.0 auf 2.5 erhöht: zwei 3.7%-Rampen mit einer langen, fast flachen Verschnaufpause dazwischen (Gesamt-Ø 2.3%) werden jetzt nicht mehr überbrückt.' },
 ];
 
 const ROUTE_GEN_SETTINGS_FIELDS = [
