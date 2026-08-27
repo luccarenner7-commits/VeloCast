@@ -943,7 +943,7 @@ let state = {
     evalError: null,
     evalResult: null, // evaluateWorkout() output, or null
     evalTestAchievedWatts: null, // computeMmpFromStream(stream)[workout.testDurationSec] for a classKey==='test' evaluation, or null -- see runTrainerEvaluation()
-    lastWorkout: null, // {steps, rp, routeBased} for the deferred mountTrainerChart() call after render
+    lastWorkout: null, // {steps, rp, routeBased, classKey} for the deferred mountTrainerChart() call after render
     // HF-only LTHR auto-estimation pipeline (see loadHrLthrEstimate() near
     // trainerRiderContext()) — the full network fetch only ever runs lazily,
     // on first switch to equipmentMode==='hr' without an existing manual
@@ -10484,7 +10484,7 @@ function renderTrainerPage(){
   }
   const workoutExists = !!workout;
   const hasWorkout = !!(workout && workout.steps && workout.steps.length);
-  tp.lastWorkout = hasWorkout ? { steps:workout.steps, rp, routeBased: effectiveRouteBased } : null;
+  tp.lastWorkout = hasWorkout ? { steps:workout.steps, rp, routeBased: effectiveRouteBased, classKey: workout.classKey } : null;
   const metrics = hasWorkout ? (effectiveRouteBased ? estimateRouteWorkoutMetrics(workout.steps, rp) : workoutMetrics(workout.steps, rp)) : null;
   const zoneBreakdown = hasWorkout ? workoutZoneBreakdown(workout.steps, effectiveRouteBased, rp) : null;
   const specificity = (hasWorkout && effectiveRouteBased) ? computeSpecificityScore(workout, workoutGoalKey) : null;
