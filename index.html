@@ -636,6 +636,11 @@
   .changelog-group{ margin-top:18px; }
   .changelog-group:first-child{ margin-top:0; }
   .changelog-date{ font-family:'Space Grotesk', sans-serif; font-size:12px; font-weight:600; color:var(--chalk-dim); margin:0 0 8px; }
+  /* Category sub-label within a date group (Features/Fixes/Verbesserungen)
+     -- same small-uppercase-label recipe as .stat-chip .l/.metric-card .ml
+     elsewhere in the file, just under its own name for this context. */
+  .changelog-category-label{ font-family:'IBM Plex Mono', monospace; font-size:10px; font-weight:700; color:var(--chalk-dim); text-transform:uppercase; letter-spacing:0.05em; margin:12px 0 6px; }
+  .changelog-category-label:first-child{ margin-top:0; }
   .tsettings-chip-item{ display:inline-flex; align-items:center; gap:var(--space-2); }
   .tsettings-chip-input{ display:inline-flex; align-items:center; gap:5px; }
   .tsettings-chip-input .tsettings-unit{ min-width:0; }
@@ -3382,36 +3387,67 @@ const NAV_ITEMS = [
 // UTC) -- see the many `.toLocaleDateString('de-DE', ...)` call sites
 // elsewhere in this file for the same displayed format.
 const CHANGELOG_SEEN_KEY = 'velocast_changelog_seen';
+// Each date group is split into up to three categories -- displayed in this
+// order (see CHANGELOG_CATEGORIES/renderChangelogPage() below): `features`
+// (something new you can now do), `fixes` (something that was broken and
+// now isn't), `improvements` (neither -- a tuning/polish/refinement of
+// something that already worked, catch-all working title "Verbesserungen").
+// A date with no items in a category simply omits that category's heading
+// rather than showing an empty section.
 const CHANGELOG = [
-  { date:'28.08.2026', items:[
-    'Datum/Uhrzeit-Auswahl: Kalender-Symbol war auf dem Desktop kaum sichtbar (dunkel auf dunklem Grund) — behoben.',
-    'Windrichtung (Gegenwind/Seitenwind/Rückenwind) wird jetzt stabiler berechnet — vorher konnte einzelnes GPS-Rauschen die Einordnung für ganze Streckenabschnitte kippen.',
-    'Neue Einstellung „Daten beim Besuch automatisch laden" — bei Bedarf lässt sich das automatische Laden deaktivieren, dann erscheint stattdessen ein Button zum manuellen Laden.',
-    'Ladevorgang beim Start zeigt jetzt eine Fortschrittsanzeige statt flackernder Textwechsel.',
-    'App nutzt auf breiten Desktop-Bildschirmen die volle verfügbare Breite (vorher bei 1080px begrenzt).',
-  ]},
-  { date:'28.08.2026 (früher)', items:[
-    'Kartenkacheln repariert — zeigten zuletzt einen „API KEY REQUIRED"-Fehler statt der Karte.',
-    '„Genutztes Potential" bei Segmenten ist jetzt sofort in der Liste sichtbar (vorher erst nach Antippen eines Segments), lädt schneller beim Start und vergleicht gegen einen längeren Zeitraum.',
-    'Strecke-Seite: Wind-Aufteilung zeigt jetzt zusätzlich getrennt nach erster und zweiter Hälfte der Strecke.',
-  ]},
-  { date:'27.08.2026', items:[
-    '„Meine Segmente" zeigt jetzt wirklich alle mit Stern markierten Segmente an (vorher war bei 12 Schluss).',
-    'Neue Kennzahl „Genutztes Potential" bei Segmenten: zeigt, wie nah die eigene Bestleistung an der persönlichen Höchstleistung für diese Dauer liegt.',
-    'Anstiegs-Erkennung erkennt jetzt auch bei mehreren kurzen Unterbrechungen hintereinander einen durchgehenden Anstieg.',
-    'Trainer: Höhenprofil färbt sich durchgehend nach Streckeneignung für die gewählte Trainingsklasse.',
-    'Ablauf & Analyse: aufgeräumte Schritt-Liste mit fortlaufender Positionsangabe.',
-    'Größerer App-Container auf Desktop-Bildschirmen (Mobil unverändert).',
-  ]},
-  { date:'26.08.2026', items:[
-    'Neue „Top-Strecken"-Karte im Trainer-Tab: schlägt automatisch die am besten passenden gespeicherten und gefahrenen Strecken für die gewählte Trainingsklasse vor.',
-    'Neuer Umkehr-Schalter auf der Strecke-Seite, um eine Strecke in beide Richtungen zu vergleichen (z. B. für die Windrichtung).',
-    'Workout-Vorschau: Höhenprofil und einzelne Intervalle zeigen jetzt farblich, wie gut die Steigung zur Trainingsklasse passt.',
-    'Neue Trainingsklasse „Test" für gezielte Bestleistungstests.',
-    'Schwächen-Erkennung: Bewertungen sind jetzt untereinander vergleichbar, inklusive Erwartungswert je Balken.',
-    'Wochenzonen-Balken zeigen jetzt zusätzlich, welcher Anteil der Zeit in einer Zone als echtes Intervall fürs Wochenbudget zählt.',
-    'Toleranz für kurze Unterbrechungen (Ampel, Kurve) bei der Intervall-Erkennung großzügiger gestaltet.',
-  ]},
+  { date:'28.08.2026',
+    features:[
+      'Automatisches Laden beim Verbinden lässt sich jetzt einzeln für „Aktivitäten & Route", „Markierte Segmente" und „Trainingsdaten" ein-/ausschalten (Einstellungen) — vorher ein einzelner Schalter für alles. Ist eine Kategorie deaktiviert, erscheint an ihrer Stelle ein eigener „laden"-Button.',
+      'Ladevorgang beim Start zeigt jetzt eine Fortschrittsanzeige statt flackernder Textwechsel.',
+    ],
+    fixes:[
+      'Datum/Uhrzeit-Auswahl: Kalender-Symbol war auf dem Desktop kaum sichtbar (dunkel auf dunklem Grund) — behoben.',
+      'Windrichtung (Gegenwind/Seitenwind/Rückenwind) wird jetzt stabiler berechnet — vorher konnte einzelnes GPS-Rauschen die Einordnung für ganze Streckenabschnitte kippen.',
+      'Automatisches Laden hat die Trainingsdaten nicht mit geladen — dadurch fehlte oft die „Genutztes Potential"-Kennzahl bei Segmenten, ohne dass ein Fehler sichtbar war. Jetzt behoben.',
+    ],
+    improvements:[
+      'App nutzt auf breiten Desktop-Bildschirmen die volle verfügbare Breite (vorher bei 1080px begrenzt).',
+    ]},
+  { date:'28.08.2026 (früher)',
+    features:[
+      'Strecke-Seite: Wind-Aufteilung zeigt jetzt zusätzlich getrennt nach erster und zweiter Hälfte der Strecke.',
+    ],
+    fixes:[
+      'Kartenkacheln repariert — zeigten zuletzt einen „API KEY REQUIRED"-Fehler statt der Karte.',
+    ],
+    improvements:[
+      '„Genutztes Potential" bei Segmenten ist jetzt sofort in der Liste sichtbar (vorher erst nach Antippen eines Segments), lädt schneller beim Start und vergleicht gegen einen längeren Zeitraum.',
+    ]},
+  { date:'27.08.2026',
+    features:[
+      'Neue Kennzahl „Genutztes Potential" bei Segmenten: zeigt, wie nah die eigene Bestleistung an der persönlichen Höchstleistung für diese Dauer liegt.',
+      'Trainer: Höhenprofil färbt sich durchgehend nach Streckeneignung für die gewählte Trainingsklasse.',
+    ],
+    fixes:[
+      '„Meine Segmente" zeigt jetzt wirklich alle mit Stern markierten Segmente an (vorher war bei 12 Schluss).',
+    ],
+    improvements:[
+      'Anstiegs-Erkennung erkennt jetzt auch bei mehreren kurzen Unterbrechungen hintereinander einen durchgehenden Anstieg.',
+      'Ablauf & Analyse: aufgeräumte Schritt-Liste mit fortlaufender Positionsangabe.',
+      'Größerer App-Container auf Desktop-Bildschirmen (Mobil unverändert).',
+    ]},
+  { date:'26.08.2026',
+    features:[
+      'Neue „Top-Strecken"-Karte im Trainer-Tab: schlägt automatisch die am besten passenden gespeicherten und gefahrenen Strecken für die gewählte Trainingsklasse vor.',
+      'Neuer Umkehr-Schalter auf der Strecke-Seite, um eine Strecke in beide Richtungen zu vergleichen (z. B. für die Windrichtung).',
+      'Workout-Vorschau: Höhenprofil und einzelne Intervalle zeigen jetzt farblich, wie gut die Steigung zur Trainingsklasse passt.',
+      'Neue Trainingsklasse „Test" für gezielte Bestleistungstests.',
+      'Wochenzonen-Balken zeigen jetzt zusätzlich, welcher Anteil der Zeit in einer Zone als echtes Intervall fürs Wochenbudget zählt.',
+    ],
+    improvements:[
+      'Schwächen-Erkennung: Bewertungen sind jetzt untereinander vergleichbar, inklusive Erwartungswert je Balken.',
+      'Toleranz für kurze Unterbrechungen (Ampel, Kurve) bei der Intervall-Erkennung großzügiger gestaltet.',
+    ]},
+];
+const CHANGELOG_CATEGORIES = [
+  { key:'features', label:'Features' },
+  { key:'fixes', label:'Fixes' },
+  { key:'improvements', label:'Verbesserungen' },
 ];
 function hasUnseenChangelog(){
   if(!CHANGELOG.length) return false;
@@ -11619,8 +11655,13 @@ function renderChangelogPage(){
     const groupEl = el('div', {class:'changelog-group'}, [
       el('h3', {class:'changelog-date'}, [group.date]),
     ]);
-    group.items.forEach(text => {
-      groupEl.appendChild(el('div', {class:'legend-note', style:'margin-top:0; margin-bottom:6px;'}, [`– ${text}`]));
+    CHANGELOG_CATEGORIES.forEach(cat => {
+      const items = group[cat.key];
+      if(!items || !items.length) return;
+      groupEl.appendChild(el('div', {class:'changelog-category-label'}, [cat.label]));
+      items.forEach(text => {
+        groupEl.appendChild(el('div', {class:'legend-note', style:'margin-top:0; margin-bottom:6px;'}, [`– ${text}`]));
+      });
     });
     card.appendChild(groupEl);
   });
