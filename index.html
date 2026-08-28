@@ -4326,34 +4326,6 @@ function renderRouteSourceTabs(card){
   }
 }
 
-// Shared markup for one tail/cross/head hero-stats-over-bar block, used by
-// the first/second-half breakdown below. The whole-route block above it
-// keeps its own inline markup as-is rather than being rewired onto this, so
-// its existing output can't be affected by this change.
-function renderWindMixStatBlock(mix){
-  return [
-    el("div", {class:"wind-mix-stats"}, [
-      el("div", {class:"wind-mix-stat", style:"align-items:flex-start;"}, [
-        el("div", {class:"v", style:"color:var(--tail);"}, [`${mix.tailPct}%`]),
-        el("div", {class:"l"}, ["Rückenwind"])
-      ]),
-      el("div", {class:"wind-mix-stat", style:"align-items:center; text-align:center;"}, [
-        el("div", {class:"v", style:"color:var(--cross);"}, [`${mix.crossPct}%`]),
-        el("div", {class:"l"}, ["Seitenwind"])
-      ]),
-      el("div", {class:"wind-mix-stat", style:"align-items:flex-end; text-align:right;"}, [
-        el("div", {class:"v", style:"color:var(--head);"}, [`${mix.headPct}%`]),
-        el("div", {class:"l"}, ["Gegenwind"])
-      ])
-    ]),
-    el("div", {class:"wind-mix-bar"}, [
-      el("div", {style:`flex:${mix.tailPct}; background:var(--tail);`}),
-      el("div", {style:`flex:${mix.crossPct}; background:var(--cross);`}),
-      el("div", {style:`flex:${mix.headPct}; background:var(--head);`})
-    ])
-  ];
-}
-
 function renderRouteMapSection(card){
   // The map container is appended whenever we have coordinates at all —
   // including while weather is still loading — rather than only once
@@ -4407,20 +4379,36 @@ function renderRouteMapSection(card){
       // false, omit the block entirely (silent, matching this app's
       // established convention for missing optional data elsewhere).
       if(halves && halves.first && halves.second){
-        // Same mix as above, split at the route's distance midpoint — stacked
-        // vertically (not side-by-side) so each half keeps the full card
-        // width for its three stats, which stays readable down to ~375px.
-        const halfBlocks = [
-          el("div", {style:"margin-top:12px;"}, [
-            el("div", {style:"font-family:'IBM Plex Mono', monospace; font-size:10px; font-weight:700; color:var(--chalk-dim); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:8px;"}, ["1. Hälfte"]),
-            ...renderWindMixStatBlock(halves.first)
-          ]),
-          el("div", {style:"margin-top:12px;"}, [
-            el("div", {style:"font-family:'IBM Plex Mono', monospace; font-size:10px; font-weight:700; color:var(--chalk-dim); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:8px;"}, ["2. Hälfte"]),
-            ...renderWindMixStatBlock(halves.second)
-          ])
-        ];
-        card.appendChild(el("div", {style:"margin-top:14px; padding-top:14px; border-top:1px solid var(--line);"}, halfBlocks));
+        // Folded into the same bar language as the whole-route block above
+        // instead of repeating its full hero-stats-over-bar layout twice —
+        // that read as three near-identical stacked graphics (see git
+        // history for the earlier version). Each half gets one small label,
+        // one colored number for whichever wind type dominates that half
+        // (not all three — the thin bar below already shows the full mix),
+        // and its own thin proportional bar, side by side.
+        const dominantWindOf = mix => mix.tailPct >= mix.crossPct && mix.tailPct >= mix.headPct
+          ? {pct: mix.tailPct, label: "Rückenwind", color: "var(--tail)"}
+          : mix.headPct >= mix.crossPct
+            ? {pct: mix.headPct, label: "Gegenwind", color: "var(--head)"}
+            : {pct: mix.crossPct, label: "Seitenwind", color: "var(--cross)"};
+        const halfColumn = (mix, label) => {
+          const dominant = dominantWindOf(mix);
+          return el("div", {style:"flex:1; min-width:0;"}, [
+            el("div", {style:"font-family:'IBM Plex Mono', monospace; font-size:10px; font-weight:700; color:var(--chalk-dim); text-transform:uppercase; letter-spacing:0.05em;"}, [label]),
+            el("div", {class:"stat-secondary", style:"margin-top:2px;"}, [
+              el("span", {style:`color:${dominant.color};`}, [`${dominant.pct}% ${dominant.label}`])
+            ]),
+            el("div", {class:"wind-mix-bar", style:"margin-top:6px;"}, [
+              el("div", {style:`flex:${mix.tailPct}; background:var(--tail);`}),
+              el("div", {style:`flex:${mix.crossPct}; background:var(--cross);`}),
+              el("div", {style:`flex:${mix.headPct}; background:var(--head);`})
+            ])
+          ]);
+        };
+        card.appendChild(el("div", {style:"display:flex; gap:16px; margin-top:14px;"}, [
+          halfColumn(halves.first, "1. Hälfte"),
+          halfColumn(halves.second, "2. Hälfte")
+        ]));
       }
       const ringsRow = renderRangeRingsRow();
       if(ringsRow) card.appendChild(ringsRow);
