@@ -20,6 +20,13 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.js"></script>
 <style>
   :root{
+    /* App is dark-only, no light mode -- tells the browser to render native
+       widget chrome (the datetime-local input's picker icon/internal fields
+       being the one that actually appears here) in dark-appropriate colors
+       instead of defaulting to light-scheme chrome against a dark input
+       background, which made the picker icon look broken/near-invisible on
+       desktop Chromium/Edge. */
+    color-scheme: dark;
     --asphalt: #14171d;
     --asphalt-2: #1c212a;
     --asphalt-3: #262c37;
@@ -140,10 +147,14 @@
   /* 720px was a mobile-era leftover -- on any desktop window it left huge
      empty gutters either side. Widening this never affects phones: a phone
      viewport is always narrower than even the smallest step below, so
-     max-width simply never engages there. */
+     max-width simply never engages there.
+     Above 1200px there's no further cap at all ("randlos, volle Breite") --
+     content uses the full viewport width, just with side padding that grows
+     a bit via clamp() on very wide (e.g. ultrawide) screens so it doesn't
+     sit glued to the edge, without reintroducing a de-facto cap. */
   .app{ max-width: 720px; margin: 0 auto; padding: 28px 20px 60px; }
   @media (min-width:900px){ .app{ max-width: 900px; } }
-  @media (min-width:1200px){ .app{ max-width: 1080px; } }
+  @media (min-width:1200px){ .app{ max-width: none; padding-left: clamp(20px, 4vw, 96px); padding-right: clamp(20px, 4vw, 96px); } }
 
   .brand{ display:flex; align-items:baseline; justify-content:space-between; margin-bottom: 22px; }
   .brand .brand-left{ display:flex; align-items:baseline; gap:12px; }
@@ -399,6 +410,22 @@
     border-left:3px solid var(--chalk-dim); border-radius:var(--r-sm);
   }
   .loading{ color: var(--chalk-dim); font-size:13px; font-family:'IBM Plex Mono', monospace; }
+
+  /* Startup-sequence progress bar (renderStartupProgressBar()) -- token
+     refresh -> activities -> first activity's route/weather -> starred
+     segments, for the connect/revisit/manual-"Daten laden" flows only, not a
+     general indicator for the app's other .loading spots. Deliberately
+     minimal: a track + fill, no keyframe animation, just a plain width
+     transition on step changes. */
+  .startup-progress{ margin-top:8px; }
+  .startup-progress .track{
+    width:100%; height:6px; border-radius:var(--r-full); background:var(--asphalt-3);
+    overflow:hidden; margin-top:6px;
+  }
+  .startup-progress .fill{
+    height:100%; background:var(--route); border-radius:var(--r-full);
+    transition:width 0.2s ease;
+  }
 
   /* Segment Top-10 leaderboard (renderSegmentLeaderboard()) — the app's only
      table-like layout, deliberately dense/compact rather than another stack
@@ -766,6 +793,25 @@ let state = {
   // `!= null` (not `||`) so an explicit saved `false` survives a reload
   // instead of being coerced back to the true default.
   hideIrrelevantSegments: savedSettings.hideIrrelevantSegments != null ? savedSettings.hideIrrelevantSegments : true,
+  // Whether connecting (fresh OAuth or a stored-token revisit) should
+  // immediately auto-fetch activities/routes/starred segments, same as the
+  // app always did before this setting existed. `!= null` (not `||`) for the
+  // same reason as hideIrrelevantSegments above -- an explicit saved `false`
+  // must survive a reload. Defaults to true so every existing user with no
+  // saved setting keeps today's behavior unchanged. See connectWithCode()/
+  // init() for where this is read, and state.needsManualLoad below for the
+  // manual-mode flag it gates.
+  autoLoadOnVisit: savedSettings.autoLoadOnVisit != null ? savedSettings.autoLoadOnVisit : true,
+  // True right after connecting (OAuth or stored-token revisit) when
+  // autoLoadOnVisit is off, until the user clicks the "Daten laden" button
+  // (see renderManualLoadCard()) -- never persisted, always starts false.
+  needsManualLoad: false,
+  // Startup-sequence progress state (see startupProgressBegin()/Step()/End()
+  // and renderStartupProgressBar()) -- {step,total,label} while the connect/
+  // revisit/manual-load chain is running, null otherwise. Declared here for
+  // consistency with the rest of state even though startupProgressBegin()
+  // is what actually assigns it; never persisted.
+  startupProgress: null,
   // id -> true map, mirroring state.segmentStars' id-keyed-object shape for
   // O(1) lookup. Rebuilt from the plain id array saveSettings() persists
   // (see loadSettings()'s JSON round-trip note there). ONE global set, not
@@ -1056,6 +1102,63 @@ function estimateArrival(startDate, distanceKm, avgSpeedKmh){
   return new Date(startDate.getTime() + hours*3600*1000);
 }
 
+// A bearing taken between two literally-adjacent raw GPS/polyline vertices
+// can be a chord only a few meters long, so ordinary GPS jitter can swing it
+// by tens of degrees and flip a whole reported segment's tail/cross/head
+// classification (windRelative() itself and its thresholds are fine -- it's
+// the noisy bearing fed into it that isn't). Averaging over a longer
+// real-world chord smooths that out. Windowed by distance (via `cumDist`,
+// which is already computed per point) rather than a fixed vertex count,
+// since raw point density varies a lot between GPX files/Strava polylines.
+const BEARING_SMOOTHING_WINDOW_KM = 0.2;
+
+// Walks `cumDist` from `fromIdx` toward `dir` (-1 = backward, +1 = forward)
+// until it reaches (or would overshoot) `targetKm`, clamped at the array's
+// ends -- used to find the "before" and "after" ends of the smoothing
+// window around a given index.
+function indexAtDistance(cumDist, targetKm, fromIdx, dir){
+  let idx = fromIdx;
+  if(dir < 0){
+    while(idx > 0 && cumDist[idx] > targetKm) idx--;
+  } else {
+    while(idx < cumDist.length - 1 && cumDist[idx] < targetKm) idx++;
+  }
+  return idx;
+}
+
+// Smoothed bearing at raw-vertex index `idx`: the bearing between a point
+// ~BEARING_SMOOTHING_WINDOW_KM before it and ~BEARING_SMOOTHING_WINDOW_KM
+// after it along the route, instead of just the bearing to the next
+// adjacent vertex. Clamped to the route's start/end where a full window
+// isn't available (e.g. very short routes), falling back to the immediate
+// neighbor(s) if even that collapses to nothing.
+function smoothedBearingAt(coords, cumDist, idx){
+  const rawAdjacentBearing = () => {
+    const nextIdx = idx + 1 < coords.length ? idx + 1 : idx;
+    const prevIdx = idx > 0 ? idx - 1 : idx;
+    return idx < coords.length - 1 ? bearingBetween(coords[idx], coords[nextIdx]) : bearingBetween(coords[prevIdx], coords[idx]);
+  };
+  const here = cumDist[idx];
+  const beforeIdx = indexAtDistance(cumDist, here - BEARING_SMOOTHING_WINDOW_KM, idx, -1);
+  const afterIdx = indexAtDistance(cumDist, here + BEARING_SMOOTHING_WINDOW_KM, idx, 1);
+  if(beforeIdx === afterIdx){
+    return rawAdjacentBearing();
+  }
+  // Hairpin/out-and-back guard: at a U-turn that falls inside the smoothing
+  // window, `beforeIdx`/`afterIdx` are index-distinct but can still end up
+  // almost spatially coincident (the route doubles back on itself between
+  // them), producing a near-arbitrary long-chord bearing for this one
+  // sample. Detect that by comparing the straight-line distance between them
+  // to the along-route distance the window is supposed to span -- a real
+  // straight-ish stretch keeps those close; a turnaround collapses the
+  // straight-line distance well below it.
+  const alongRouteKm = cumDist[afterIdx] - cumDist[beforeIdx];
+  if(alongRouteKm > 0 && haversineKm(coords[beforeIdx], coords[afterIdx]) < alongRouteKm * 0.5){
+    return rawAdjacentBearing();
+  }
+  return bearingBetween(coords[beforeIdx], coords[afterIdx]);
+}
+
 function pickRoutePoints(coords, cumDist, stepKm){
   if(coords.length < 2) return [];
 
@@ -1068,9 +1171,7 @@ function pickRoutePoints(coords, cumDist, stepKm){
   while (targetDistance <= totalDistance + 1e-9) {
     while (idx < cumDist.length - 1 && cumDist[idx] < targetDistance) idx++;
     const p = coords[idx];
-    const nextIdx = idx + 1 < coords.length ? idx + 1 : idx;
-    const prevIdx = idx > 0 ? idx - 1 : idx;
-    const bearing = idx < coords.length - 1 ? bearingBetween(coords[idx], coords[nextIdx]) : bearingBetween(coords[prevIdx], coords[idx]);
+    const bearing = smoothedBearingAt(coords, cumDist, idx);
     points.push({ lat: p[0], lon: p[1], bearing, distanceKm: cumDist[idx], idx });
     targetDistance += step;
   }
@@ -1081,7 +1182,7 @@ function pickRoutePoints(coords, cumDist, stepKm){
     points.push({
       lat: last[0],
       lon: last[1],
-      bearing: bearingBetween(coords[lastIdx - 1] || coords[lastIdx], coords[lastIdx]),
+      bearing: smoothedBearingAt(coords, cumDist, lastIdx),
       distanceKm: cumDist[lastIdx],
       idx: lastIdx
     });
@@ -1830,6 +1931,7 @@ function saveSettings(){
       avgSpeedKmh: state.avgSpeedKmh,
       routePointDistanceKm: state.routePointDistanceKm,
       hideIrrelevantSegments: state.hideIrrelevantSegments,
+      autoLoadOnVisit: state.autoLoadOnVisit,
       // Serialized as a plain array (JSON has no id-map type) and rebuilt
       // back into a {[id]: true} object on load — see state.
       // irrelevantSegmentIds' declaration above.
@@ -3272,6 +3374,13 @@ const NAV_ITEMS = [
 const CHANGELOG_SEEN_KEY = 'velocast_changelog_seen';
 const CHANGELOG = [
   { date:'28.08.2026', items:[
+    'Datum/Uhrzeit-Auswahl: Kalender-Symbol war auf dem Desktop kaum sichtbar (dunkel auf dunklem Grund) — behoben.',
+    'Windrichtung (Gegenwind/Seitenwind/Rückenwind) wird jetzt stabiler berechnet — vorher konnte einzelnes GPS-Rauschen die Einordnung für ganze Streckenabschnitte kippen.',
+    'Neue Einstellung „Daten beim Besuch automatisch laden" — bei Bedarf lässt sich das automatische Laden deaktivieren, dann erscheint stattdessen ein Button zum manuellen Laden.',
+    'Ladevorgang beim Start zeigt jetzt eine Fortschrittsanzeige statt flackernder Textwechsel.',
+    'App nutzt auf breiten Desktop-Bildschirmen die volle verfügbare Breite (vorher bei 1080px begrenzt).',
+  ]},
+  { date:'28.08.2026 (früher)', items:[
     'Kartenkacheln repariert — zeigten zuletzt einen „API KEY REQUIRED"-Fehler statt der Karte.',
     '„Genutztes Potential" bei Segmenten ist jetzt sofort in der Liste sichtbar (vorher erst nach Antippen eines Segments), lädt schneller beim Start und vergleicht gegen einen längeren Zeitraum.',
     'Strecke-Seite: Wind-Aufteilung zeigt jetzt zusätzlich getrennt nach erster und zweiter Hälfte der Strecke.',
@@ -3556,6 +3665,11 @@ function render(){
     // screen. Only applies to the "route" page; "Meine Segmente" has its own
     // always-visible connect prompt inside renderSegmentsPage().
     app.appendChild(renderConnectCard());
+  } else if(state.connected && state.needsManualLoad){
+    // autoLoadOnVisit is off — connected, but nothing fetched yet. Shown
+    // instead of the normal route/segments cards until the user clicks
+    // "Daten laden" (see renderManualLoadCard()/loadActivitiesAndSegments()).
+    app.appendChild(renderManualLoadCard());
   } else {
     app.appendChild(renderRouteCard());
     const infoTabsCard = renderRouteInfoTabsCard();
@@ -3663,6 +3777,16 @@ function renderStravaConnectCard(title, description){
   const btn = el("button", {class:"btn", style:"width:100%;", onclick: ()=>{ window.location.href = buildAuthUrl(); }}, [state.loading.connect ? "Verbinde…" : "Mit Strava einloggen →"]);
   if(state.loading.connect) btn.disabled = true;
   card.appendChild(btn);
+  // Startup-sequence progress bar (see startupProgressBegin()/
+  // renderStartupProgressBar()) -- null/no-op everywhere this card is shown
+  // outside of an actual connect/revisit/manual-load sequence (segments/
+  // profil/aktivitaeten/trainer's own "please connect" prompts included), but
+  // visible here from the very first "Verbindung wird hergestellt…"/"Token
+  // wird aktualisiert…" step, not just once loadActivitiesAndSegments()'s own
+  // card takes over — this card (via renderConnectCard()) is what's actually
+  // on screen during that first step, since state.connected is still false.
+  const startupBar = renderStartupProgressBar();
+  if(startupBar) card.appendChild(startupBar);
   return card;
 }
 
@@ -3671,47 +3795,144 @@ function renderConnectCard(){
   // renderStravaConnectCard()'s button has no bottom margin (nothing follows
   // it at its other call sites) -- restore it here since the button is an
   // inline-block (.btn has no display override), so its margin never
-  // collapses with the "oder..." div's own margin-top below.
-  card.lastChild.style.marginBottom = "8px";
+  // collapses with the "oder..." div's own margin-top below. Targeted via
+  // querySelector rather than card.lastChild since the startup progress bar
+  // (when a sequence is running) is now the actual last child, not the button.
+  const connectBtn = card.querySelector(".btn");
+  if(connectBtn) connectBtn.style.marginBottom = "8px";
   card.appendChild(el("div", {class:"muted", style:"margin:16px 0 8px; font-size:12px;"}, ["oder, ganz ohne Account:"]));
   card.appendChild(renderGpxUploadRow());
   return card;
 }
 
+// ---------- startup progress ----------
+// Simple step counter for the connect/revisit/manual-"Daten laden" startup
+// sequence (see renderStartupProgressBar()) -- token refresh -> activities
+// fetch -> first activity's route/weather -> starred segments+extras, shared
+// across all three call sites (connectWithCode(), init()'s stored-token
+// branch, and the manual-load button) so the same bar appears wherever the
+// chain runs. Left null/undefined outside of a startup sequence so it never
+// lingers once the chain completes (see startupProgressEnd()). Deliberately
+// NOT used for the app's other ~11 pre-existing .loading flags -- this is
+// startup-sequence-only infrastructure, not a general loading indicator.
+function startupProgressBegin(total){
+  state.startupProgress = { step: 0, total, label: "" };
+}
+function startupProgressStep(label){
+  if(!state.startupProgress) return;
+  state.startupProgress.step++;
+  state.startupProgress.label = label;
+}
+function startupProgressEnd(){
+  state.startupProgress = null;
+}
+
+// Renders "Schritt X von N: <label>" + the visual bar, or null if no startup
+// sequence is running. Callers place this wherever the connect/revisit/
+// manual-load flow's own loading text already appeared.
+function renderStartupProgressBar(){
+  const p = state.startupProgress;
+  if(!p) return null;
+  const pct = p.total > 0 ? Math.round((p.step / p.total) * 100) : 0;
+  return el("div", {class:"startup-progress"}, [
+    el("div", {class:"loading"}, [`Schritt ${p.step} von ${p.total}: ${p.label}`]),
+    el("div", {class:"track"}, [
+      el("div", {class:"fill", style:`width:${pct}%;`})
+    ])
+  ]);
+}
+
 async function connectWithCode(code){
   state.error = null;
-  state.loading.connect = true; render();
+  state.loading.connect = true;
+  startupProgressBegin(4);
+  startupProgressStep("Verbindung wird hergestellt…");
+  render();
   try{
     const tokenData = await exchangeCode(code);
     state.accessToken = tokenData.access_token;
     state.athlete = tokenData.athlete;
     await saveToken(tokenData.refresh_token);
     state.connected = true;
-    await loadActivitiesAndSegments();
+    if(state.autoLoadOnVisit){
+      await loadActivitiesAndSegments();
+    } else {
+      state.needsManualLoad = true;
+    }
   }catch(e){
     state.error = e.message || "Verbindung fehlgeschlagen.";
   }
   state.loading.connect = false;
+  startupProgressEnd();
   render();
 }
 
+// Fetches activities + starred segments — the shared back half of the
+// startup sequence (steps 2-4: activities, first activity's route/weather,
+// segments+extras), used by all three of connectWithCode(), init()'s
+// stored-token revisit branch, and the manual "Daten laden" button (see
+// renderManualLoadCard()) — plus the footnote's own "Neu laden" link
+// (renderFootnote()), which calls this directly. `ownsProgress` tracks
+// whether THIS call started the progress sequence itself (a standalone
+// reload, e.g. the "Neu laden" link, or the manual-load button — total 3, no
+// preceding token step) versus being called after a caller already ran its
+// own token-refresh step (total 4 set by that caller) — only the call that
+// started the sequence is responsible for ending it, so a nested call here
+// never cuts off a step the caller still wants to show.
+//
+// Also always clears state.needsManualLoad once the chain completes — not
+// just from the manual-load card's own button — since renderFootnote()'s
+// "Neu laden" link reaches this function directly, bypassing that card
+// entirely; leaving the flag set after a footnote-triggered load would
+// strand the user on the manual-load card with freshly fetched data they
+// can't see (render() would just keep showing renderManualLoadCard()).
 async function loadActivitiesAndSegments(){
-  state.loading.activities = true; render();
+  const ownsProgress = !state.startupProgress;
+  if(ownsProgress) startupProgressBegin(3);
+
+  state.loading.activities = true;
+  startupProgressStep("Lade Aktivitäten…"); render();
   try{
     state.activities = await fetchActivities(state.accessToken);
+    startupProgressStep("Lade Route & Wetter…"); render();
     if(state.activities.length){
       await selectActivity(state.activities[0]);
     }
   }catch(e){ state.error = e.message; }
   state.loading.activities = false;
 
-  state.loading.segments = true; render();
+  state.loading.segments = true;
+  startupProgressStep("Lade Segmente & Wind…"); render();
   try{
     state.segments = await fetchStarredSegments(state.accessToken);
     await loadSegmentExtras(state.segments, segmentBucket("starred"), Infinity);
   }catch(e){ state.error = e.message; }
   state.loading.segments = false;
+  if(ownsProgress) startupProgressEnd();
+  state.needsManualLoad = false;
   render();
+}
+
+// Shown in place of the normal route/segments content when connected but
+// state.needsManualLoad is set (autoLoadOnVisit is off — see connectWithCode()/
+// init()). Clicking "Daten laden" runs the exact same loadActivitiesAndSegments()
+// chain the automatic path uses (progress bar included); that chain itself
+// clears the flag once done (see its own comment above), so render() switches
+// back to the normal connected view without any extra bookkeeping here.
+function renderManualLoadCard(){
+  const card = pageTitleCard("Verbunden");
+  card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [
+    "Automatisches Laden ist deaktiviert (siehe Einstellungen). Lade Aktivitäten, Routen und markierte Segmente jetzt manuell."
+  ]));
+  const loading = state.loading.activities || state.loading.segments;
+  const btn = el("button", {class:"btn", style:"width:100%;", onclick: ()=>{
+    loadActivitiesAndSegments();
+  }}, [loading ? "Lade…" : "Daten laden"]);
+  if(loading) btn.disabled = true;
+  card.appendChild(btn);
+  const bar = renderStartupProgressBar();
+  if(bar) card.appendChild(bar);
+  return card;
 }
 
 // Bundles a segment source's parallel state fields (list + weather + details
@@ -4167,11 +4388,28 @@ async function ensureRideSegments(){
   render();
 }
 
+// Step used to sample a list-chip's polyline into smoothed-bearing points
+// (see pickRoutePoints()/smoothedBearingAt()) -- much finer than the
+// route-page's user-configurable Punktabstand since this only drives a
+// distance-weighted percentage mix, not individually shown wind markers.
+const LIST_ITEM_WIND_STEP_KM = 1;
+
 // Distance-weighted tail/cross/head wind-mix for a route/activity list chip.
 // The polyline is decoded and split into bearings entirely client-side
 // (free); only a single Open-Meteo call is made (wind at the start point) to
 // classify all of those segments against, so this stays cheap enough to run
-// for every visible list item.
+// for every visible list item. Reuses pickRoutePoints() purely to get evenly
+// spaced ~LIST_ITEM_WIND_STEP_KM leg endpoints along the route -- but unlike
+// the route map's own markers, each leg here is classified by the direct
+// chord bearing across ITS OWN endpoints (coords[points[i].idx] ->
+// coords[points[i+1].idx]), not by points[i].bearing (that field is the
+// BEARING_SMOOTHING_WINDOW_KM-windowed bearing meant for the finer-grained
+// map/route classification, centered on the leg's start point -- at this
+// function's much coarser 1km step, that window barely reaches past the
+// leg's own start and mostly reflects the previous leg, not the ~1km this
+// bearing is meant to represent). The full-leg chord is both smoother
+// (spans the whole ~1km) and actually descriptive of the leg being
+// classified.
 async function ensureListItemWindTag(key, polyline){
   if(state.routeWindCache[key] !== undefined) return;
   state.routeWindCache[key] = null;
@@ -4180,12 +4418,14 @@ async function ensureListItemWindTag(key, polyline){
   if(coords.length < 2) return;
   try{
     const w = await fetchWeather(coords[0][0].toFixed(4), coords[0][1].toFixed(4));
+    const cumDist = buildCumulativeDistances(coords);
+    const points = pickRoutePoints(coords, cumDist, LIST_ITEM_WIND_STEP_KM);
     let tailDist = 0, crossDist = 0, totalDist = 0;
-    for(let i=0;i<coords.length-1;i++){
-      const dist = haversineKm(coords[i], coords[i+1]);
+    for(let i=0;i<points.length-1;i++){
+      const dist = points[i+1].distanceKm - points[i].distanceKm;
       if(dist <= 0) continue;
-      const bearing = bearingBetween(coords[i], coords[i+1]);
-      const rel = windRelative(bearing, w.windDir);
+      const legBearing = bearingBetween(coords[points[i].idx], coords[points[i+1].idx]);
+      const rel = windRelative(legBearing, w.windDir);
       if(rel.type === "tail") tailDist += dist;
       else if(rel.type === "cross") crossDist += dist;
       totalDist += dist;
@@ -4513,6 +4753,14 @@ function renderRouteCard(){
   }
 
   card.appendChild(el("h2", {}, ["Strecke"]));
+
+  // Augments (doesn't replace) the tab-level "Lade Aktivitäten…"-style
+  // loading text below with the shared startup-sequence bar, while the
+  // automatic connect/revisit flow is running (see startupProgressBegin()).
+  // The manual-load flow's own card (renderManualLoadCard()) shows this
+  // separately since renderRouteCard() isn't reached at all in that state.
+  const startupBar = renderStartupProgressBar();
+  if(startupBar) card.appendChild(startupBar);
 
   renderRoutePersistentSettingsRow(card);
 
@@ -11301,6 +11549,23 @@ function renderEinstellungenPage(){
   ]));
   frag.appendChild(headerCard);
 
+  // Same renderToggleSwitch() convention as the "Nicht relevante Segmente
+  // ausblenden" toggle on the segment pages (see there), just a different
+  // backing field (state.autoLoadOnVisit — see connectWithCode()/init()'s
+  // stored-token branch for where it's read, and render()'s
+  // needsManualLoad branch for what changes when it's off).
+  const autoLoadCard = el('div', {class:'card'});
+  autoLoadCard.appendChild(el('h2', {}, ['Datenladen']));
+  autoLoadCard.appendChild(renderToggleSwitch(
+    state.autoLoadOnVisit,
+    "Daten beim Besuch automatisch laden",
+    ()=>{ state.autoLoadOnVisit = !state.autoLoadOnVisit; saveSettings(); render(); }
+  ));
+  autoLoadCard.appendChild(el('div', {class:'muted', style:'font-size:12px; margin-top:-6px;'}, [
+    'Wenn deaktiviert, werden Aktivitäten, Routen und markierte Segmente nach dem Verbinden nicht automatisch geladen — stattdessen erscheint ein „Daten laden"-Button.'
+  ]));
+  frag.appendChild(autoLoadCard);
+
   frag.appendChild(buildEquipmentModeCard());
 
   const classCard = el('div', {class:'card'});
@@ -11362,17 +11627,25 @@ async function init(){
   if(!justConnected){
     const stored = await loadStoredToken();
     if(stored){
-      state.loading.connect = true; render();
+      state.loading.connect = true;
+      startupProgressBegin(4);
+      startupProgressStep("Token wird aktualisiert…");
+      render();
       try{
         const tokenData = await refreshAccessToken(stored);
         state.accessToken = tokenData.access_token;
         await saveToken(tokenData.refresh_token);
         state.connected = true;
-        await loadActivitiesAndSegments();
+        if(state.autoLoadOnVisit){
+          await loadActivitiesAndSegments();
+        } else {
+          state.needsManualLoad = true;
+        }
       }catch(e){
         // stored token invalid, stay on connect screen
       }
       state.loading.connect = false;
+      startupProgressEnd();
       render();
     }
   }
