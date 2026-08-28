@@ -3845,7 +3845,7 @@ function renderStartupProgressBar(){
 async function connectWithCode(code){
   state.error = null;
   state.loading.connect = true;
-  startupProgressBegin(4);
+  startupProgressBegin(5);
   startupProgressStep("Verbindung wird hergestellt…");
   render();
   try{
@@ -3867,18 +3867,31 @@ async function connectWithCode(code){
   render();
 }
 
-// Fetches activities + starred segments — the shared back half of the
-// startup sequence (steps 2-4: activities, first activity's route/weather,
-// segments+extras), used by all three of connectWithCode(), init()'s
-// stored-token revisit branch, and the manual "Daten laden" button (see
-// renderManualLoadCard()) — plus the footnote's own "Neu laden" link
-// (renderFootnote()), which calls this directly. `ownsProgress` tracks
-// whether THIS call started the progress sequence itself (a standalone
-// reload, e.g. the "Neu laden" link, or the manual-load button — total 3, no
-// preceding token step) versus being called after a caller already ran its
-// own token-refresh step (total 4 set by that caller) — only the call that
-// started the sequence is responsible for ending it, so a nested call here
-// never cuts off a step the caller still wants to show.
+// Fetches activities + starred segments + Profil training data — the shared
+// back half of the startup sequence (steps 2-5: activities, first activity's
+// route/weather, segments+extras, training data), used by all three of
+// connectWithCode(), init()'s stored-token revisit branch, and the manual
+// "Daten laden" button (see renderManualLoadCard()) — plus the footnote's
+// own "Neu laden" link (renderFootnote()), which calls this directly.
+// `ownsProgress` tracks whether THIS call started the progress sequence
+// itself (a standalone reload, e.g. the "Neu laden" link, or the
+// manual-load button — total 4, no preceding token step) versus being
+// called after a caller already ran its own token-refresh step (total 5 set
+// by that caller) — only the call that started the sequence is responsible
+// for ending it, so a nested call here never cuts off a step the caller
+// still wants to show.
+//
+// The Profil training-data step (loadProfilData()) was missing from this
+// chain originally, even though "alle Daten (Trainingsdaten usw)" is
+// literally what the autoLoadOnVisit setting was requested for — without
+// it, riderProfile.mmpCurve never gets built automatically, which silently
+// starves the "Potential"-Chip on Meine Segmente (buildPotentialChip() just
+// omits the chip when there's no MMP curve, no visible error) unless the
+// user happened to separately open Profil and click "Trainingsdaten laden"
+// in the same session. loadProfilData() never throws (it catches its own
+// errors into pp.error for the Profil page to show), so no extra try/catch
+// is needed here, and it reuses pp.athleteDetail/the on-disk activity cache
+// when already populated, so repeat calls (e.g. via "Neu laden") stay cheap.
 //
 // Also always clears state.needsManualLoad once the chain completes — not
 // just from the manual-load card's own button — since renderFootnote()'s
@@ -3888,7 +3901,7 @@ async function connectWithCode(code){
 // can't see (render() would just keep showing renderManualLoadCard()).
 async function loadActivitiesAndSegments(){
   const ownsProgress = !state.startupProgress;
-  if(ownsProgress) startupProgressBegin(3);
+  if(ownsProgress) startupProgressBegin(4);
 
   state.loading.activities = true;
   startupProgressStep("Lade Aktivitäten…"); render();
@@ -3908,6 +3921,10 @@ async function loadActivitiesAndSegments(){
     await loadSegmentExtras(state.segments, segmentBucket("starred"), Infinity);
   }catch(e){ state.error = e.message; }
   state.loading.segments = false;
+
+  startupProgressStep("Lade Trainingsdaten…"); render();
+  await loadProfilData(state.accessToken);
+
   if(ownsProgress) startupProgressEnd();
   state.needsManualLoad = false;
   render();
@@ -3922,7 +3939,7 @@ async function loadActivitiesAndSegments(){
 function renderManualLoadCard(){
   const card = pageTitleCard("Verbunden");
   card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [
-    "Automatisches Laden ist deaktiviert (siehe Einstellungen). Lade Aktivitäten, Routen und markierte Segmente jetzt manuell."
+    "Automatisches Laden ist deaktiviert (siehe Einstellungen). Lade Aktivitäten, Routen, markierte Segmente und Trainingsdaten jetzt manuell."
   ]));
   const loading = state.loading.activities || state.loading.segments;
   const btn = el("button", {class:"btn", style:"width:100%;", onclick: ()=>{
@@ -11562,7 +11579,7 @@ function renderEinstellungenPage(){
     ()=>{ state.autoLoadOnVisit = !state.autoLoadOnVisit; saveSettings(); render(); }
   ));
   autoLoadCard.appendChild(el('div', {class:'muted', style:'font-size:12px; margin-top:-6px;'}, [
-    'Wenn deaktiviert, werden Aktivitäten, Routen und markierte Segmente nach dem Verbinden nicht automatisch geladen — stattdessen erscheint ein „Daten laden"-Button.'
+    'Wenn deaktiviert, werden Aktivitäten, Routen, markierte Segmente und Trainingsdaten nach dem Verbinden nicht automatisch geladen — stattdessen erscheint ein „Daten laden"-Button.'
   ]));
   frag.appendChild(autoLoadCard);
 
@@ -11628,7 +11645,7 @@ async function init(){
     const stored = await loadStoredToken();
     if(stored){
       state.loading.connect = true;
-      startupProgressBegin(4);
+      startupProgressBegin(5);
       startupProgressStep("Token wird aktualisiert…");
       render();
       try{
