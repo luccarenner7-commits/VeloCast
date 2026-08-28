@@ -78,16 +78,20 @@
     --grade-4: #c3d5ec; --grade-4-bg: rgba(195,213,236,0.22);
     /* Wind-speed (absolute, not direction-relative) intensity ramp for the
        Windfeld map overlay — its own token family, deliberately NOT the
-       --grade-* ramp above, because the Leaflet basemap tiles are light
-       (cartodb light_all, ~#f2f0eb), the inverse of the dark climb-chart
-       context --grade-* was tuned for. Direction is reversed from --grade-*
-       too: here DARKER/more saturated = stronger wind, so the most
-       dangerous reading is the most visually prominent against light tiles,
-       not the least. Alpha is baked into each stop (not a separate opacity
-       multiplier) so contrast against the tiles can be tuned per step —
-       measured (blended-pixel vs. #f2f0eb) at roughly 3.2:1 / 4.8:1 / 7.3:1 /
-       11.7:1 for tiers 1→4, all above the 3:1 WCAG floor for non-text
-       graphics conveying information. */
+       --grade-* ramp above, because the Leaflet basemap tiles are light,
+       the inverse of the dark climb-chart context --grade-* was tuned for.
+       Direction is reversed from --grade-* too: here DARKER/more saturated
+       = stronger wind, so the most dangerous reading is the most visually
+       prominent against light tiles, not the least. Alpha is baked into
+       each stop (not a separate opacity multiplier) so contrast against the
+       tiles can be tuned per step. The original measured ratios (3.2:1 /
+       4.8:1 / 7.3:1 / 11.7:1 for tiers 1→4) were against CARTO's flat
+       #f2f0eb basemap; since the basemap switched to standard OpenStreetMap
+       tiles (CARTO's key-less raster tiles were retired), the background is
+       no longer one flat color, so those numbers are no longer a
+       guarantee — still fine against most OSM tile colors in practice, but
+       not re-verified against the full range (e.g. dark-green forest,
+       saturated water blue). */
     --wind-1: rgba(90,123,168,0.90);
     --wind-2: rgba(63,95,143,0.92);
     --wind-3: rgba(42,69,112,0.94);
@@ -1099,9 +1103,13 @@ function windRelative(routeBearing, windFromDeg){
   return { type:"cross", diff };
 }
 
-// Distance-weighted breakdown of the whole route by wind relation, so a
-// short but very headwind-y stretch doesn't count the same as a long one.
-function computeWindMix(){
+// Distance-weighted breakdown of a [fromKm, toKm) slice of the route by wind
+// relation, so a short but very headwind-y stretch doesn't count the same as
+// a long one. Each inter-point segment is assigned by its midpoint distance,
+// so it always lands wholly in one slice or the other (no proportional
+// splitting of a segment straddling a boundary — the route's point spacing
+// doesn't need that precision).
+function computeWindMixForRange(fromKm, toKm){
   const pts = state.routePoints;
   let tailDist = 0, crossDist = 0, totalDist = 0;
   for(let i=0;i<pts.length-1;i++){
@@ -1109,6 +1117,8 @@ function computeWindMix(){
     if(!w) continue;
     const dist = pts[i+1].distanceKm - pts[i].distanceKm;
     if(dist <= 0) continue;
+    const mid = (pts[i].distanceKm + pts[i+1].distanceKm) / 2;
+    if(mid < fromKm || mid >= toKm) continue;
     const rel = windRelative(pts[i].bearing, w.windDir);
     if(rel.type === "tail") tailDist += dist;
     else if(rel.type === "cross") crossDist += dist;
@@ -1119,6 +1129,33 @@ function computeWindMix(){
   const crossPct = Math.round(crossDist / totalDist * 100);
   const headPct = Math.max(0, 100 - tailPct - crossPct);
   return { tailPct, crossPct, headPct };
+}
+
+// Whole-route wind mix — same computation as computeWindMixForRange, just
+// unbounded. No segment midpoint can reach the last point's own distance
+// (it's always the average of two smaller-or-equal values), so bounding by
+// [0, totalKm) still includes every segment.
+function computeWindMix(){
+  const pts = state.routePoints;
+  if(!pts.length) return null;
+  const totalKm = pts[pts.length - 1].distanceKm;
+  return computeWindMixForRange(0, totalKm);
+}
+
+// Same mix, split at the route's distance midpoint, for a first-half vs.
+// second-half pacing read (e.g. "tailwind out, headwind back"). Either half
+// can come back null (e.g. an extremely short route with no segment
+// midpoint on that side) — callers should handle that gracefully.
+function computeWindMixHalves(){
+  const pts = state.routePoints;
+  if(!pts.length) return null;
+  const totalKm = pts[pts.length - 1].distanceKm;
+  if(totalKm <= 0) return null;
+  const halfKm = totalKm / 2;
+  return {
+    first: computeWindMixForRange(0, halfKm),
+    second: computeWindMixForRange(halfKm, totalKm)
+  };
 }
 
 // Thresholds for the strong-wind banner. Sustained wind and gusts are judged
@@ -3234,8 +3271,14 @@ const NAV_ITEMS = [
 // elsewhere in this file for the same displayed format.
 const CHANGELOG_SEEN_KEY = 'velocast_changelog_seen';
 const CHANGELOG = [
+  { date:'28.08.2026', items:[
+    'Kartenkacheln repariert — zeigten zuletzt einen „API KEY REQUIRED"-Fehler statt der Karte.',
+    '„Genutztes Potential" bei Segmenten ist jetzt sofort in der Liste sichtbar (vorher erst nach Antippen eines Segments), lädt schneller beim Start und vergleicht gegen einen längeren Zeitraum.',
+    'Strecke-Seite: Wind-Aufteilung zeigt jetzt zusätzlich getrennt nach erster und zweiter Hälfte der Strecke.',
+  ]},
   { date:'27.08.2026', items:[
     '„Meine Segmente" zeigt jetzt wirklich alle mit Stern markierten Segmente an (vorher war bei 12 Schluss).',
+    'Neue Kennzahl „Genutztes Potential" bei Segmenten: zeigt, wie nah die eigene Bestleistung an der persönlichen Höchstleistung für diese Dauer liegt.',
     'Anstiegs-Erkennung erkennt jetzt auch bei mehreren kurzen Unterbrechungen hintereinander einen durchgehenden Anstieg.',
     'Trainer: Höhenprofil färbt sich durchgehend nach Streckeneignung für die gewählte Trainingsklasse.',
     'Ablauf & Analyse: aufgeräumte Schritt-Liste mit fortlaufender Positionsangabe.',
@@ -4283,6 +4326,34 @@ function renderRouteSourceTabs(card){
   }
 }
 
+// Shared markup for one tail/cross/head hero-stats-over-bar block, used by
+// the first/second-half breakdown below. The whole-route block above it
+// keeps its own inline markup as-is rather than being rewired onto this, so
+// its existing output can't be affected by this change.
+function renderWindMixStatBlock(mix){
+  return [
+    el("div", {class:"wind-mix-stats"}, [
+      el("div", {class:"wind-mix-stat", style:"align-items:flex-start;"}, [
+        el("div", {class:"v", style:"color:var(--tail);"}, [`${mix.tailPct}%`]),
+        el("div", {class:"l"}, ["Rückenwind"])
+      ]),
+      el("div", {class:"wind-mix-stat", style:"align-items:center; text-align:center;"}, [
+        el("div", {class:"v", style:"color:var(--cross);"}, [`${mix.crossPct}%`]),
+        el("div", {class:"l"}, ["Seitenwind"])
+      ]),
+      el("div", {class:"wind-mix-stat", style:"align-items:flex-end; text-align:right;"}, [
+        el("div", {class:"v", style:"color:var(--head);"}, [`${mix.headPct}%`]),
+        el("div", {class:"l"}, ["Gegenwind"])
+      ])
+    ]),
+    el("div", {class:"wind-mix-bar"}, [
+      el("div", {style:`flex:${mix.tailPct}; background:var(--tail);`}),
+      el("div", {style:`flex:${mix.crossPct}; background:var(--cross);`}),
+      el("div", {style:`flex:${mix.headPct}; background:var(--head);`})
+    ])
+  ];
+}
+
 function renderRouteMapSection(card){
   // The map container is appended whenever we have coordinates at all —
   // including while weather is still loading — rather than only once
@@ -4323,6 +4394,33 @@ function renderRouteMapSection(card){
             el("div", {style:`flex:${mix.headPct}; background:var(--head);`})
           ])
         ]));
+      }
+      const halves = computeWindMixHalves();
+      // A first-vs-second split only means anything when BOTH halves have
+      // data. Short routes (point spacing >= route length, e.g. the 10km
+      // default) produce exactly one inter-point segment whose midpoint
+      // lands exactly at totalKm/2 — the half-open [fromKm, toKm) test in
+      // computeWindMixForRange puts that segment in the second half only,
+      // so `first` comes back null while `second` ends up holding the
+      // *entire* route's wind mix mislabeled as "2. Hälfte". Requiring both
+      // halves non-null avoids ever asserting that false split; when it's
+      // false, omit the block entirely (silent, matching this app's
+      // established convention for missing optional data elsewhere).
+      if(halves && halves.first && halves.second){
+        // Same mix as above, split at the route's distance midpoint — stacked
+        // vertically (not side-by-side) so each half keeps the full card
+        // width for its three stats, which stays readable down to ~375px.
+        const halfBlocks = [
+          el("div", {style:"margin-top:12px;"}, [
+            el("div", {style:"font-family:'IBM Plex Mono', monospace; font-size:10px; font-weight:700; color:var(--chalk-dim); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:8px;"}, ["1. Hälfte"]),
+            ...renderWindMixStatBlock(halves.first)
+          ]),
+          el("div", {style:"margin-top:12px;"}, [
+            el("div", {style:"font-family:'IBM Plex Mono', monospace; font-size:10px; font-weight:700; color:var(--chalk-dim); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:8px;"}, ["2. Hälfte"]),
+            ...renderWindMixStatBlock(halves.second)
+          ])
+        ];
+        card.appendChild(el("div", {style:"margin-top:14px; padding-top:14px; border-top:1px solid var(--line);"}, halfBlocks));
       }
       const ringsRow = renderRangeRingsRow();
       if(ringsRow) card.appendChild(ringsRow);
@@ -4536,10 +4634,15 @@ function mountRouteMap(){
   if(isNewRoute){
     if(leafletMapInstance) leafletMapInstance.remove();
     leafletMapInstance = L.map(container, { scrollWheelZoom:true });
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-      attribution: '&copy; OpenStreetMap Mitwirkende &copy; CARTO',
-      maxZoom: 20,
-      subdomains: 'abcd'
+    // CARTO retired its key-less raster basemap (basemaps.cartocdn.com) --
+    // every tile now renders an "API key required" watermark unless a
+    // registered CARTO API key is attached to the URL. Standard OSM tiles
+    // are the only major provider left that's genuinely free with no
+    // signup/key at all, so that's what this uses now.
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap Mitwirkende',
+      maxZoom: 19,
+      subdomains: 'abc'
     }).addTo(leafletMapInstance);
     routeMapLayers = L.layerGroup().addTo(leafletMapInstance);
     mountedRouteKey = key;
