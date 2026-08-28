@@ -793,19 +793,27 @@ let state = {
   // `!= null` (not `||`) so an explicit saved `false` survives a reload
   // instead of being coerced back to the true default.
   hideIrrelevantSegments: savedSettings.hideIrrelevantSegments != null ? savedSettings.hideIrrelevantSegments : true,
-  // Whether connecting (fresh OAuth or a stored-token revisit) should
-  // immediately auto-fetch activities/routes/starred segments, same as the
-  // app always did before this setting existed. `!= null` (not `||`) for the
-  // same reason as hideIrrelevantSegments above -- an explicit saved `false`
-  // must survive a reload. Defaults to true so every existing user with no
-  // saved setting keeps today's behavior unchanged. See connectWithCode()/
-  // init() for where this is read, and state.needsManualLoad below for the
-  // manual-mode flag it gates.
-  autoLoadOnVisit: savedSettings.autoLoadOnVisit != null ? savedSettings.autoLoadOnVisit : true,
-  // True right after connecting (OAuth or stored-token revisit) when
-  // autoLoadOnVisit is off, until the user clicks the "Daten laden" button
-  // (see renderManualLoadCard()) -- never persisted, always starts false.
-  needsManualLoad: false,
+  // Per-category whether connecting (fresh OAuth or a stored-token revisit)
+  // should immediately auto-fetch that category, same as the app always did
+  // before this setting existed. `!= null` (not `||`) for the same reason as
+  // hideIrrelevantSegments above -- an explicit saved `false` must survive a
+  // reload. Each falls back to the old single `autoLoadOnVisit` setting (pre-
+  // granular version of this same toggle) if present, then to `true`, so
+  // every existing user with no saved setting -- or only the old one -- keeps
+  // today's behavior unchanged. See loadActivitiesAndSegments() for where
+  // these are read, and state.needsManualLoad below for the per-category
+  // manual-mode flags they gate. "Aktivitäten" bundles the first activity's
+  // route/weather -- that step has no meaning without an activity list to
+  // pick from, so it isn't a fourth independent toggle.
+  autoLoadActivities: savedSettings.autoLoadActivities != null ? savedSettings.autoLoadActivities : (savedSettings.autoLoadOnVisit != null ? savedSettings.autoLoadOnVisit : true),
+  autoLoadSegments: savedSettings.autoLoadSegments != null ? savedSettings.autoLoadSegments : (savedSettings.autoLoadOnVisit != null ? savedSettings.autoLoadOnVisit : true),
+  autoLoadTraining: savedSettings.autoLoadTraining != null ? savedSettings.autoLoadTraining : (savedSettings.autoLoadOnVisit != null ? savedSettings.autoLoadOnVisit : true),
+  // True right after connecting (OAuth or stored-token revisit) for whichever
+  // categories' autoLoad-flag was off, until the user loads that category
+  // manually (see renderManualLoadCard() for "activities", and the segments/
+  // Profil pages' own load-prompt cards for the other two) -- never
+  // persisted, always starts all-false.
+  needsManualLoad: { activities:false, segments:false },
   // Startup-sequence progress state (see startupProgressBegin()/Step()/End()
   // and renderStartupProgressBar()) -- {step,total,label} while the connect/
   // revisit/manual-load chain is running, null otherwise. Declared here for
@@ -1931,7 +1939,9 @@ function saveSettings(){
       avgSpeedKmh: state.avgSpeedKmh,
       routePointDistanceKm: state.routePointDistanceKm,
       hideIrrelevantSegments: state.hideIrrelevantSegments,
-      autoLoadOnVisit: state.autoLoadOnVisit,
+      autoLoadActivities: state.autoLoadActivities,
+      autoLoadSegments: state.autoLoadSegments,
+      autoLoadTraining: state.autoLoadTraining,
       // Serialized as a plain array (JSON has no id-map type) and rebuilt
       // back into a {[id]: true} object on load — see state.
       // irrelevantSegmentIds' declaration above.
@@ -3665,10 +3675,14 @@ function render(){
     // screen. Only applies to the "route" page; "Meine Segmente" has its own
     // always-visible connect prompt inside renderSegmentsPage().
     app.appendChild(renderConnectCard());
-  } else if(state.connected && state.needsManualLoad){
-    // autoLoadOnVisit is off — connected, but nothing fetched yet. Shown
-    // instead of the normal route/segments cards until the user clicks
-    // "Daten laden" (see renderManualLoadCard()/loadActivitiesAndSegments()).
+  } else if(state.connected && state.needsManualLoad.activities){
+    // autoLoadActivities is off — connected, but no activity list fetched
+    // yet, and this page has nothing to show without one. Shown instead of
+    // the normal route card until the user clicks "Daten laden" (see
+    // renderManualLoadCard()/loadActivitiesAndSegments()). The other two
+    // categories (segments/training) don't gate this page — see their own
+    // pages' load-prompt cards instead (renderSegmentsCard(),
+    // renderProfilLoadPromptCard()).
     app.appendChild(renderManualLoadCard());
   } else {
     app.appendChild(renderRouteCard());
@@ -3845,7 +3859,7 @@ function renderStartupProgressBar(){
 async function connectWithCode(code){
   state.error = null;
   state.loading.connect = true;
-  startupProgressBegin(5);
+  startupProgressBegin(1 + autoLoadStepCount());
   startupProgressStep("Verbindung wird hergestellt…");
   render();
   try{
@@ -3854,11 +3868,7 @@ async function connectWithCode(code){
     state.athlete = tokenData.athlete;
     await saveToken(tokenData.refresh_token);
     state.connected = true;
-    if(state.autoLoadOnVisit){
-      await loadActivitiesAndSegments();
-    } else {
-      state.needsManualLoad = true;
-    }
+    await loadActivitiesAndSegments();
   }catch(e){
     state.error = e.message || "Verbindung fehlgeschlagen.";
   }
@@ -3867,42 +3877,29 @@ async function connectWithCode(code){
   render();
 }
 
-// Fetches activities + starred segments + Profil training data — the shared
-// back half of the startup sequence (steps 2-5: activities, first activity's
-// route/weather, segments+extras, training data), used by all three of
-// connectWithCode(), init()'s stored-token revisit branch, and the manual
-// "Daten laden" button (see renderManualLoadCard()) — plus the footnote's
-// own "Neu laden" link (renderFootnote()), which calls this directly.
-// `ownsProgress` tracks whether THIS call started the progress sequence
-// itself (a standalone reload, e.g. the "Neu laden" link, or the
-// manual-load button — total 4, no preceding token step) versus being
-// called after a caller already ran its own token-refresh step (total 5 set
-// by that caller) — only the call that started the sequence is responsible
-// for ending it, so a nested call here never cuts off a step the caller
-// still wants to show.
-//
-// The Profil training-data step (loadProfilData()) was missing from this
-// chain originally, even though "alle Daten (Trainingsdaten usw)" is
-// literally what the autoLoadOnVisit setting was requested for — without
-// it, riderProfile.mmpCurve never gets built automatically, which silently
-// starves the "Potential"-Chip on Meine Segmente (buildPotentialChip() just
-// omits the chip when there's no MMP curve, no visible error) unless the
-// user happened to separately open Profil and click "Trainingsdaten laden"
-// in the same session. loadProfilData() never throws (it catches its own
-// errors into pp.error for the Profil page to show), so no extra try/catch
-// is needed here, and it reuses pp.athleteDetail/the on-disk activity cache
-// when already populated, so repeat calls (e.g. via "Neu laden") stay cheap.
-//
-// Also always clears state.needsManualLoad once the chain completes — not
-// just from the manual-load card's own button — since renderFootnote()'s
-// "Neu laden" link reaches this function directly, bypassing that card
-// entirely; leaving the flag set after a footnote-triggered load would
-// strand the user on the manual-load card with freshly fetched data they
-// can't see (render() would just keep showing renderManualLoadCard()).
-async function loadActivitiesAndSegments(){
-  const ownsProgress = !state.startupProgress;
-  if(ownsProgress) startupProgressBegin(4);
+// How many progress-bar steps loadActivitiesAndSegments() will actually run,
+// given the three per-category autoLoad* flags (see state) — used to size
+// the shared startup-progress bar before it starts (connectWithCode(), the
+// stored-token revisit branch in init()) since the step count now depends on
+// which categories are enabled instead of always being the same fixed
+// number. "Aktivitäten" is worth 2 steps (activity list, then the first
+// activity's route/weather); segments and training are 1 step each.
+function autoLoadStepCount(){
+  return (state.autoLoadActivities ? 2 : 0) + (state.autoLoadSegments ? 1 : 0) + (state.autoLoadTraining ? 1 : 0);
+}
 
+// The three startup-sequence categories, each independently gated by its own
+// autoLoad* setting (see state) and independently triggerable by hand: this
+// function (the shared "everything enabled" chain), the manual "Daten
+// laden" button (activities — see renderManualLoadCard()), and the segments
+// page's own load-prompt card (see renderSegmentsCard()) call these
+// directly, unconditionally, regardless of the autoLoad flag — the flag only
+// decides whether loadActivitiesAndSegments() below calls them
+// automatically, not whether they CAN run. startupProgressStep() is a no-op
+// without an active state.startupProgress, so a standalone manual trigger
+// (no surrounding chain) just relies on the page's own state.loading.* flag
+// instead, same as before this split existed.
+async function loadActivitiesStep(){
   state.loading.activities = true;
   startupProgressStep("Lade Aktivitäten…"); render();
   try{
@@ -3913,7 +3910,9 @@ async function loadActivitiesAndSegments(){
     }
   }catch(e){ state.error = e.message; }
   state.loading.activities = false;
-
+  state.needsManualLoad.activities = false;
+}
+async function loadSegmentsStep(){
   state.loading.segments = true;
   startupProgressStep("Lade Segmente & Wind…"); render();
   try{
@@ -3921,29 +3920,92 @@ async function loadActivitiesAndSegments(){
     await loadSegmentExtras(state.segments, segmentBucket("starred"), Infinity);
   }catch(e){ state.error = e.message; }
   state.loading.segments = false;
-
+  state.needsManualLoad.segments = false;
+}
+// The Profil training-data step was missing from the automatic chain
+// originally, even though "alle Daten (Trainingsdaten usw)" is literally
+// what autoLoadOnVisit (this setting's pre-granular predecessor) was
+// requested for — without it, riderProfile.mmpCurve never got built
+// automatically, which silently starved the "Potential"-Chip on Meine
+// Segmente (buildPotentialChip() just omits the chip when there's no MMP
+// curve, no visible error) unless the user happened to separately open
+// Profil and click "Trainingsdaten laden" in the same session.
+// loadProfilData() never throws (it catches its own errors into pp.error
+// for the Profil page's existing load-prompt/error cards to show) and
+// reuses pp.athleteDetail/the on-disk activity cache when already
+// populated, so repeat calls (e.g. via "Neu laden") stay cheap — no separate
+// needsManualLoad flag needed for this category, pp.loaded already serves
+// that purpose for renderProfilLoadPromptCard().
+async function loadTrainingStep(){
   startupProgressStep("Lade Trainingsdaten…"); render();
   await loadProfilData(state.accessToken);
+}
+
+// Runs whichever of the three startup categories are enabled — used by
+// connectWithCode() and init()'s stored-token revisit branch (the only two
+// callers: both right after a fresh connect/revisit, when needsManualLoad is
+// still at its default all-false). `ownsProgress` tracks whether THIS call
+// started the progress sequence itself versus being called after a caller
+// already ran its own token-refresh step — only the call that started the
+// sequence is responsible for ending it, so a nested call here never cuts
+// off a step the caller still wants to show. A disabled category is marked
+// as needing a manual load instead (see the per-category load-prompt cards)
+// rather than being silently skipped.
+//
+// Deliberately NOT reused by the manual "Daten laden" button or the
+// footnote's "Neu laden" link (see renderManualLoadCard()/reloadAllData()
+// below) — both need to force-load a category regardless of its autoLoad*
+// flag (that's the whole point of a MANUAL load), whereas this function
+// respects the flags by design. Reusing it there would silently no-op a
+// disabled category's manual load button, or worse, re-flip an
+// already-manually-loaded category's needsManualLoad back to true.
+async function loadActivitiesAndSegments(){
+  const ownsProgress = !state.startupProgress;
+  if(ownsProgress) startupProgressBegin(autoLoadStepCount());
+
+  if(state.autoLoadActivities) await loadActivitiesStep();
+  else state.needsManualLoad.activities = true;
+
+  if(state.autoLoadSegments) await loadSegmentsStep();
+  else state.needsManualLoad.segments = true;
+
+  if(state.autoLoadTraining) await loadTrainingStep();
 
   if(ownsProgress) startupProgressEnd();
-  state.needsManualLoad = false;
   render();
 }
 
-// Shown in place of the normal route/segments content when connected but
-// state.needsManualLoad is set (autoLoadOnVisit is off — see connectWithCode()/
-// init()). Clicking "Daten laden" runs the exact same loadActivitiesAndSegments()
-// chain the automatic path uses (progress bar included); that chain itself
-// clears the flag once done (see its own comment above), so render() switches
-// back to the normal connected view without any extra bookkeeping here.
+// Unconditionally re-runs all three categories, ignoring the autoLoad*
+// flags entirely — used by the footnote's "Neu laden" link (see
+// renderFootnote()), a manual "refresh everything now" action that must
+// work the same way regardless of what's set to auto-load on connect.
+async function reloadAllData(){
+  const ownsProgress = !state.startupProgress;
+  if(ownsProgress) startupProgressBegin(4);
+  await loadActivitiesStep();
+  await loadSegmentsStep();
+  await loadTrainingStep();
+  if(ownsProgress) startupProgressEnd();
+  render();
+}
+
+// Shown in place of the normal route content when connected but
+// state.needsManualLoad.activities is set (autoLoadActivities is off — see
+// connectWithCode()/init()) — the route page has nothing to show without an
+// activity list, unlike the segments/Profil pages, which have their own
+// load-prompt cards and don't need this global gate. Clicking "Daten laden"
+// calls loadActivitiesStep() directly (NOT loadActivitiesAndSegments() —
+// see its comment above for why), which is sufficient on its own: any OTHER
+// enabled category was already loaded automatically during connect, since
+// this card only gates on needsManualLoad.activities.
 function renderManualLoadCard(){
   const card = pageTitleCard("Verbunden");
   card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [
-    "Automatisches Laden ist deaktiviert (siehe Einstellungen). Lade Aktivitäten, Routen, markierte Segmente und Trainingsdaten jetzt manuell."
+    "Automatisches Laden von Aktivitäten & Route ist deaktiviert (siehe Einstellungen). Lade sie jetzt manuell."
   ]));
-  const loading = state.loading.activities || state.loading.segments;
+  const loading = state.loading.activities;
   const btn = el("button", {class:"btn", style:"width:100%;", onclick: ()=>{
-    loadActivitiesAndSegments();
+    loadActivitiesStep().then(render);
   }}, [loading ? "Lade…" : "Daten laden"]);
   if(loading) btn.disabled = true;
   card.appendChild(btn);
@@ -5637,6 +5699,16 @@ function renderSegmentsCard(){
     card.appendChild(el("div", {class:"loading"}, ["Lade Segmente & Wind…"]));
     return card;
   }
+  // autoLoadSegments is off (see Einstellungen) and nothing's been fetched
+  // yet -- distinct from the genuine "no starred segments" empty-state below,
+  // which would otherwise wrongly claim the athlete has none.
+  if(state.needsManualLoad.segments){
+    card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [
+      "Automatisches Laden ist deaktiviert (siehe Einstellungen)."
+    ]));
+    card.appendChild(el("button", {class:"btn", style:"width:100%;", onclick: ()=>{ loadSegmentsStep().then(render); }}, ["Segmente laden"]));
+    return card;
+  }
   if(!state.segments.length){
     card.appendChild(el("div", {class:"empty-state"}, ["Keine markierten (gesternten) Segmente gefunden."]));
     return card;
@@ -6831,7 +6903,7 @@ function renderAktivitaetenPage(){
 function renderFootnote(){
   return el("div", {class:"footnote"}, [
     "Wetterdaten: Open-Meteo. Wind wird an ausgewählten Punkten entlang der Strecke bzw. am Startpunkt jedes Segments abgefragt und mit der Streckenrichtung verglichen. ",
-    state.connected ? el("a", {href:"#", onclick:(e)=>{e.preventDefault(); loadActivitiesAndSegments();}}, ["Neu laden"]) : ""
+    state.connected ? el("a", {href:"#", onclick:(e)=>{e.preventDefault(); reloadAllData();}}, ["Neu laden"]) : ""
   ]);
 }
 
@@ -11567,19 +11639,27 @@ function renderEinstellungenPage(){
   frag.appendChild(headerCard);
 
   // Same renderToggleSwitch() convention as the "Nicht relevante Segmente
-  // ausblenden" toggle on the segment pages (see there), just a different
-  // backing field (state.autoLoadOnVisit — see connectWithCode()/init()'s
-  // stored-token branch for where it's read, and render()'s
-  // needsManualLoad branch for what changes when it's off).
+  // ausblenden" toggle on the segment pages (see there) — one per startup
+  // category (see state.autoLoadActivities/autoLoadSegments/autoLoadTraining
+  // and loadActivitiesAndSegments()/autoLoadStepCount() for where they're
+  // read). A disabled category shows its own load-prompt instead: the route
+  // page for "Aktivitäten & Route" (render()'s needsManualLoad.activities
+  // branch → renderManualLoadCard()), the segments list for "Segmente"
+  // (renderSegmentsCard()), and the existing "Trainingsdaten laden" prompt
+  // on the Profil page for "Trainingsdaten" (unchanged — it already worked
+  // this way before autoLoadTraining existed).
   const autoLoadCard = el('div', {class:'card'});
   autoLoadCard.appendChild(el('h2', {}, ['Datenladen']));
-  autoLoadCard.appendChild(renderToggleSwitch(
-    state.autoLoadOnVisit,
-    "Daten beim Besuch automatisch laden",
-    ()=>{ state.autoLoadOnVisit = !state.autoLoadOnVisit; saveSettings(); render(); }
+  const autoLoadToggle = (field, label) => autoLoadCard.appendChild(renderToggleSwitch(
+    state[field],
+    label,
+    ()=>{ state[field] = !state[field]; saveSettings(); render(); }
   ));
+  autoLoadToggle('autoLoadActivities', "Aktivitäten & Route automatisch laden");
+  autoLoadToggle('autoLoadSegments', "Markierte Segmente automatisch laden");
+  autoLoadToggle('autoLoadTraining', "Trainingsdaten automatisch laden");
   autoLoadCard.appendChild(el('div', {class:'muted', style:'font-size:12px; margin-top:-6px;'}, [
-    'Wenn deaktiviert, werden Aktivitäten, Routen, markierte Segmente und Trainingsdaten nach dem Verbinden nicht automatisch geladen — stattdessen erscheint ein „Daten laden"-Button.'
+    'Wenn eine Kategorie deaktiviert ist, wird sie nach dem Verbinden nicht automatisch geladen — stattdessen erscheint an ihrer Stelle ein „laden"-Button.'
   ]));
   frag.appendChild(autoLoadCard);
 
@@ -11645,7 +11725,7 @@ async function init(){
     const stored = await loadStoredToken();
     if(stored){
       state.loading.connect = true;
-      startupProgressBegin(5);
+      startupProgressBegin(1 + autoLoadStepCount());
       startupProgressStep("Token wird aktualisiert…");
       render();
       try{
@@ -11653,11 +11733,7 @@ async function init(){
         state.accessToken = tokenData.access_token;
         await saveToken(tokenData.refresh_token);
         state.connected = true;
-        if(state.autoLoadOnVisit){
-          await loadActivitiesAndSegments();
-        } else {
-          state.needsManualLoad = true;
-        }
+        await loadActivitiesAndSegments();
       }catch(e){
         // stored token invalid, stay on connect screen
       }
