@@ -2403,32 +2403,27 @@ function gearWearStatus(totalDistanceM, resetKm, intervalKm){
 // interpolated, then scaled by weight/terrain/tubeless/wheel factors. Front
 // wheel, road terrain, non-tubeless, 75kg total weight is the reference
 // point the table itself is expressed in.
-const TIRE_WIDTH_BASE_PRESSURE_TABLE = [
-  [23, 7.5], [25, 7.0], [28, 6.0], [32, 5.0], [35, 4.5],
-  [38, 4.0], [42, 3.5], [47, 3.0], [50, 2.7], [55, 2.3]
-];
-function basePressureForWidth(widthMm){
-  const table = TIRE_WIDTH_BASE_PRESSURE_TABLE;
-  if(widthMm <= table[0][0]) return table[0][1];
-  if(widthMm >= table[table.length - 1][0]) return table[table.length - 1][1];
-  for(let i = 0; i < table.length - 1; i++){
-    const [w0, p0] = table[i], [w1, p1] = table[i + 1];
-    if(widthMm >= w0 && widthMm <= w1){
-      const t = (widthMm - w0) / (w1 - w0);
-      return p0 + t * (p1 - p0);
-    }
-  }
-  return table[table.length - 1][1]; // unreachable given the clamps above
-}
+//
+// Power-law shape (pressure falls off with width faster than it rises with
+// weight) fitted against real recommendations pulled from SRAM's tire
+// pressure calculator (4 data points: 35mm/47mm width at 93.4kg and 47mm at
+// 69.4kg system weight, hooked/tubed) -- an earlier hand-guessed lookup
+// table ran ~40-60% too high compared to that reference. WIDTH_EXPONENT and
+// WEIGHT_EXPONENT and BASE_COEFFICIENT are the fitted constants; matches
+// SRAM's own numbers to within ~1%.
+const TIRE_PRESSURE_BASE_COEFFICIENT = 46.1;
+const TIRE_PRESSURE_WIDTH_EXPONENT = 1.3;
+const TIRE_PRESSURE_WEIGHT_EXPONENT = 0.45;
 // Pure, DOM/state-free by design (see project test convention) -- `wheel` is
 // 'front'|'rear', `terrain` is 'road'|'gravel'|'offroad'.
 function computeTargetPressureBar({ riderWeightKg, bikeWeightKg, tireWidthMm, tubeless, terrain, wheel }){
-  const base = basePressureForWidth(tireWidthMm);
-  const weightFactor = (riderWeightKg + bikeWeightKg) / 75;
+  const clampedWidth = Math.min(55, Math.max(23, tireWidthMm));
+  const widthFactor = Math.pow(clampedWidth, -TIRE_PRESSURE_WIDTH_EXPONENT);
+  const weightFactor = Math.pow(riderWeightKg + bikeWeightKg, TIRE_PRESSURE_WEIGHT_EXPONENT);
   const terrainFactor = terrain === 'gravel' ? 0.85 : (terrain === 'offroad' ? 0.7 : 1.0);
   const tubelessFactor = tubeless ? 0.9 : 1.0;
-  const wheelFactor = wheel === 'rear' ? 1.1 : 1.0;
-  const raw = base * weightFactor * terrainFactor * tubelessFactor * wheelFactor;
+  const wheelFactor = wheel === 'rear' ? 1.065 : 1.0;
+  const raw = TIRE_PRESSURE_BASE_COEFFICIENT * widthFactor * weightFactor * terrainFactor * tubelessFactor * wheelFactor;
   const clamped = Math.min(9.0, Math.max(1.5, raw));
   return Math.round(clamped * 10) / 10;
 }

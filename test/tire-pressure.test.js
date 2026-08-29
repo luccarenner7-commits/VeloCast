@@ -18,85 +18,123 @@ const { loadApp } = require('./support/loadApp.js');
 // computeTargetPressureBar({riderWeightKg, bikeWeightKg, tireWidthMm, tubeless, terrain, wheel})
 // ---------------------------------------------------------------------
 test('computeTargetPressureBar', async (t) => {
-  await t.test('exact table breakpoint: 25mm, 75kg total, road, non-tubeless, front -> 7.0 bar exactly', () => {
+  await t.test('25mm, 75kg total, road, non-tubeless, front -> 4.9 bar', () => {
     const { get } = loadApp();
     const computeTargetPressureBar = get('computeTargetPressureBar');
     const result = computeTargetPressureBar({ riderWeightKg: 70, bikeWeightKg: 5, tireWidthMm: 25, tubeless: false, terrain: 'road', wheel: 'front' });
-    assert.equal(result, 7.0);
+    assert.equal(result, 4.9);
   });
 
-  await t.test('interpolated value between two breakpoints: 30mm (halfway between 28mm/6.0 and 32mm/5.0) -> 5.5 bar', () => {
+  await t.test('width falls off faster than linear: 30mm, 75kg, road, front -> 3.9 bar', () => {
     const { get } = loadApp();
     const computeTargetPressureBar = get('computeTargetPressureBar');
     const result = computeTargetPressureBar({ riderWeightKg: 70, bikeWeightKg: 5, tireWidthMm: 30, tubeless: false, terrain: 'road', wheel: 'front' });
-    assert.equal(result, 5.5);
+    assert.equal(result, 3.9);
   });
 
-  await t.test('weight-scaled: 25mm base 7.0, 90kg total (weight factor 1.2) -> 8.4 bar', () => {
+  await t.test('weight-scaled (sub-linear): 25mm, 90kg total instead of 75kg -> 5.3 bar', () => {
     const { get } = loadApp();
     const computeTargetPressureBar = get('computeTargetPressureBar');
     const result = computeTargetPressureBar({ riderWeightKg: 85, bikeWeightKg: 5, tireWidthMm: 25, tubeless: false, terrain: 'road', wheel: 'front' });
-    assert.equal(result, 8.4);
+    assert.equal(result, 5.3);
   });
 
-  await t.test('terrain factor: gravel (x0.85) on 32mm/75kg base 5.0 -> 4.3 bar', () => {
+  await t.test('terrain factor: gravel (x0.85) on 32mm/75kg -> 3.0 bar', () => {
     const { get } = loadApp();
     const computeTargetPressureBar = get('computeTargetPressureBar');
     const result = computeTargetPressureBar({ riderWeightKg: 70, bikeWeightKg: 5, tireWidthMm: 32, tubeless: false, terrain: 'gravel', wheel: 'front' });
-    assert.equal(result, 4.3);
+    assert.equal(result, 3.0);
   });
 
-  await t.test('terrain factor: offroad (x0.7) on 32mm/75kg base 5.0 -> 3.5 bar', () => {
+  await t.test('terrain factor: offroad (x0.7) on 32mm/75kg -> 2.5 bar', () => {
     const { get } = loadApp();
     const computeTargetPressureBar = get('computeTargetPressureBar');
     const result = computeTargetPressureBar({ riderWeightKg: 70, bikeWeightKg: 5, tireWidthMm: 32, tubeless: false, terrain: 'offroad', wheel: 'front' });
-    assert.equal(result, 3.5);
+    assert.equal(result, 2.5);
   });
 
-  await t.test('tubeless factor: 25mm/75kg/road tubeless (x0.9) -> 6.3 bar', () => {
+  await t.test('tubeless factor: 25mm/75kg/road tubeless (x0.9) -> 4.4 bar', () => {
     const { get } = loadApp();
     const computeTargetPressureBar = get('computeTargetPressureBar');
     const result = computeTargetPressureBar({ riderWeightKg: 70, bikeWeightKg: 5, tireWidthMm: 25, tubeless: true, terrain: 'road', wheel: 'front' });
-    assert.equal(result, 6.3);
+    assert.equal(result, 4.4);
   });
 
-  await t.test('wheel factor: rear (x1.1) on the same 25mm/75kg/road/non-tubeless setup as the front breakpoint test -> 7.7 bar', () => {
+  await t.test('wheel factor: rear (x1.065) on the same 25mm/75kg/road/non-tubeless setup as the front test -> 5.2 bar', () => {
     const { get } = loadApp();
     const computeTargetPressureBar = get('computeTargetPressureBar');
     const front = computeTargetPressureBar({ riderWeightKg: 70, bikeWeightKg: 5, tireWidthMm: 25, tubeless: false, terrain: 'road', wheel: 'front' });
     const rear = computeTargetPressureBar({ riderWeightKg: 70, bikeWeightKg: 5, tireWidthMm: 25, tubeless: false, terrain: 'road', wheel: 'rear' });
-    assert.equal(front, 7.0);
-    assert.equal(rear, 7.7);
+    assert.equal(front, 4.9);
+    assert.equal(rear, 5.2);
   });
 
-  await t.test('width clamp: below 23mm clamps to the 23mm table endpoint (7.5 bar base)', () => {
+  await t.test('width clamp: below 23mm clamps to the 23mm endpoint -> 5.5 bar', () => {
     const { get } = loadApp();
     const computeTargetPressureBar = get('computeTargetPressureBar');
     const result = computeTargetPressureBar({ riderWeightKg: 70, bikeWeightKg: 5, tireWidthMm: 10, tubeless: false, terrain: 'road', wheel: 'front' });
-    assert.equal(result, 7.5);
+    assert.equal(result, 5.5);
   });
 
-  await t.test('width clamp: above 55mm clamps to the 55mm table endpoint (2.3 bar base)', () => {
+  await t.test('width clamp: above 55mm clamps to the 55mm endpoint -> 1.8 bar', () => {
     const { get } = loadApp();
     const computeTargetPressureBar = get('computeTargetPressureBar');
     const result = computeTargetPressureBar({ riderWeightKg: 70, bikeWeightKg: 5, tireWidthMm: 70, tubeless: false, terrain: 'road', wheel: 'front' });
-    assert.equal(result, 2.3);
+    assert.equal(result, 1.8);
   });
 
   await t.test('final clamp: an extreme heavy rider pushes the raw result above 9.0 -> clamped to 9.0', () => {
     const { get } = loadApp();
     const computeTargetPressureBar = get('computeTargetPressureBar');
-    // 23mm base 7.5, total weight 170kg -> weight factor ~2.27, raw ~17.0
-    const result = computeTargetPressureBar({ riderWeightKg: 150, bikeWeightKg: 20, tireWidthMm: 23, tubeless: false, terrain: 'road', wheel: 'front' });
+    const result = computeTargetPressureBar({ riderWeightKg: 400, bikeWeightKg: 50, tireWidthMm: 23, tubeless: false, terrain: 'road', wheel: 'front' });
     assert.equal(result, 9.0);
   });
 
   await t.test('final clamp: an extreme light rider pushes the raw result below 1.5 -> clamped to 1.5', () => {
     const { get } = loadApp();
     const computeTargetPressureBar = get('computeTargetPressureBar');
-    // 55mm base 2.3, total weight 20kg -> weight factor ~0.267, raw ~0.61
     const result = computeTargetPressureBar({ riderWeightKg: 15, bikeWeightKg: 5, tireWidthMm: 55, tubeless: false, terrain: 'road', wheel: 'front' });
     assert.equal(result, 1.5);
+  });
+
+  // Real-world calibration: values from SRAM's published tire pressure
+  // calculator (hooked/tubed unless noted), 84kg/9.4kg or 60kg/9.4kg
+  // rider/bike, road. Our formula was fitted to these and should land
+  // within a rounding step.
+  await t.test('SRAM calibration: 35mm, 84kg+9.4kg, tubed -> front 3.5, rear 3.7 (SRAM: 3.49/3.71)', () => {
+    const { get } = loadApp();
+    const computeTargetPressureBar = get('computeTargetPressureBar');
+    const front = computeTargetPressureBar({ riderWeightKg: 84, bikeWeightKg: 9.4, tireWidthMm: 35, tubeless: false, terrain: 'road', wheel: 'front' });
+    const rear = computeTargetPressureBar({ riderWeightKg: 84, bikeWeightKg: 9.4, tireWidthMm: 35, tubeless: false, terrain: 'road', wheel: 'rear' });
+    assert.equal(front, 3.5);
+    assert.equal(rear, 3.7);
+  });
+
+  await t.test('SRAM calibration: 47mm, 84kg+9.4kg, tubed -> front 2.4, rear 2.5 (SRAM: 2.39/2.55)', () => {
+    const { get } = loadApp();
+    const computeTargetPressureBar = get('computeTargetPressureBar');
+    const front = computeTargetPressureBar({ riderWeightKg: 84, bikeWeightKg: 9.4, tireWidthMm: 47, tubeless: false, terrain: 'road', wheel: 'front' });
+    const rear = computeTargetPressureBar({ riderWeightKg: 84, bikeWeightKg: 9.4, tireWidthMm: 47, tubeless: false, terrain: 'road', wheel: 'rear' });
+    assert.equal(front, 2.4);
+    assert.equal(rear, 2.5);
+  });
+
+  await t.test('SRAM calibration: 47mm, 60kg+9.4kg, tubed -> front 2.1, rear 2.2 (SRAM: 2.10/2.23)', () => {
+    const { get } = loadApp();
+    const computeTargetPressureBar = get('computeTargetPressureBar');
+    const front = computeTargetPressureBar({ riderWeightKg: 60, bikeWeightKg: 9.4, tireWidthMm: 47, tubeless: false, terrain: 'road', wheel: 'front' });
+    const rear = computeTargetPressureBar({ riderWeightKg: 60, bikeWeightKg: 9.4, tireWidthMm: 47, tubeless: false, terrain: 'road', wheel: 'rear' });
+    assert.equal(front, 2.1);
+    assert.equal(rear, 2.2);
+  });
+
+  await t.test('SRAM calibration: 35mm, 84kg+9.4kg, tubeless -> front 3.1, rear 3.3 (SRAM: 3.17/3.38)', () => {
+    const { get } = loadApp();
+    const computeTargetPressureBar = get('computeTargetPressureBar');
+    const front = computeTargetPressureBar({ riderWeightKg: 84, bikeWeightKg: 9.4, tireWidthMm: 35, tubeless: true, terrain: 'road', wheel: 'front' });
+    const rear = computeTargetPressureBar({ riderWeightKg: 84, bikeWeightKg: 9.4, tireWidthMm: 35, tubeless: true, terrain: 'road', wheel: 'rear' });
+    assert.equal(front, 3.1);
+    assert.equal(rear, 3.3);
   });
 });
 
