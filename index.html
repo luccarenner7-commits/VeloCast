@@ -899,7 +899,7 @@ let state = {
   // and at the start of every ensureRideSegments() run (retry).
   routeSegmentsError: null,
   navOpen: false, // left slide-in nav drawer open/closed
-  activePage: "route", // "route" | "segments" | "profil" | "aktivitaeten" | "trainer" | "einstellungen" - which NAV_ITEMS entry is active
+  activePage: "route", // "route" | "segments" | "profil" | "aktivitaeten" | "trainer" | "einstellungen" | "reifendruck" | "changelog" - which NAV_ITEMS entry is active
   routeSourceTab: "activities", // "routes" | "activities" | "gpx"
   stravaRoutes: [], // saved/planned Strava routes, fetched lazily when that tab opens
   routeInfoTab: "elevation", // "elevation" | "climbs" | "beststart"
@@ -1039,7 +1039,19 @@ let state = {
     // hrProfile above -- only runs in equipmentMode==='hr', so power users
     // see zero change.
     blendedLoad: { loading:false, loaded:false, error:null, activities:null, fetchedAt:0 }
-  }
+  },
+  // Reifendruckrechner mit Reminder -- loaded from localStorage in init()
+  // (loadTirePressureData(), see TIRE_PRESSURE_KEY) rather than inline here,
+  // since the load helper isn't defined until later in the file (top-level
+  // `let state = {...}` runs before that point). tirePressureReminder is set
+  // once at startup ({front:bool, rear:bool} | null, see
+  // computeTirePressureReminder()); tirePressureReminderDismissed is a
+  // session-only flag (never persisted) so dismissing the banner just clears
+  // it for the current page load, matching the feature's "no real push
+  // notification, no dismissal tracking" scope.
+  tirePressure: null,
+  tirePressureReminder: null,
+  tirePressureReminderDismissed: false
 };
 
 function el(tag, attrs, children){
@@ -1615,8 +1627,8 @@ function statBlock(value, label, alignRight){
     el("div", {class:"sb-l"}, [label])
   ]);
 }
-function statChip(value, label, style){
-  return el("div", {class:"stat-chip", style: style || null}, [
+function statChip(value, label, style, id){
+  return el("div", {class:"stat-chip", style: style || null, id: id || null}, [
     el("div", {class:"v"}, [value]),
     el("div", {class:"l"}, [label])
   ]);
@@ -2383,6 +2395,133 @@ function gearWearStatus(totalDistanceM, resetKm, intervalKm){
   const pct = intervalKm > 0 ? sinceKm/intervalKm*100 : 0;
   const level = pct >= 100 ? "danger" : (pct >= 80 ? "warn" : "good");
   return { sinceKm, pct: Math.min(999, pct), level };
+}
+
+// ---------- Reifendruckrechner mit Reminder ----------
+// Deliberately simple, explainable reference-table model (not a "real"
+// calibrated formula) -- base pressure by tire width in mm, linearly
+// interpolated, then scaled by weight/terrain/tubeless/wheel factors. Front
+// wheel, road terrain, non-tubeless, 75kg total weight is the reference
+// point the table itself is expressed in.
+const TIRE_WIDTH_BASE_PRESSURE_TABLE = [
+  [23, 7.5], [25, 7.0], [28, 6.0], [32, 5.0], [35, 4.5],
+  [38, 4.0], [42, 3.5], [47, 3.0], [50, 2.7], [55, 2.3]
+];
+function basePressureForWidth(widthMm){
+  const table = TIRE_WIDTH_BASE_PRESSURE_TABLE;
+  if(widthMm <= table[0][0]) return table[0][1];
+  if(widthMm >= table[table.length - 1][0]) return table[table.length - 1][1];
+  for(let i = 0; i < table.length - 1; i++){
+    const [w0, p0] = table[i], [w1, p1] = table[i + 1];
+    if(widthMm >= w0 && widthMm <= w1){
+      const t = (widthMm - w0) / (w1 - w0);
+      return p0 + t * (p1 - p0);
+    }
+  }
+  return table[table.length - 1][1]; // unreachable given the clamps above
+}
+// Pure, DOM/state-free by design (see project test convention) -- `wheel` is
+// 'front'|'rear', `terrain` is 'road'|'gravel'|'offroad'.
+function computeTargetPressureBar({ riderWeightKg, bikeWeightKg, tireWidthMm, tubeless, terrain, wheel }){
+  const base = basePressureForWidth(tireWidthMm);
+  const weightFactor = (riderWeightKg + bikeWeightKg) / 75;
+  const terrainFactor = terrain === 'gravel' ? 0.85 : (terrain === 'offroad' ? 0.7 : 1.0);
+  const tubelessFactor = tubeless ? 0.9 : 1.0;
+  const wheelFactor = wheel === 'rear' ? 1.1 : 1.0;
+  const raw = base * weightFactor * terrainFactor * tubelessFactor * wheelFactor;
+  const clamped = Math.min(9.0, Math.max(1.5, raw));
+  return Math.round(clamped * 10) / 10;
+}
+
+// Loss-rate learning: sparse, manually-entered data (a rider measures maybe
+// once every few rides) doesn't support anything fancier than an EMA of
+// observed rates -- see task brief.
+function computeLossRateBarPerDay(priorBar, measuredBar, hoursElapsed){
+  if(!(hoursElapsed > 0)) return null; // guards hoursElapsed<=0 and NaN in one comparison
+  return (priorBar - measuredBar) / (hoursElapsed / 24);
+}
+// Sanity-clamp range for a single measured rate before it's allowed to move
+// the learned average: 0 is the floor (a "gain" reading is a bad/mistimed
+// measurement, not negative loss -- e.g. topping up mid-week); 3 bar/day is
+// already a blatant leak, so anything above that is almost certainly a
+// fat-fingered manual entry rather than a real data point, and letting it
+// through unclamped would let one typo dominate the EMA for a long time.
+function updateLearnedRateBarPerDay(oldRate, newMeasuredRate, alpha = 0.3){
+  const clamped = Math.min(3, Math.max(0, newMeasuredRate));
+  return alpha * clamped + (1 - alpha) * oldRate;
+}
+function estimateCurrentPressureBar(lastBaselineBar, lastBaselineAtMs, learnedRateBarPerDay, nowMs){
+  const daysElapsed = (nowMs - lastBaselineAtMs) / 86400000;
+  return Math.max(0, lastBaselineBar - learnedRateBarPerDay * daysElapsed);
+}
+function isPressureLow(estimatedBar, targetBar, thresholdPercent){
+  return estimatedBar < targetBar * (thresholdPercent / 100);
+}
+
+// Reasonable generic default for a clincher road tire, used only until the
+// wheel has at least one real "Nachmessen"-derived data point.
+const TIRE_PRESSURE_DEFAULT_RATE_BAR_PER_DAY = 0.15;
+const TIRE_PRESSURE_KEY = 'velocast_tire_pressure';
+function defaultTireWheelData(){
+  return { lastBaselineBar: null, lastBaselineAtMs: null, learnedRateBarPerDay: TIRE_PRESSURE_DEFAULT_RATE_BAR_PER_DAY, history: [] };
+}
+function defaultTirePressureData(){
+  return {
+    settings: { riderWeightKg: null, bikeWeightKg: null, tireWidthMm: null, tubeless: false, terrain: 'road', reminderThresholdPercent: 85 },
+    front: defaultTireWheelData(),
+    rear: defaultTireWheelData()
+  };
+}
+// Same read-helper convention as loadGearResets()/loadConfigOverrides()
+// above: any failure (missing key, corrupt JSON, wrong shape) silently falls
+// back to a safe default instead of throwing into render().
+function loadTirePressureData(){
+  try{
+    const raw = localStorage.getItem(TIRE_PRESSURE_KEY);
+    if(raw){
+      const parsed = JSON.parse(raw);
+      if(parsed && typeof parsed === 'object'){
+        const out = defaultTirePressureData();
+        if(parsed.settings && typeof parsed.settings === 'object') Object.assign(out.settings, parsed.settings);
+        ['front', 'rear'].forEach(wheel => {
+          if(parsed[wheel] && typeof parsed[wheel] === 'object'){
+            out[wheel] = Object.assign(defaultTireWheelData(), parsed[wheel]);
+            if(!Array.isArray(out[wheel].history)) out[wheel].history = [];
+          }
+        });
+        return out;
+      }
+    }
+  }catch(e){}
+  return defaultTirePressureData();
+}
+// Cap history to the last 50 entries, same pattern as saveTrainerHistory()'s
+// .slice(-100) -- nothing in the UI shows full history, this is just to keep
+// localStorage from growing unboundedly.
+function saveTirePressureData(data){
+  try{
+    ['front', 'rear'].forEach(wheel => { data[wheel].history = data[wheel].history.slice(-50); });
+    localStorage.setItem(TIRE_PRESSURE_KEY, JSON.stringify(data));
+  }catch(e){}
+}
+// Startup check (see init()): {front, rear} booleans, both false if settings
+// aren't filled in yet or a wheel has no baseline yet -- computeTargetPressureBar
+// can't run without riderWeightKg/bikeWeightKg/tireWidthMm.
+function computeTirePressureReminder(data){
+  const s = data.settings;
+  const result = { front: false, rear: false };
+  const settingsReady = isFinite(s.riderWeightKg) && s.riderWeightKg > 0
+    && isFinite(s.bikeWeightKg) && s.bikeWeightKg > 0
+    && isFinite(s.tireWidthMm) && s.tireWidthMm > 0;
+  if(!settingsReady) return result;
+  ['front', 'rear'].forEach(wheel => {
+    const w = data[wheel];
+    if(w.lastBaselineBar == null || w.lastBaselineAtMs == null) return;
+    const target = computeTargetPressureBar({ riderWeightKg: s.riderWeightKg, bikeWeightKg: s.bikeWeightKg, tireWidthMm: s.tireWidthMm, tubeless: s.tubeless, terrain: s.terrain, wheel });
+    const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateBarPerDay, Date.now());
+    result[wheel] = isPressureLow(estimated, target, s.reminderThresholdPercent);
+  });
+  return result;
 }
 
 // ---------- Profil: per-ride estimation math ----------
@@ -3374,6 +3513,7 @@ const NAV_ITEMS = [
   {id:"aktivitaeten", label:"Aktivitäten"},
   {id:"trainer", label:"Trainer"},
   {id:"einstellungen", label:"Einstellungen"},
+  {id:"reifendruck", label:"Reifendruck"},
   {id:"changelog", label:"Änderungen"}
 ];
 
@@ -3396,6 +3536,9 @@ const CHANGELOG_SEEN_KEY = 'velocast_changelog_seen';
 // rather than showing an empty section.
 const CHANGELOG = [
   { date:'29.08.2026',
+    features:[
+      'Neue Seite „Reifendruck": berechnet einen empfohlenen Zieldruck getrennt für Vorder- und Hinterrad, merkt sich das letzte Aufpumpen und lernt aus „Nachmessen & neu aufpumpen"-Einträgen, wie schnell die Reifen Luft verlieren — inklusive Hinweis-Banner, wenn der geschätzte aktuelle Druck vermutlich unter der eingestellten Schwelle liegt.',
+    ],
     fixes:[
       'Datum/Uhrzeit-Auswahl auf Desktop: Zahleneingabe sprang sofort ins nächste Feld, sodass sich z.B. „15" nicht als Stunde eintippen ließ (nur die „1" kam an) — jede Änderung löste sofort einen Seiten-Neuaufbau aus, der das Feld mitten in der Eingabe zurücksetzte. Die Auswertung wartet jetzt kurz, bis wirklich nichts mehr getippt wird.',
     ]},
@@ -3696,6 +3839,8 @@ function render(){
   app.innerHTML = "";
   app.appendChild(renderBrand());
   renderNavDrawer().forEach(n => app.appendChild(n));
+  const tirePressureBanner = renderTirePressureBanner();
+  if(tirePressureBanner) app.appendChild(tirePressureBanner);
 
   if(state.activePage === "segments"){
     app.appendChild(renderSegmentsPage());
@@ -3707,6 +3852,8 @@ function render(){
     app.appendChild(renderTrainerPage());
   } else if(state.activePage === "einstellungen"){
     app.appendChild(renderEinstellungenPage());
+  } else if(state.activePage === "reifendruck"){
+    app.appendChild(renderReifendruckPage());
   } else if(state.activePage === "changelog"){
     app.appendChild(renderChangelogPage());
   } else if(!state.connected && !state.fullRouteCoords.length){
@@ -11754,8 +11901,326 @@ function renderEinstellungenPage(){
   return frag;
 }
 
+// ---------- Reifendruck page ----------
+// One number-input field row, styled like settingsFieldRow() but bound to
+// state.tirePressure.settings directly instead of TRAINING_CONFIG (a
+// separate, unrelated settings object) -- onchange (not oninput) so a full
+// render() while the rider is mid-keystroke never happens, same reasoning as
+// settingsFieldRow() itself.
+//
+// `defaultValue` (optional): rider/bike weight and tire width legitimately
+// go back to `null` when cleared -- that's exactly what gates the
+// "Fahrergewicht, Radgewicht und Reifenbreite eingeben..." empty state, a
+// normal, visible, recoverable state. reminderThresholdPercent is different:
+// it's not shown anywhere as "incomplete", it just silently multiplies into
+// isPressureLow()'s comparison (targetBar * (threshold/100)). If it were
+// allowed to become null there, isPressureLow() would compare against 0 and
+// the startup low-pressure reminder would silently stop firing forever with
+// no visible sign why. So the threshold call site below passes a hard
+// default (85, matching TIRE_PRESSURE defaults) and, on invalid/cleared
+// input, resets both the stored value and the input's displayed value to
+// it -- same reset-and-reflect-in-the-DOM pattern as settingsFieldRow()
+// (index.html ~11521). Callers that don't pass defaultValue keep the old
+// null-on-invalid behavior.
+function tirePressureNumberRow(data, key, label, unit, step, defaultValue){
+  const s = data.settings;
+  const id = 'tp-' + key;
+  const input = el('input', {type:'number', id, step: step || 1, min: '0', value: s[key] != null ? s[key] : '', onchange: (e) => {
+    const v = parseFloat(e.target.value);
+    if(isFinite(v) && v > 0){
+      s[key] = v;
+    } else if(defaultValue != null){
+      s[key] = defaultValue;
+      e.target.value = defaultValue;
+    } else {
+      s[key] = null;
+    }
+    saveTirePressureData(data);
+    state.tirePressureReminder = computeTirePressureReminder(data);
+    // Deliberately NOT render(): a full render() tears down and rebuilds the
+    // entire #app DOM, which would destroy the very input node under the
+    // rider's cursor mid-interaction (a number input's spinner-arrow click
+    // fires `change` immediately, before the click sequence finishes) and
+    // close any currently-open infoButton() popover elsewhere on the page --
+    // same reasoning as settingsFieldRow()/settingsFieldChip() above. Only
+    // the per-wheel target-pressure chips need to reflect the new value, so
+    // update just those, scoped to #tp-wheels-container.
+    refreshTirePressureWheelsSection(data);
+  }});
+  const wrap = el('span', {class: 'tsettings-input-wrap'}, [input, unit ? el('span', {class: 'tsettings-unit'}, [unit]) : null]);
+  const main = el('div', {class: 'tsettings-row-main'}, [el('label', {for: id}, [label]), wrap]);
+  return el('div', {class: 'tsettings-row'}, [main]);
+}
+
+function renderTirePressureSettingsCard(data){
+  const s = data.settings;
+  const card = el('div', {class: 'card'});
+  card.appendChild(el('h2', {style: 'display:flex; align-items:center; gap:8px;'}, [
+    'Angaben',
+    infoButton('Zielwert je Rad: Tabellenwert für die Reifenbreite (Vorderrad, Straße, 75kg Gesamtgewicht als Referenz), skaliert mit Gesamtgewicht/75, Untergrund (Gravel ×0.85, Gelände ×0.7), Tubeless (×0.9) und Rad (hinten ×1.1). Bewusst einfache Referenz-Formel, keine physikalische Berechnung.')
+  ]));
+  card.appendChild(tirePressureNumberRow(data, 'riderWeightKg', 'Fahrergewicht', 'kg', 0.5));
+  card.appendChild(tirePressureNumberRow(data, 'bikeWeightKg', 'Radgewicht', 'kg', 0.1));
+  card.appendChild(tirePressureNumberRow(data, 'tireWidthMm', 'Reifenbreite', 'mm', 1));
+
+  const tubelessRow = renderToggleSwitch(s.tubeless, 'Tubeless', () => {
+    s.tubeless = !s.tubeless;
+    saveTirePressureData(data);
+    state.tirePressureReminder = computeTirePressureReminder(data);
+    render();
+  });
+  card.appendChild(tubelessRow);
+
+  const terrainSelect = el('select', {id: 'tp-terrain', onchange: (e) => {
+    s.terrain = ['road', 'gravel', 'offroad'].includes(e.target.value) ? e.target.value : 'road';
+    saveTirePressureData(data);
+    state.tirePressureReminder = computeTirePressureReminder(data);
+    render();
+  }}, [
+    el('option', {value: 'road'}, ['Straße']),
+    el('option', {value: 'gravel'}, ['Gravel']),
+    el('option', {value: 'offroad'}, ['Gelände'])
+  ]);
+  terrainSelect.value = s.terrain;
+  card.appendChild(el('div', {class: 'tsettings-row'}, [
+    el('div', {class: 'tsettings-row-main'}, [el('label', {for: 'tp-terrain'}, ['Untergrund']), terrainSelect])
+  ]));
+
+  card.appendChild(tirePressureNumberRow(data, 'reminderThresholdPercent', 'Warnschwelle', '% vom Ziel', 1, 85));
+
+  return card;
+}
+
+// One wheel's card: target/baseline/estimate chips, the "Aufgepumpt"
+// baseline-log action, and (once a baseline exists) the combined
+// "Nachmessen & neu aufpumpen" form. Inputs are uncontrolled (read via
+// closure at submit time) rather than mirrored into `state` on every
+// keystroke -- same reasoning as settingsFieldRow()'s onchange-not-oninput
+// convention, just taken one step further since these values are never
+// needed before their one submit action fires.
+function buildTireWheelCard(data, wheel, label){
+  const s = data.settings;
+  const w = data[wheel];
+  const target = computeTargetPressureBar({ riderWeightKg: s.riderWeightKg, bikeWeightKg: s.bikeWeightKg, tireWidthMm: s.tireWidthMm, tubeless: s.tubeless, terrain: s.terrain, wheel });
+  const hasBaseline = w.lastBaselineBar != null && w.lastBaselineAtMs != null;
+
+  const card = el('div', {class: 'card'});
+  card.appendChild(el('h2', {}, [label]));
+
+  const chips = el('div', {style: 'display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px;'}, [
+    // Stable ids so refreshTirePressureWheelsSection() can update these chips
+    // in place after a settings change, without a full render().
+    statChip(target.toFixed(1) + ' bar', 'Ziel', null, 'tp-target-' + wheel)
+  ]);
+  if(hasBaseline){
+    const now = Date.now();
+    const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateBarPerDay, now);
+    const ageDays = Math.round((now - w.lastBaselineAtMs) / 86400000);
+    const ageText = ageDays <= 0 ? 'heute' : `vor ${ageDays} Tag${ageDays === 1 ? '' : 'en'}`;
+    chips.appendChild(statChip(w.lastBaselineBar.toFixed(1) + ' bar', `Aufgepumpt (${ageText})`));
+    const low = isPressureLow(estimated, target, s.reminderThresholdPercent);
+    chips.appendChild(statChip(estimated.toFixed(1) + ' bar', 'Geschätzt aktuell', low ? 'color:var(--cross); background:var(--cross-bg);' : null, 'tp-estimated-' + wheel));
+  }
+  card.appendChild(chips);
+
+  // dataset.auto marks the field as still showing the auto-filled target --
+  // refreshTirePressureWheelsSection() only overwrites it while that holds,
+  // so a value the rider typed by hand is never clobbered by a later
+  // settings-driven target change.
+  const aufpumpenInput = el('input', {
+    type: 'number', step: '0.1', min: '0', value: target.toFixed(1), style: 'width:90px;',
+    id: 'tp-aufpumpen-' + wheel, oninput: e => { e.target.dataset.auto = 'false'; }
+  });
+  aufpumpenInput.dataset.auto = 'true';
+  card.appendChild(el('div', {class: 'tsettings-row'}, [
+    el('div', {class: 'tsettings-row-main'}, [
+      el('label', {}, ['Aufgepumpt auf']),
+      el('span', {class: 'tsettings-input-wrap'}, [aufpumpenInput, el('span', {class: 'tsettings-unit'}, ['bar'])])
+    ])
+  ]));
+  card.appendChild(el('button', {class: 'btn secondary', style: 'margin-top:8px;', onclick: () => {
+    const bar = parseFloat(aufpumpenInput.value);
+    if(!(isFinite(bar) && bar > 0)) return;
+    w.lastBaselineBar = Math.round(bar * 10) / 10;
+    w.lastBaselineAtMs = Date.now();
+    saveTirePressureData(data);
+    state.tirePressureReminder = computeTirePressureReminder(data);
+    render();
+  }}, ['Aufgepumpt']));
+
+  if(hasBaseline){
+    const gemessenInput = el('input', {type: 'number', step: '0.1', min: '0', style: 'width:90px;'});
+    const neuInput = el('input', {
+      type: 'number', step: '0.1', min: '0', value: target.toFixed(1), style: 'width:90px;',
+      id: 'tp-neu-' + wheel, oninput: e => { e.target.dataset.auto = 'false'; }
+    });
+    neuInput.dataset.auto = 'true';
+    const remeasureBlock = el('div', {style: 'margin-top:14px; padding-top:14px; border-top:1px solid var(--line);'});
+    remeasureBlock.appendChild(el('div', {style: 'display:flex; align-items:center; gap:6px; margin-bottom:8px;'}, [
+      'Nachmessen & neu aufpumpen',
+      infoButton('Ein Schritt für beides: berechnet aus der gemessenen Restluft seit dem letzten Aufpumpen die Verlustrate (fließt per gleitendem Durchschnitt in die künftige Schätzung ein) und setzt den neuen Ausgangspunkt auf den frisch aufgepumpten Wert.')
+    ]));
+    remeasureBlock.appendChild(el('div', {class: 'tsettings-row'}, [
+      el('div', {class: 'tsettings-row-main'}, [
+        el('label', {}, ['Gemessen']),
+        el('span', {class: 'tsettings-input-wrap'}, [gemessenInput, el('span', {class: 'tsettings-unit'}, ['bar'])])
+      ])
+    ]));
+    remeasureBlock.appendChild(el('div', {class: 'tsettings-row'}, [
+      el('div', {class: 'tsettings-row-main'}, [
+        el('label', {}, ['Neu aufgepumpt auf']),
+        el('span', {class: 'tsettings-input-wrap'}, [neuInput, el('span', {class: 'tsettings-unit'}, ['bar'])])
+      ])
+    ]));
+    remeasureBlock.appendChild(el('button', {class: 'btn secondary', style: 'margin-top:4px;', onclick: () => {
+      const measured = parseFloat(gemessenInput.value);
+      const neu = parseFloat(neuInput.value);
+      if(!(isFinite(measured) && isFinite(neu) && neu > 0)) return;
+      const now = Date.now();
+      const hoursElapsed = (now - w.lastBaselineAtMs) / 3600000;
+      const rate = computeLossRateBarPerDay(w.lastBaselineBar, measured, hoursElapsed);
+      if(rate != null){
+        w.learnedRateBarPerDay = updateLearnedRateBarPerDay(w.learnedRateBarPerDay, rate);
+        w.history.push({ measuredAtMs: now, priorBar: w.lastBaselineBar, measuredBar: measured, hoursElapsed, rateBarPerDay: rate });
+      }
+      w.lastBaselineBar = Math.round(neu * 10) / 10;
+      w.lastBaselineAtMs = now;
+      saveTirePressureData(data);
+      state.tirePressureReminder = computeTirePressureReminder(data);
+      render();
+    }}, ['Nachmessen & neu aufpumpen']));
+    card.appendChild(remeasureBlock);
+  }
+
+  return card;
+}
+
+// Fills #tp-wheels-container (either the two wheel cards or the empty-state
+// card) from scratch. Used both for the initial render and, from
+// refreshTirePressureWheelsSection() below, for the rare structural case
+// where settingsReady itself flips (the wheel cards need to appear/disappear)
+// -- still scoped to this one container, not a full app render().
+function populateTirePressureWheelsSection(container, data){
+  container.innerHTML = '';
+  const s = data.settings;
+  const settingsReady = isFinite(s.riderWeightKg) && s.riderWeightKg > 0
+    && isFinite(s.bikeWeightKg) && s.bikeWeightKg > 0
+    && isFinite(s.tireWidthMm) && s.tireWidthMm > 0;
+  if(!settingsReady){
+    const emptyCard = el('div', {class: 'card'});
+    emptyCard.appendChild(el('div', {class: 'empty-state'}, ['Fahrergewicht, Radgewicht und Reifenbreite eingeben, um Zielwerte zu berechnen.']));
+    container.appendChild(emptyCard);
+    return;
+  }
+  container.appendChild(buildTireWheelCard(data, 'front', 'Vorderrad'));
+  container.appendChild(buildTireWheelCard(data, 'rear', 'Hinterrad'));
+}
+
+// Scoped, no-render() refresh of the per-wheel target-pressure display after
+// a tirePressureNumberRow() settings change (see there for why render() is
+// avoided). Normal case: the wheel cards are already showing, so just update
+// their "Ziel" text and "Geschätzt aktuell" low-pressure styling in place by
+// id. Rare case: settingsReady itself changed (rider just finished or
+// cleared riderWeightKg/bikeWeightKg/tireWidthMm) -- that's a structural
+// swap between the empty-state card and the wheel cards, handled by rebuild-
+// ing just #tp-wheels-container via populateTirePressureWheelsSection(),
+// still without touching the rest of the page.
+function refreshTirePressureWheelsSection(data){
+  const container = document.getElementById('tp-wheels-container');
+  if(!container) return; // not currently on the Reifendruck page
+  const s = data.settings;
+  const settingsReady = isFinite(s.riderWeightKg) && s.riderWeightKg > 0
+    && isFinite(s.bikeWeightKg) && s.bikeWeightKg > 0
+    && isFinite(s.tireWidthMm) && s.tireWidthMm > 0;
+  const wheelsPresent = !!document.getElementById('tp-target-front');
+  if(settingsReady !== wheelsPresent){
+    populateTirePressureWheelsSection(container, data);
+    return;
+  }
+  if(!settingsReady) return; // still incomplete, empty-state already showing
+
+  ['front', 'rear'].forEach(wheel => {
+    const target = computeTargetPressureBar({ riderWeightKg: s.riderWeightKg, bikeWeightKg: s.bikeWeightKg, tireWidthMm: s.tireWidthMm, tubeless: s.tubeless, terrain: s.terrain, wheel });
+    const targetChip = document.getElementById('tp-target-' + wheel);
+    if(targetChip){
+      const valueEl = targetChip.querySelector('.v');
+      if(valueEl) valueEl.textContent = target.toFixed(1) + ' bar';
+    }
+
+    ['tp-aufpumpen-' + wheel, 'tp-neu-' + wheel].forEach(id => {
+      const input = document.getElementById(id);
+      if(input && input.dataset.auto === 'true') input.value = target.toFixed(1);
+    });
+
+    const w = data[wheel];
+    if(w.lastBaselineBar == null || w.lastBaselineAtMs == null) return;
+    const estimatedChip = document.getElementById('tp-estimated-' + wheel);
+    if(!estimatedChip) return;
+    const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateBarPerDay, Date.now());
+    const low = isPressureLow(estimated, target, s.reminderThresholdPercent);
+    estimatedChip.style.cssText = low ? 'color:var(--cross); background:var(--cross-bg);' : '';
+  });
+}
+
+function renderReifendruckPage(){
+  const frag = document.createDocumentFragment();
+  const data = state.tirePressure;
+
+  const headerCard = el('div', {class: 'card'});
+  headerCard.appendChild(el('h2', {style: 'margin:0;'}, ['Reifendruck']));
+  frag.appendChild(headerCard);
+
+  frag.appendChild(renderTirePressureSettingsCard(data));
+
+  const wheelsContainer = el('div', {id: 'tp-wheels-container'});
+  populateTirePressureWheelsSection(wheelsContainer, data);
+  frag.appendChild(wheelsContainer);
+
+  return frag;
+}
+
+// Dismissible startup notice (see init()/state.tirePressureReminder) --
+// dismissal is session-only (state.tirePressureReminderDismissed), never
+// persisted. Rendered inline as a normal render()-driven card (unlike
+// infoButton()'s direct-DOM toggling) since this isn't a rapid-toggle
+// interaction, just a one-off per-session notice.
+function renderTirePressureBanner(){
+  const r = state.tirePressureReminder;
+  if(!r || state.tirePressureReminderDismissed || (!r.front && !r.rear)) return null;
+  const data = state.tirePressure;
+  const s = data.settings;
+  const now = Date.now();
+  const parts = [];
+  ['front', 'rear'].forEach(wheel => {
+    if(!r[wheel]) return;
+    const w = data[wheel];
+    const target = computeTargetPressureBar({ riderWeightKg: s.riderWeightKg, bikeWeightKg: s.bikeWeightKg, tireWidthMm: s.tireWidthMm, tubeless: s.tubeless, terrain: s.terrain, wheel });
+    const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateBarPerDay, now);
+    parts.push(`${wheel === 'front' ? 'Vorderrad' : 'Hinterrad'}: ca. ${estimated.toFixed(1)} bar, Ziel ${target.toFixed(1)} bar`);
+  });
+  const text = `Reifendruck vermutlich niedrig (${parts.join('; ')}) — Seite „Reifendruck" öffnen?`;
+
+  return el('div', {class: 'card', style: 'border-color:var(--cross); display:flex; align-items:center; justify-content:space-between; gap:10px; cursor:pointer;', onclick: () => {
+    state.activePage = 'reifendruck';
+    render();
+  }}, [
+    el('div', {style: 'color:var(--cross); font-size:13px;'}, [text]),
+    el('button', {class: 'btn secondary', style: 'flex-shrink:0;', onclick: (e) => {
+      e.stopPropagation();
+      state.tirePressureReminderDismissed = true;
+      render();
+    }}, ['×'])
+  ]);
+}
+
 // ---------- init ----------
 async function init(){
+  // Synchronous localStorage load + reminder check, done before the first
+  // render() so the startup banner (if any) is present on first paint
+  // instead of popping in a frame later.
+  state.tirePressure = loadTirePressureData();
+  state.tirePressureReminder = computeTirePressureReminder(state.tirePressure);
+
   render();
 
   state.hammerheadConnected = !!(await loadStoredHammerheadToken());
