@@ -3395,6 +3395,10 @@ const CHANGELOG_SEEN_KEY = 'velocast_changelog_seen';
 // A date with no items in a category simply omits that category's heading
 // rather than showing an empty section.
 const CHANGELOG = [
+  { date:'29.08.2026',
+    fixes:[
+      'Datum/Uhrzeit-Auswahl auf Desktop: Zahleneingabe sprang sofort ins nächste Feld, sodass sich z.B. „15" nicht als Stunde eintippen ließ (nur die „1" kam an) — jede Änderung löste sofort einen Seiten-Neuaufbau aus, der das Feld mitten in der Eingabe zurücksetzte. Die Auswertung wartet jetzt kurz, bis wirklich nichts mehr getippt wird.',
+    ]},
   { date:'28.08.2026',
     features:[
       'Automatisches Laden beim Verbinden lässt sich jetzt einzeln für „Aktivitäten & Route", „Markierte Segmente" und „Trainingsdaten" ein-/ausschalten (Einstellungen) — vorher ein einzelner Schalter für alles. Ist eine Kategorie deaktiviert, erscheint an ihrer Stelle ein eigener „laden"-Button.',
@@ -4904,16 +4908,33 @@ const routeMapContainer = el("div", {id:"route-map", style:"margin-top:14px;"});
 // control gets destroyed and replaced out from under it. That's exactly
 // what happened here — this input's own onchange calls loadRouteWeather(),
 // which calls render() twice in quick succession (once synchronously when
-// weather loading starts, once again when it finishes), and Safari can fire
-// `change` per-segment (e.g. right after editing just the hour) while the
-// native picker overlay is still open. Keeping the node persistent and only
-// ever mutating its .value (never recreating it) avoids that entirely. The
-// avg-speed input and Punktabstand select are fixed the same way for
-// consistency, since they're the same category of bug even though a plain
-// number/select is much less likely to crash outright.
+// weather loading starts, once again when it finishes), and Safari/Chrome's
+// datetime-local widget fires `change` per SEGMENT (hour, then minute, ...),
+// not just once for the whole value, while the field is still being typed
+// into. Keeping the node persistent (never recreated) fixed the Safari
+// crash, but every one of those per-segment `change` events still triggered
+// an immediate render() -- which wipes and rebuilds the DOM tree
+// (app.innerHTML="") and blurs the input mid-edit. Once blurred,
+// syncPersistentInputValue()'s activeElement guard no longer applies, so the
+// next render() re-synced .value from state.startTime -- resetting the
+// browser's internal typing/segment buffer and making it look like only the
+// hour's first digit "took" before jumping to the next segment (couldn't
+// type e.g. "15" as two digits). Debouncing so a change event only actually
+// triggers loadRouteWeather()/render() after a short pause fixes this: rapid
+// per-segment events while still typing collapse into the one that follows
+// once the user stops. The avg-speed input and Punktabstand select are kept
+// persistent the same way for consistency (same category of bug even though
+// a plain number/select is much less likely to crash outright), but don't
+// need the debounce since a plain number input doesn't have this
+// multi-segment/per-keystroke `change` behavior.
+let startTimeChangeTimer = null;
 const startTimeInput = el("input", {
   type:"datetime-local", style:"width:100%;",
-  onchange:(e)=>{ state.startTime = e.target.value; loadRouteWeather(); }
+  onchange:(e)=>{
+    state.startTime = e.target.value;
+    clearTimeout(startTimeChangeTimer);
+    startTimeChangeTimer = setTimeout(loadRouteWeather, 600);
+  }
 });
 const avgSpeedInput = el("input", {
   type:"number", style:"width:100%;", min:"5", max:"60", step:"1",
