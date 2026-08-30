@@ -2453,16 +2453,28 @@ function isPressureLow(estimatedBar, targetBar, thresholdPercent){
   return estimatedBar < targetBar * (thresholdPercent / 100);
 }
 
+// Target pressure per wheel, calculator-mode-aware: with the calculator on
+// (default), the target is computed from rider/bike/tire settings as before;
+// with it off, the rider enters their own target per wheel directly (see
+// buildTireWheelCard's "Zieldruck" field) and this just reads it back --
+// null until they do, same "not ready yet" meaning as computeTargetPressureBar
+// never having run. `data` is the full {settings, front, rear} shape.
+function getWheelTargetBar(data, wheel){
+  const s = data.settings;
+  if(s.calculatorEnabled === false) return data[wheel].manualTargetBar;
+  return computeTargetPressureBar({ riderWeightKg: s.riderWeightKg, bikeWeightKg: s.bikeWeightKg, tireWidthMm: s.tireWidthMm, tubeless: s.tubeless, terrain: s.terrain, wheel });
+}
+
 // Reasonable generic default for a clincher road tire, used only until the
 // wheel has at least one real "Nachmessen"-derived data point.
 const TIRE_PRESSURE_DEFAULT_RATE_BAR_PER_DAY = 0.15;
 const TIRE_PRESSURE_KEY = 'velocast_tire_pressure';
 function defaultTireWheelData(){
-  return { lastBaselineBar: null, lastBaselineAtMs: null, learnedRateBarPerDay: TIRE_PRESSURE_DEFAULT_RATE_BAR_PER_DAY, history: [] };
+  return { lastBaselineBar: null, lastBaselineAtMs: null, learnedRateBarPerDay: TIRE_PRESSURE_DEFAULT_RATE_BAR_PER_DAY, history: [], manualTargetBar: null };
 }
 function defaultTirePressureData(){
   return {
-    settings: { riderWeightKg: null, bikeWeightKg: null, tireWidthMm: null, tubeless: false, terrain: 'road', reminderThresholdPercent: 85 },
+    settings: { riderWeightKg: null, bikeWeightKg: null, tireWidthMm: null, tubeless: false, terrain: 'road', reminderThresholdPercent: 85, calculatorEnabled: true },
     front: defaultTireWheelData(),
     rear: defaultTireWheelData()
   };
@@ -2505,14 +2517,17 @@ function saveTirePressureData(data){
 function computeTirePressureReminder(data){
   const s = data.settings;
   const result = { front: false, rear: false };
-  const settingsReady = isFinite(s.riderWeightKg) && s.riderWeightKg > 0
-    && isFinite(s.bikeWeightKg) && s.bikeWeightKg > 0
-    && isFinite(s.tireWidthMm) && s.tireWidthMm > 0;
-  if(!settingsReady) return result;
+  if(s.calculatorEnabled !== false){
+    const settingsReady = isFinite(s.riderWeightKg) && s.riderWeightKg > 0
+      && isFinite(s.bikeWeightKg) && s.bikeWeightKg > 0
+      && isFinite(s.tireWidthMm) && s.tireWidthMm > 0;
+    if(!settingsReady) return result;
+  }
   ['front', 'rear'].forEach(wheel => {
     const w = data[wheel];
     if(w.lastBaselineBar == null || w.lastBaselineAtMs == null) return;
-    const target = computeTargetPressureBar({ riderWeightKg: s.riderWeightKg, bikeWeightKg: s.bikeWeightKg, tireWidthMm: s.tireWidthMm, tubeless: s.tubeless, terrain: s.terrain, wheel });
+    const target = getWheelTargetBar(data, wheel);
+    if(target == null) return; // calculator off, rider hasn't entered a manual target yet
     const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateBarPerDay, Date.now());
     result[wheel] = isPressureLow(estimated, target, s.reminderThresholdPercent);
   });
@@ -11949,37 +11964,48 @@ function tirePressureNumberRow(data, key, label, unit, step, defaultValue){
 
 function renderTirePressureSettingsCard(data){
   const s = data.settings;
+  const calcOn = s.calculatorEnabled !== false;
   const card = el('div', {class: 'card'});
   card.appendChild(el('h2', {style: 'display:flex; align-items:center; gap:8px;'}, [
     'Angaben',
-    infoButton('Zielwert je Rad: Tabellenwert für die Reifenbreite (Vorderrad, Straße, 75kg Gesamtgewicht als Referenz), skaliert mit Gesamtgewicht/75, Untergrund (Gravel ×0.85, Gelände ×0.7), Tubeless (×0.9) und Rad (hinten ×1.1). Bewusst einfache Referenz-Formel, keine physikalische Berechnung.')
+    calcOn ? infoButton('Zielwert je Rad: Tabellenwert für die Reifenbreite (Vorderrad, Straße, 75kg Gesamtgewicht als Referenz), skaliert mit Gesamtgewicht/75, Untergrund (Gravel ×0.85, Gelände ×0.7), Tubeless (×0.9) und Rad (hinten ×1.1). Bewusst einfache Referenz-Formel, keine physikalische Berechnung.') : null
   ]));
-  card.appendChild(tirePressureNumberRow(data, 'riderWeightKg', 'Fahrergewicht', 'kg', 0.5));
-  card.appendChild(tirePressureNumberRow(data, 'bikeWeightKg', 'Radgewicht', 'kg', 0.1));
-  card.appendChild(tirePressureNumberRow(data, 'tireWidthMm', 'Reifenbreite', 'mm', 1));
 
-  const tubelessRow = renderToggleSwitch(s.tubeless, 'Tubeless', () => {
-    s.tubeless = !s.tubeless;
+  card.appendChild(renderToggleSwitch(calcOn, calcOn ? 'Rechner aktiv' : 'Rechner aus — Zieldruck manuell je Rad', () => {
+    s.calculatorEnabled = !calcOn;
     saveTirePressureData(data);
     state.tirePressureReminder = computeTirePressureReminder(data);
     render();
-  });
-  card.appendChild(tubelessRow);
+  }));
 
-  const terrainSelect = el('select', {id: 'tp-terrain', onchange: (e) => {
-    s.terrain = ['road', 'gravel', 'offroad'].includes(e.target.value) ? e.target.value : 'road';
-    saveTirePressureData(data);
-    state.tirePressureReminder = computeTirePressureReminder(data);
-    render();
-  }}, [
-    el('option', {value: 'road'}, ['Straße']),
-    el('option', {value: 'gravel'}, ['Gravel']),
-    el('option', {value: 'offroad'}, ['Gelände'])
-  ]);
-  terrainSelect.value = s.terrain;
-  card.appendChild(el('div', {class: 'tsettings-row'}, [
-    el('div', {class: 'tsettings-row-main'}, [el('label', {for: 'tp-terrain'}, ['Untergrund']), terrainSelect])
-  ]));
+  if(calcOn){
+    card.appendChild(tirePressureNumberRow(data, 'riderWeightKg', 'Fahrergewicht', 'kg', 0.5));
+    card.appendChild(tirePressureNumberRow(data, 'bikeWeightKg', 'Radgewicht', 'kg', 0.1));
+    card.appendChild(tirePressureNumberRow(data, 'tireWidthMm', 'Reifenbreite', 'mm', 1));
+
+    const tubelessRow = renderToggleSwitch(s.tubeless, 'Tubeless', () => {
+      s.tubeless = !s.tubeless;
+      saveTirePressureData(data);
+      state.tirePressureReminder = computeTirePressureReminder(data);
+      render();
+    });
+    card.appendChild(tubelessRow);
+
+    const terrainSelect = el('select', {id: 'tp-terrain', onchange: (e) => {
+      s.terrain = ['road', 'gravel', 'offroad'].includes(e.target.value) ? e.target.value : 'road';
+      saveTirePressureData(data);
+      state.tirePressureReminder = computeTirePressureReminder(data);
+      render();
+    }}, [
+      el('option', {value: 'road'}, ['Straße']),
+      el('option', {value: 'gravel'}, ['Gravel']),
+      el('option', {value: 'offroad'}, ['Gelände'])
+    ]);
+    terrainSelect.value = s.terrain;
+    card.appendChild(el('div', {class: 'tsettings-row'}, [
+      el('div', {class: 'tsettings-row-main'}, [el('label', {for: 'tp-terrain'}, ['Untergrund']), terrainSelect])
+    ]));
+  }
 
   card.appendChild(tirePressureNumberRow(data, 'reminderThresholdPercent', 'Warnschwelle', '% vom Ziel', 1, 85));
 
@@ -11996,24 +12022,47 @@ function renderTirePressureSettingsCard(data){
 function buildTireWheelCard(data, wheel, label){
   const s = data.settings;
   const w = data[wheel];
-  const target = computeTargetPressureBar({ riderWeightKg: s.riderWeightKg, bikeWeightKg: s.bikeWeightKg, tireWidthMm: s.tireWidthMm, tubeless: s.tubeless, terrain: s.terrain, wheel });
+  const calcOn = s.calculatorEnabled !== false;
+  const target = getWheelTargetBar(data, wheel); // null when calc is off and no manual target entered yet
   const hasBaseline = w.lastBaselineBar != null && w.lastBaselineAtMs != null;
 
   const card = el('div', {class: 'card'});
   card.appendChild(el('h2', {}, [label]));
 
-  const chips = el('div', {style: 'display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px;'}, [
-    // Stable ids so refreshTirePressureWheelsSection() can update these chips
+  if(!calcOn){
+    // Same direct-DOM refresh discipline as tirePressureNumberRow() --
+    // onchange (not oninput), no full render() here either.
+    const zielInput = el('input', {
+      type: 'number', step: '0.1', min: '0', value: target != null ? target.toFixed(1) : '', style: 'width:90px;',
+      id: 'tp-ziel-' + wheel, onchange: (e) => {
+        const v = parseFloat(e.target.value);
+        w.manualTargetBar = (isFinite(v) && v > 0) ? Math.round(v * 10) / 10 : null;
+        saveTirePressureData(data);
+        state.tirePressureReminder = computeTirePressureReminder(data);
+        refreshTirePressureWheelsSection(data);
+      }
+    });
+    card.appendChild(el('div', {class: 'tsettings-row'}, [
+      el('div', {class: 'tsettings-row-main'}, [
+        el('label', {}, ['Zieldruck']),
+        el('span', {class: 'tsettings-input-wrap'}, [zielInput, el('span', {class: 'tsettings-unit'}, ['bar'])])
+      ])
+    ]));
+  }
+
+  const chips = el('div', {style: 'display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px;'}, []);
+  if(calcOn){
+    // Stable id so refreshTirePressureWheelsSection() can update this chip
     // in place after a settings change, without a full render().
-    statChip(target.toFixed(1) + ' bar', 'Ziel', null, 'tp-target-' + wheel)
-  ]);
+    chips.appendChild(statChip(target.toFixed(1) + ' bar', 'Ziel', null, 'tp-target-' + wheel));
+  }
   if(hasBaseline){
     const now = Date.now();
     const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateBarPerDay, now);
     const ageDays = Math.round((now - w.lastBaselineAtMs) / 86400000);
     const ageText = ageDays <= 0 ? 'heute' : `vor ${ageDays} Tag${ageDays === 1 ? '' : 'en'}`;
     chips.appendChild(statChip(w.lastBaselineBar.toFixed(1) + ' bar', `Aufgepumpt (${ageText})`));
-    const low = isPressureLow(estimated, target, s.reminderThresholdPercent);
+    const low = target != null && isPressureLow(estimated, target, s.reminderThresholdPercent);
     chips.appendChild(statChip(estimated.toFixed(1) + ' bar', 'Geschätzt aktuell', low ? 'color:var(--cross); background:var(--cross-bg);' : null, 'tp-estimated-' + wheel));
   }
   card.appendChild(chips);
@@ -12021,9 +12070,10 @@ function buildTireWheelCard(data, wheel, label){
   // dataset.auto marks the field as still showing the auto-filled target --
   // refreshTirePressureWheelsSection() only overwrites it while that holds,
   // so a value the rider typed by hand is never clobbered by a later
-  // settings-driven target change.
+  // settings-driven target change. Falls back to '' (no auto-fill) while
+  // calc is off and no manual target has been entered yet.
   const aufpumpenInput = el('input', {
-    type: 'number', step: '0.1', min: '0', value: target.toFixed(1), style: 'width:90px;',
+    type: 'number', step: '0.1', min: '0', value: target != null ? target.toFixed(1) : '', style: 'width:90px;',
     id: 'tp-aufpumpen-' + wheel, oninput: e => { e.target.dataset.auto = 'false'; }
   });
   aufpumpenInput.dataset.auto = 'true';
@@ -12046,7 +12096,7 @@ function buildTireWheelCard(data, wheel, label){
   if(hasBaseline){
     const gemessenInput = el('input', {type: 'number', step: '0.1', min: '0', style: 'width:90px;'});
     const neuInput = el('input', {
-      type: 'number', step: '0.1', min: '0', value: target.toFixed(1), style: 'width:90px;',
+      type: 'number', step: '0.1', min: '0', value: target != null ? target.toFixed(1) : '', style: 'width:90px;',
       id: 'tp-neu-' + wheel, oninput: e => { e.target.dataset.auto = 'false'; }
     });
     neuInput.dataset.auto = 'true';
@@ -12098,9 +12148,11 @@ function buildTireWheelCard(data, wheel, label){
 function populateTirePressureWheelsSection(container, data){
   container.innerHTML = '';
   const s = data.settings;
-  const settingsReady = isFinite(s.riderWeightKg) && s.riderWeightKg > 0
+  // With the calculator off there's nothing to wait on -- the wheel cards
+  // show immediately and the rider fills in "Zieldruck" themselves per wheel.
+  const settingsReady = s.calculatorEnabled === false || (isFinite(s.riderWeightKg) && s.riderWeightKg > 0
     && isFinite(s.bikeWeightKg) && s.bikeWeightKg > 0
-    && isFinite(s.tireWidthMm) && s.tireWidthMm > 0;
+    && isFinite(s.tireWidthMm) && s.tireWidthMm > 0);
   if(!settingsReady){
     const emptyCard = el('div', {class: 'card'});
     emptyCard.appendChild(el('div', {class: 'empty-state'}, ['Fahrergewicht, Radgewicht und Reifenbreite eingeben, um Zielwerte zu berechnen.']));
@@ -12124,10 +12176,13 @@ function refreshTirePressureWheelsSection(data){
   const container = document.getElementById('tp-wheels-container');
   if(!container) return; // not currently on the Reifendruck page
   const s = data.settings;
-  const settingsReady = isFinite(s.riderWeightKg) && s.riderWeightKg > 0
+  const settingsReady = s.calculatorEnabled === false || (isFinite(s.riderWeightKg) && s.riderWeightKg > 0
     && isFinite(s.bikeWeightKg) && s.bikeWeightKg > 0
-    && isFinite(s.tireWidthMm) && s.tireWidthMm > 0;
-  const wheelsPresent = !!document.getElementById('tp-target-front');
+    && isFinite(s.tireWidthMm) && s.tireWidthMm > 0);
+  // tp-aufpumpen-front always exists once the wheel cards are showing,
+  // regardless of calculator mode (unlike tp-target-front, which only
+  // renders with the calculator on) -- so it's the reliable presence marker.
+  const wheelsPresent = !!document.getElementById('tp-aufpumpen-front');
   if(settingsReady !== wheelsPresent){
     populateTirePressureWheelsSection(container, data);
     return;
@@ -12135,16 +12190,17 @@ function refreshTirePressureWheelsSection(data){
   if(!settingsReady) return; // still incomplete, empty-state already showing
 
   ['front', 'rear'].forEach(wheel => {
-    const target = computeTargetPressureBar({ riderWeightKg: s.riderWeightKg, bikeWeightKg: s.bikeWeightKg, tireWidthMm: s.tireWidthMm, tubeless: s.tubeless, terrain: s.terrain, wheel });
+    const target = getWheelTargetBar(data, wheel);
     const targetChip = document.getElementById('tp-target-' + wheel);
     if(targetChip){
       const valueEl = targetChip.querySelector('.v');
       if(valueEl) valueEl.textContent = target.toFixed(1) + ' bar';
     }
 
+    const autoValue = target != null ? target.toFixed(1) : '';
     ['tp-aufpumpen-' + wheel, 'tp-neu-' + wheel].forEach(id => {
       const input = document.getElementById(id);
-      if(input && input.dataset.auto === 'true') input.value = target.toFixed(1);
+      if(input && input.dataset.auto === 'true') input.value = autoValue;
     });
 
     const w = data[wheel];
@@ -12152,7 +12208,7 @@ function refreshTirePressureWheelsSection(data){
     const estimatedChip = document.getElementById('tp-estimated-' + wheel);
     if(!estimatedChip) return;
     const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateBarPerDay, Date.now());
-    const low = isPressureLow(estimated, target, s.reminderThresholdPercent);
+    const low = target != null && isPressureLow(estimated, target, s.reminderThresholdPercent);
     estimatedChip.style.cssText = low ? 'color:var(--cross); background:var(--cross-bg);' : '';
   });
 }
@@ -12183,16 +12239,17 @@ function renderTirePressureBanner(){
   const r = state.tirePressureReminder;
   if(!r || state.tirePressureReminderDismissed || (!r.front && !r.rear)) return null;
   const data = state.tirePressure;
-  const s = data.settings;
   const now = Date.now();
   const parts = [];
   ['front', 'rear'].forEach(wheel => {
     if(!r[wheel]) return;
     const w = data[wheel];
-    const target = computeTargetPressureBar({ riderWeightKg: s.riderWeightKg, bikeWeightKg: s.bikeWeightKg, tireWidthMm: s.tireWidthMm, tubeless: s.tubeless, terrain: s.terrain, wheel });
+    const target = getWheelTargetBar(data, wheel);
+    if(target == null) return; // calculator off, rider hasn't entered a manual target yet
     const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateBarPerDay, now);
     parts.push(`${wheel === 'front' ? 'Vorderrad' : 'Hinterrad'}: ca. ${estimated.toFixed(1)} bar, Ziel ${target.toFixed(1)} bar`);
   });
+  if(parts.length === 0) return null;
   const text = `Reifendruck vermutlich niedrig (${parts.join('; ')}) — Seite „Reifendruck" öffnen?`;
 
   return el('div', {class: 'card', style: 'border-color:var(--cross); display:flex; align-items:center; justify-content:space-between; gap:10px; cursor:pointer;', onclick: () => {

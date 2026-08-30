@@ -234,3 +234,114 @@ test('isPressureLow', async (t) => {
     assert.equal(isPressureLow(5.1, 6.0, 85), false);
   });
 });
+
+// ---------------------------------------------------------------------
+// getWheelTargetBar(data, wheel) -- calculator on/off toggle (Nachtrag)
+// ---------------------------------------------------------------------
+test('getWheelTargetBar', async (t) => {
+  await t.test('calculator on (default): returns computeTargetPressureBar\'s result', () => {
+    const { get } = loadApp();
+    const getWheelTargetBar = get('getWheelTargetBar');
+    const defaultTirePressureData = get('defaultTirePressureData');
+    const data = defaultTirePressureData();
+    data.settings.riderWeightKg = 70;
+    data.settings.bikeWeightKg = 5;
+    data.settings.tireWidthMm = 25;
+    const result = getWheelTargetBar(data, 'front');
+    assert.equal(result, 4.9); // matches the 25mm/75kg/road/front computeTargetPressureBar test above
+  });
+
+  await t.test('calculator off, manual target set: returns the manual value, ignores rider/bike/tire settings', () => {
+    const { get } = loadApp();
+    const getWheelTargetBar = get('getWheelTargetBar');
+    const defaultTirePressureData = get('defaultTirePressureData');
+    const data = defaultTirePressureData();
+    data.settings.calculatorEnabled = false;
+    data.settings.riderWeightKg = 70; // present but must be ignored while calc is off
+    data.front.manualTargetBar = 3.2;
+    const result = getWheelTargetBar(data, 'front');
+    assert.equal(result, 3.2);
+  });
+
+  await t.test('calculator off, no manual target entered yet: returns null', () => {
+    const { get } = loadApp();
+    const getWheelTargetBar = get('getWheelTargetBar');
+    const defaultTirePressureData = get('defaultTirePressureData');
+    const data = defaultTirePressureData();
+    data.settings.calculatorEnabled = false;
+    const result = getWheelTargetBar(data, 'front');
+    assert.equal(result, null);
+  });
+
+  await t.test('front and rear track independent manual targets while calculator is off', () => {
+    const { get } = loadApp();
+    const getWheelTargetBar = get('getWheelTargetBar');
+    const defaultTirePressureData = get('defaultTirePressureData');
+    const data = defaultTirePressureData();
+    data.settings.calculatorEnabled = false;
+    data.front.manualTargetBar = 3.2;
+    data.rear.manualTargetBar = 3.5;
+    assert.equal(getWheelTargetBar(data, 'front'), 3.2);
+    assert.equal(getWheelTargetBar(data, 'rear'), 3.5);
+  });
+});
+
+// ---------------------------------------------------------------------
+// computeTirePressureReminder(data) -- calculator on/off gating (Nachtrag)
+// ---------------------------------------------------------------------
+test('computeTirePressureReminder', async (t) => {
+  function baselineDaysAgo(w, bar, days){
+    w.lastBaselineBar = bar;
+    w.lastBaselineAtMs = Date.now() - days * 86400000;
+    w.learnedRateBarPerDay = 0; // isolate the target/threshold comparison from loss-rate decay
+  }
+
+  await t.test('calculator off, manual target set, estimated below threshold -> low', () => {
+    const { get } = loadApp();
+    const computeTirePressureReminder = get('computeTirePressureReminder');
+    const defaultTirePressureData = get('defaultTirePressureData');
+    const data = defaultTirePressureData();
+    data.settings.calculatorEnabled = false;
+    data.settings.reminderThresholdPercent = 85;
+    data.front.manualTargetBar = 6.0;
+    baselineDaysAgo(data.front, 5.0, 1); // 5.0 < 6.0*0.85=5.1 -> low
+    const result = computeTirePressureReminder(data);
+    assert.equal(result.front, true);
+    assert.equal(result.rear, false);
+  });
+
+  await t.test('calculator off, no manual target yet -> never flagged low, even with a baseline logged', () => {
+    const { get } = loadApp();
+    const computeTirePressureReminder = get('computeTirePressureReminder');
+    const defaultTirePressureData = get('defaultTirePressureData');
+    const data = defaultTirePressureData();
+    data.settings.calculatorEnabled = false;
+    baselineDaysAgo(data.front, 1.0, 30); // would be "low" against any real target, but there is none
+    const result = computeTirePressureReminder(data);
+    assert.equal(result.front, false);
+  });
+
+  await t.test('calculator off: rider/bike/tire settings being unset does NOT gate the reminder (unlike calculator-on mode)', () => {
+    const { get } = loadApp();
+    const computeTirePressureReminder = get('computeTirePressureReminder');
+    const defaultTirePressureData = get('defaultTirePressureData');
+    const data = defaultTirePressureData();
+    data.settings.calculatorEnabled = false;
+    // riderWeightKg/bikeWeightKg/tireWidthMm left null, unlike the calculator-on case
+    data.front.manualTargetBar = 6.0;
+    baselineDaysAgo(data.front, 5.0, 1);
+    const result = computeTirePressureReminder(data);
+    assert.equal(result.front, true);
+  });
+
+  await t.test('calculator on (default): unchanged behavior, still gated on rider/bike/tire settings being filled in', () => {
+    const { get } = loadApp();
+    const computeTirePressureReminder = get('computeTirePressureReminder');
+    const defaultTirePressureData = get('defaultTirePressureData');
+    const data = defaultTirePressureData();
+    // settings left empty -> not ready, even with a baseline logged
+    baselineDaysAgo(data.front, 1.0, 30);
+    const result = computeTirePressureReminder(data);
+    assert.equal(result.front, false);
+  });
+});
