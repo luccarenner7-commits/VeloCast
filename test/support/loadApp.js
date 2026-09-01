@@ -157,7 +157,7 @@ function loadApp({ onFetchCall } = {}) {
   // touching index.html itself. Listed explicitly (rather than trying to
   // auto-discover every top-level const) so a typo here fails loudly as a
   // ReferenceError instead of silently returning undefined.
-  const exposedSrc = `${scriptSrc}\n;globalThis.__exposed = { state, BEARING_SMOOTHING_WINDOW_KM, MMP_DURATIONS_SEC, CEILING_WINDOW_DAYS, computeTargetPressureBar, computeLossRateBarPerDay, updateLearnedRateBarPerDay, estimateCurrentPressureBar, isPressureLow, getWheelTargetBar, computeTirePressureReminder, defaultTirePressureData, applyNachmessenUpdate };\n`;
+  const exposedSrc = `${scriptSrc}\n;globalThis.__exposed = { state, BEARING_SMOOTHING_WINDOW_KM, MMP_DURATIONS_SEC, CEILING_WINDOW_DAYS, POWER_ZONE_META, computeTargetPressureBar, computeLossRateBarPerDay, updateLearnedRateBarPerDay, estimateCurrentPressureBar, isPressureLow, getWheelTargetBar, computeTirePressureReminder, defaultTirePressureData, applyNachmessenUpdate };\n`;
 
   const ctx = vm.createContext(sandbox);
   const script = new vm.Script(exposedSrc, { filename: 'index.html-inline-script.js' });

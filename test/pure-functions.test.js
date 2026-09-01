@@ -326,6 +326,129 @@ test('buildPotentialChip', async (t) => {
 });
 
 // ---------------------------------------------------------------------
+// segmentPotentialValue(seg, bucket) / sortSegmentsBy(list, bucket, "potential")
+// (Task 1: "Meine Segmente" Potential sort)
+// ---------------------------------------------------------------------
+test('segmentPotentialValue', async (t) => {
+  await t.test('starred bucket (efforts == null): no detail for this segment -> null', () => {
+    const { get } = loadApp();
+    const segmentPotentialValue = get('segmentPotentialValue');
+    const bucket = { efforts: null, details: {}, prWatts: { 1: { watts: 300 } } };
+    assert.equal(segmentPotentialValue({ id: 1 }, bucket), null);
+  });
+
+  await t.test('starred bucket: no prWatts entry for this segment -> null', () => {
+    const { get } = loadApp();
+    const segmentPotentialValue = get('segmentPotentialValue');
+    const bucket = { efforts: null, details: { 1: { athlete_segment_stats: { pr_elapsed_time: 60 } } }, prWatts: {} };
+    assert.equal(segmentPotentialValue({ id: 1 }, bucket), null);
+  });
+
+  await t.test('starred bucket: detail present but pr_elapsed_time missing -> null', () => {
+    const { get } = loadApp();
+    const segmentPotentialValue = get('segmentPotentialValue');
+    const bucket = { efforts: null, details: { 1: { athlete_segment_stats: {} } }, prWatts: { 1: { watts: 300 } } };
+    assert.equal(segmentPotentialValue({ id: 1 }, bucket), null);
+  });
+
+  await t.test('starred bucket: no rider profile loaded yet -> null (matches buildPotentialChip\'s own convention)', () => {
+    const { get } = loadApp();
+    const segmentPotentialValue = get('segmentPotentialValue');
+    const bucket = { efforts: null, details: { 1: { athlete_segment_stats: { pr_elapsed_time: 60 } } }, prWatts: { 1: { watts: 300 } } };
+    assert.equal(segmentPotentialValue({ id: 1 }, bucket), null);
+  });
+
+  await t.test('starred bucket: full data -> same numeric % as buildPotentialChip(watts, pr) would show', () => {
+    const { get } = loadApp();
+    const segmentPotentialValue = get('segmentPotentialValue');
+    const buildPotentialChip = get('buildPotentialChip');
+    const state = get('state');
+    state.profilPage.riderProfile = { mmpCurve: { 60: 300, 300: 200 } };
+    const bucket = { efforts: null, details: { 1: { athlete_segment_stats: { pr_elapsed_time: 60 } } }, prWatts: { 1: { watts: 285 } } };
+    assert.equal(segmentPotentialValue({ id: 1 }, bucket), 95);
+    assert.equal(buildPotentialChip(285, 60).value, '95%');
+  });
+
+  await t.test('ride-completed bucket (efforts set): uses this ride\'s own effort duration, not a PR', () => {
+    const { get } = loadApp();
+    const segmentPotentialValue = get('segmentPotentialValue');
+    const state = get('state');
+    state.profilPage.riderProfile = { mmpCurve: { 60: 300, 300: 200 } };
+    const bucket = { efforts: { 1: { elapsed_time: 60 } }, details: {}, prWatts: { 1: { watts: 300 } } };
+    assert.equal(segmentPotentialValue({ id: 1 }, bucket), 100);
+  });
+
+  await t.test('ride-completed bucket: no effort recorded for this segment -> null', () => {
+    const { get } = loadApp();
+    const segmentPotentialValue = get('segmentPotentialValue');
+    const bucket = { efforts: {}, details: {}, prWatts: { 1: { watts: 300 } } };
+    assert.equal(segmentPotentialValue({ id: 1 }, bucket), null);
+  });
+});
+
+test('sortSegmentsBy "potential" case', async (t) => {
+  await t.test('descending by potential %, no-data segments sink to the end regardless of how low a real value is', () => {
+    const { get } = loadApp();
+    const sortSegmentsBy = get('sortSegmentsBy');
+    const state = get('state');
+    // Needs >=2 points for estimatePowerCurveAt()'s interpolation to return
+    // anything at all (a single-point curve returns null, same as the
+    // 'rider profile present but MMP curve not interpolatable' case in
+    // buildPotentialChip's own tests above) -- both points equal so
+    // best@60s resolves to exactly 1000 regardless of interpolation.
+    state.profilPage.riderProfile = { mmpCurve: { 60: 1000, 300: 1000 } };
+    const bucket = {
+      efforts: null,
+      details: {
+        low: { athlete_segment_stats: { pr_elapsed_time: 60 } },
+        high: { athlete_segment_stats: { pr_elapsed_time: 60 } },
+        // 'noData' segment deliberately has no detail entry at all.
+      },
+      prWatts: { low: { watts: 100 }, high: { watts: 900 } }, // 10% vs 90%
+    };
+    const list = [{ id: 'noData' }, { id: 'low' }, { id: 'high' }];
+    const sorted = sortSegmentsBy(list, bucket, 'potential').map(s => s.id);
+    assert.deepEqual(sorted, ['high', 'low', 'noData']);
+  });
+
+  await t.test('a genuine 0% potential is a real, valid, low value -- it sorts BEFORE (ahead of) a no-data segment, not after', () => {
+    const { get } = loadApp();
+    const sortSegmentsBy = get('sortSegmentsBy');
+    const state = get('state');
+    state.profilPage.riderProfile = { mmpCurve: { 60: 1000, 300: 1000 } };
+    const bucket = {
+      efforts: null,
+      details: {
+        zero: { athlete_segment_stats: { pr_elapsed_time: 60 } },
+        // 'noData' segment deliberately has no detail entry at all.
+      },
+      prWatts: { zero: { watts: 0 } }, // 0% -- computed, not missing
+    };
+    const list = [{ id: 'noData' }, { id: 'zero' }];
+    const sorted = sortSegmentsBy(list, bucket, 'potential').map(s => s.id);
+    assert.deepEqual(sorted, ['zero', 'noData']);
+  });
+});
+
+// ---------------------------------------------------------------------
+// syncSegmentSortXomOptions() / syncXomSortOptions() (Task 1: both sort
+// dropdowns' kom/qom sync, generalized via syncXomSortOptionsFor())
+// ---------------------------------------------------------------------
+test('syncSegmentSortXomOptions() and syncXomSortOptions() independence', async (t) => {
+  await t.test('turning off showKomChip and calling only segmentSortSelect\'s own sync ("Meine Segmente") falls back state.segmentSortBy, but leaves state.routeSegmentSortBy ("Abgeschlossene Segmente"\'s own field) completely untouched', () => {
+    const { get } = loadApp();
+    const syncSegmentSortXomOptions = get('syncSegmentSortXomOptions');
+    const state = get('state');
+    state.showKomChip = false;
+    state.segmentSortBy = 'kom';
+    state.routeSegmentSortBy = 'kom';
+    syncSegmentSortXomOptions();
+    assert.equal(state.segmentSortBy, 'default');
+    assert.equal(state.routeSegmentSortBy, 'kom');
+  });
+});
+
+// ---------------------------------------------------------------------
 // computeFtpAnalysis(results)
 // ---------------------------------------------------------------------
 test('computeFtpAnalysis', async (t) => {
@@ -463,6 +586,68 @@ test('computeFtpAnalysis', async (t) => {
     assert.deepEqual(plain(out.ceilingSeries), []);
     assert.equal(out.reg, null);
     assert.equal(out.currentCeiling, null);
+  });
+});
+
+// ---------------------------------------------------------------------
+// rideZoneBreakdown(zoneTimes) / computeStreamMetrics(...) zoneTimes wiring
+// (Task 2: "Zeit je Zone" in the Aktivitäten single-activity detail view)
+// ---------------------------------------------------------------------
+test('rideZoneBreakdown', async (t) => {
+  await t.test('all-zero input -> totalMin 0, every zone pct 0 (not NaN from a 0/0 division)', () => {
+    const { get } = loadApp();
+    const rideZoneBreakdown = get('rideZoneBreakdown');
+    const zoneTimes = new Array(7).fill(0);
+    const out = rideZoneBreakdown(zoneTimes);
+    assert.equal(out.totalMin, 0);
+    assert.equal(out.zones.length, 7);
+    out.zones.forEach(z => assert.equal(z.pct, 0));
+  });
+
+  await t.test('converts seconds -> minutes and each zone\'s share of total time as a percentage', () => {
+    const { get } = loadApp();
+    const rideZoneBreakdown = get('rideZoneBreakdown');
+    const POWER_ZONE_META = get('POWER_ZONE_META');
+    // 600s in zone 0 (10 min), 1800s in zone 3 (30 min), 0 elsewhere -- total 2400s (40 min).
+    const zoneTimes = new Array(7).fill(0);
+    zoneTimes[0] = 600;
+    zoneTimes[3] = 1800;
+    const out = rideZoneBreakdown(zoneTimes);
+    assert.equal(out.totalMin, 40);
+    assert.equal(out.zones[0].minutes, 10);
+    assert.equal(out.zones[0].pct, 25); // 600/2400
+    assert.equal(out.zones[3].minutes, 30);
+    assert.equal(out.zones[3].pct, 75); // 1800/2400
+    assert.equal(out.zones[1].minutes, 0);
+    assert.equal(out.zones[1].pct, 0);
+    // name/color carried straight from POWER_ZONE_META, same as
+    // actualWeekZoneBreakdown()'s equivalent mapping.
+    assert.equal(out.zones[0].name, plain(POWER_ZONE_META)[0].name);
+    assert.equal(out.zones[0].color, plain(POWER_ZONE_META)[0].color);
+  });
+});
+
+test('computeStreamMetrics zoneTimes (Task 2 wiring: null powerZones -> all-zero, real zones -> populated)', async (t) => {
+  await t.test('powerZones == null -> zoneTimes is all-zero (the pre-fix Aktivitäten-detail behavior)', () => {
+    const { get } = loadApp();
+    const computeStreamMetrics = get('computeStreamMetrics');
+    const stream = { time: [0, 1, 2, 3, 4], watts: [100, 200, 300, 400, 500] };
+    const metrics = computeStreamMetrics(stream, null, 70);
+    assert.deepEqual(plain(metrics.zoneTimes), [0, 0, 0, 0, 0, 0, 0]);
+  });
+
+  await t.test('real zone boundaries -> zoneTimes reflects actual time-in-zone (the post-fix behavior)', () => {
+    const { get } = loadApp();
+    const computeStreamMetrics = get('computeStreamMetrics');
+    const stream = { time: [0, 1, 2, 3, 4], watts: [50, 50, 300, 300, 300] };
+    // Two zones: [0,100] and [100,null] (open-ended top zone) -- same
+    // powerZonesNorm shape processProfilRide() builds (z.max===-1 -> null).
+    const powerZones = [{ max: 100 }, { max: null }];
+    const metrics = computeStreamMetrics(stream, powerZones, 70);
+    // dt = 1s here; 2 samples at 50W fall in zone 0, 3 samples at 300W in zone 1.
+    assert.equal(metrics.zoneTimes[0], 2);
+    assert.equal(metrics.zoneTimes[1], 3);
+    assert.equal(metrics.zoneTimes.slice(2).every(t => t === 0), true);
   });
 });
 

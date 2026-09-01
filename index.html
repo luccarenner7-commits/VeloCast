@@ -832,11 +832,13 @@ let state = {
   hideIrrelevantSegments: savedSettings.hideIrrelevantSegments != null ? savedSettings.hideIrrelevantSegments : true,
   // Whether the KOM/QOM stat chips (see buildXomChip(), computeSegmentStatChips(),
   // computeRideEffortStatChips()) are shown on segment rows, and whether their
-  // sort options appear in "Abgeschlossene Segmente"'s sort dropdown (see
-  // syncXomSortOptions()). Both default to true so existing users see no
-  // change until they touch these toggles in Einstellungen. `!= null` (not
-  // `||`) for the same reason as hideIrrelevantSegments above -- an explicit
-  // saved `false` must survive a reload.
+  // sort options appear in BOTH sort dropdowns -- "Meine Segmente" (see
+  // syncSegmentSortXomOptions()) and "Abgeschlossene Segmente" (see
+  // syncXomSortOptions()), both thin wrappers around the shared
+  // syncXomSortOptionsFor() helper. Both default to true so existing users
+  // see no change until they touch these toggles in Einstellungen. `!= null`
+  // (not `||`) for the same reason as hideIrrelevantSegments above -- an
+  // explicit saved `false` must survive a reload.
   showKomChip: savedSettings.showKomChip != null ? savedSettings.showKomChip : true,
   showQomChip: savedSettings.showQomChip != null ? savedSettings.showQomChip : true,
   // Per-category whether connecting (fresh OAuth or a stored-token revisit)
@@ -3619,6 +3621,9 @@ const CHANGELOG = [
       'Menüreihenfolge aufgeräumt: „Reifendruck" steht jetzt direkt vor „Änderungen", „Einstellungen" ist als eigener Eintrag unterhalb einer Trennlinie immer erreichbar — auch ohne Strava-Verbindung.',
       'KOM/QOM-Anzeige lässt sich jetzt in den Einstellungen einzeln ein-/ausschalten — betrifft die Stat-Chips bei Segmenten (Meine Segmente & abgeschlossene Segmente) sowie die passenden Sortieroptionen.',
       '„Meine Segmente" zeigt jetzt eine Übersichtskarte mit allen markierten Segmenten auf einen Blick, oberhalb der Liste.',
+      '„Meine Segmente": neue Sortierung „Bestes Potential zuerst".',
+      'KOM-/QOM-Sortierung ist jetzt auch bei „Meine Segmente" auswählbar (vorher nur bei „Abgeschlossene Segmente" verfügbar) und blendet sich dort passend zu den Einstellungen ein/aus.',
+      'Aktivitäten-Detailansicht zeigt jetzt „Zeit je Zone" für die einzelne Fahrt, sofern Trainingsdaten (Profil) geladen sind.',
     ],
     improvements:[
       'Reifendruck: „Aufgepumpt auf" verschwindet, sobald schon ein Ausgangswert gemerkt ist — „Nachmessen & neu aufpumpen" reicht dann allein aus und funktioniert jetzt auch ohne Eingabe bei „Gemessen" (setzt dann einfach den neuen Ausgangswert, ohne die Verlustrate neu zu berechnen).',
@@ -5591,12 +5596,23 @@ function buildXomChip(xomTime, prSeconds, label){
 // --kom-mid) -- die bedeuten "nah an einem Strava-Rekord", ein anderes
 // Konzept als "eigenes Potential ausgeschöpft", und dieselbe Farbe für beide
 // sorgte für Verwirrung.
-function buildPotentialChip(watts, durationSec){
+// Bare numeric % (or null if not computable), factored out of
+// buildPotentialChip() below so the "Potential zuerst" sort (see
+// segmentPotentialValue()/sortSegmentsBy()'s "potential" case) can reuse the
+// exact same watts/duration -> % math without duplicating it or building a
+// display chip it doesn't need — same split as buildXomChip()/
+// segmentXomCloseness().
+function computePotentialPercent(watts, durationSec){
   if(watts == null || durationSec == null) return null;
   const rp = state.profilPage.riderProfile;
   const best = estimatePowerCurveAt(durationSec, rp && rp.mmpCurve);
   if(best == null || best <= 0) return null;
-  const pct = Math.round((watts/best) * 100);
+  return Math.round((watts/best) * 100);
+}
+
+function buildPotentialChip(watts, durationSec){
+  const pct = computePotentialPercent(watts, durationSec);
+  if(pct == null) return null;
   let style = null;
   if(pct >= 95) style = "color:var(--tail); background:var(--tail-bg);";
   else if(pct >= 85) style = "color:var(--cross); background:var(--cross-bg);";
@@ -5691,6 +5707,39 @@ function compareClosenessNullsLast(a, b){
   return a - b;
 }
 
+// Reusable "Genutztes Potential" % as a plain sortable number (or null when
+// not computable), for the "potential" sort case in sortSegmentsBy() below —
+// same display-vs-sortable-number split as segmentXomCloseness()/
+// buildXomChip(). Mirrors computeSegmentStatChips()/computeRideEffortStatChips()'s
+// own watts+duration lookup for each bucket shape (starred vs. ride-
+// completed) so the sort never disagrees with what the chip itself shows.
+function segmentPotentialValue(seg, bucket){
+  const prWatts = bucket.prWatts[seg.id];
+  if(!prWatts) return null;
+  if(bucket.efforts){
+    const effort = bucket.efforts[seg.id];
+    if(!effort || effort.elapsed_time == null) return null;
+    return computePotentialPercent(prWatts.watts, effort.elapsed_time);
+  }
+  const detail = bucket.details[seg.id];
+  if(!detail) return null;
+  const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
+  if(pr == null) return null;
+  return computePotentialPercent(prWatts.watts, pr);
+}
+
+// Descending comparator for the "Bestes Potential zuerst" sort — highest %
+// first, nulls (no MMP data / not computable, see segmentPotentialValue())
+// always sink to the end regardless of how small a real value is, matching
+// compareClosenessNullsLast()'s "no data is worse than any real number"
+// convention above.
+function comparePotentialNullsLast(a, b){
+  if(a == null && b == null) return 0;
+  if(a == null) return 1;
+  if(b == null) return -1;
+  return b - a;
+}
+
 // Shared sort logic for both segment lists (starred "Meine Segmente" and
 // ride-completed "Abgeschlossene Segmente") — takes the already-sliced list
 // to sort plus the bucket (for detail/weather lookups) and a sortBy key, so
@@ -5711,6 +5760,9 @@ function sortSegmentsBy(list, bucket, sortBy){
     // to the end — see segmentXomCloseness()/compareClosenessNullsLast().
     case "kom": return list.slice().sort((a,b) => compareClosenessNullsLast(segmentXomCloseness(a, bucket, "kom"), segmentXomCloseness(b, bucket, "kom")));
     case "qom": return list.slice().sort((a,b) => compareClosenessNullsLast(segmentXomCloseness(a, bucket, "qom"), segmentXomCloseness(b, bucket, "qom")));
+    // Highest "Genutztes Potential" % first, no-data segments pushed to the
+    // end — see segmentPotentialValue()/comparePotentialNullsLast().
+    case "potential": return list.slice().sort((a,b) => comparePotentialNullsLast(segmentPotentialValue(a, bucket), segmentPotentialValue(b, bucket)));
     default: return list;
   }
 }
@@ -6027,7 +6079,11 @@ const segmentSortSelect = el("select", {
   el("option", {value:"effort"}, ["Am häufigsten gefahren"]),
   el("option", {value:"shortest"}, ["Länge: kurz → lang"]),
   el("option", {value:"longest"}, ["Länge: lang → kurz"]),
-  el("option", {value:"steepest"}, ["Steilste zuerst"])
+  el("option", {value:"steepest"}, ["Steilste zuerst"]),
+  // Unlike kom/qom below, Potential has no show/hide Einstellungen toggle,
+  // so it's a plain always-present static option, not synced by
+  // syncXomSortOptionsFor().
+  el("option", {value:"potential"}, ["Bestes Potential zuerst"])
 ]);
 
 // Same persistent-node pattern and same reason as segmentSortSelect just
@@ -6035,10 +6091,13 @@ const segmentSortSelect = el("select", {
 // under an open picker) — this is "Abgeschlossene Segmente"'s own sort
 // select, kept as a fully separate node/state field (state.
 // routeSegmentSortBy) so its dropdown selection can never leak into or be
-// clobbered by segmentSortSelect's, and vice versa. Same option set as
-// segmentSortSelect plus the two KOM/QOM-closeness options, which only make
-// sense here (and would work fine on "Meine Segmente" too, but weren't asked
-// for there).
+// clobbered by segmentSortSelect's, and vice versa. Shares the same base 6
+// static options as segmentSortSelect above, but NOT its static "Potential"
+// option -- that one is specific to "Meine Segmente". Both selects
+// independently gain/lose their own kom/qom options based on state.
+// showKomChip/showQomChip, via the generalized syncXomSortOptionsFor()
+// helper below (this select's own call site is syncXomSortOptions(),
+// segmentSortSelect's is syncSegmentSortXomOptions()).
 const routeSegmentSortSelect = el("select", {
   style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:var(--r-sm); padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
   onchange:(e)=>{ state.routeSegmentSortBy = e.target.value; render(); }
@@ -6051,35 +6110,55 @@ const routeSegmentSortSelect = el("select", {
   el("option", {value:"steepest"}, ["Steilste zuerst"])
 ]);
 
-// Kept as detached nodes, appended/removed by syncXomSortOptions() (Task 1:
-// KOM/QOM show/hide toggles in Einstellungen) rather than always living in
-// routeSegmentSortSelect's option list above -- these two only make sense
+// Kept as detached nodes, appended/removed by syncXomSortOptionsFor() (Task
+// 1: KOM/QOM show/hide toggles in Einstellungen) rather than always living
+// in routeSegmentSortSelect's option list above -- these two only make sense
 // while the corresponding stat chip is actually shown.
 const routeSegmentSortKomOption = el("option", {value:"kom"}, ["Nähe zum KOM (%)"]);
 const routeSegmentSortQomOption = el("option", {value:"qom"}, ["Nähe zum QOM (%)"]);
 
-// Keeps routeSegmentSortSelect's KOM/QOM options in sync with the
-// Einstellungen toggles (state.showKomChip/showQomChip). appendChild on an
+// Same pattern, own detached nodes, for segmentSortSelect ("Meine Segmente")
+// -- kept fully separate from routeSegmentSort{Kom,Qom}Option above so
+// appending/removing one select's options can never touch the other
+// select's DOM nodes.
+const segmentSortKomOption = el("option", {value:"kom"}, ["Nähe zum KOM (%)"]);
+const segmentSortQomOption = el("option", {value:"qom"}, ["Nähe zum QOM (%)"]);
+
+// Generalized version of the sync logic both sort selects need: keeps
+// `select`'s KOM/QOM options in sync with the Einstellungen toggles
+// (state.showKomChip/showQomChip), falling back `select`'s OWN sort state
+// field (`sortStateKey`, e.g. "segmentSortBy" or "routeSegmentSortBy") to
+// "default" if it was pointed at the option being hidden. appendChild on an
 // already-attached option just moves it to the end, so calling this on every
 // render is cheap and idempotent, and always keeps KOM before QOM at the
-// tail of the list regardless of which (if either) is currently shown. If
-// the sort dropdown is currently sitting on "kom"/"qom" and that option is
-// the one being hidden, falls back to "default" (the sensible baseline sort)
-// rather than leaving the <select> pointed at a value with no matching
-// <option> anymore.
-function syncXomSortOptions(){
+// tail of the list regardless of which (if either) is currently shown. Each
+// select passes its own detached option nodes and own state key, so the two
+// selects' options/state can never leak into or clobber each other.
+function syncXomSortOptionsFor(select, komOption, qomOption, sortStateKey){
   if(state.showKomChip){
-    if(!routeSegmentSortKomOption.parentNode) routeSegmentSortSelect.appendChild(routeSegmentSortKomOption);
+    if(!komOption.parentNode) select.appendChild(komOption);
   } else {
-    routeSegmentSortKomOption.remove();
-    if(state.routeSegmentSortBy === "kom") state.routeSegmentSortBy = "default";
+    komOption.remove();
+    if(state[sortStateKey] === "kom") state[sortStateKey] = "default";
   }
   if(state.showQomChip){
-    if(!routeSegmentSortQomOption.parentNode) routeSegmentSortSelect.appendChild(routeSegmentSortQomOption);
+    if(!qomOption.parentNode) select.appendChild(qomOption);
   } else {
-    routeSegmentSortQomOption.remove();
-    if(state.routeSegmentSortBy === "qom") state.routeSegmentSortBy = "default";
+    qomOption.remove();
+    if(state[sortStateKey] === "qom") state[sortStateKey] = "default";
   }
+}
+
+// routeSegmentSortSelect's ("Abgeschlossene Segmente") own sync call --
+// unchanged call sites elsewhere in the file keep calling this exact name.
+function syncXomSortOptions(){
+  syncXomSortOptionsFor(routeSegmentSortSelect, routeSegmentSortKomOption, routeSegmentSortQomOption, "routeSegmentSortBy");
+}
+
+// segmentSortSelect's ("Meine Segmente") own sync call — see
+// renderSegmentsCard() for the call site.
+function syncSegmentSortXomOptions(){
+  syncXomSortOptionsFor(segmentSortSelect, segmentSortKomOption, segmentSortQomOption, "segmentSortBy");
 }
 
 // The plain starred-segments list (sort dropdown + rows) — content/behavior
@@ -6108,6 +6187,7 @@ function renderSegmentsCard(){
     return card;
   }
 
+  syncSegmentSortXomOptions();
   syncPersistentInputValue(segmentSortSelect, state.segmentSortBy);
   card.appendChild(el("div", {style:"margin-bottom:14px;"}, [
     el("label", {}, ["Sortierung"]),
@@ -7032,7 +7112,17 @@ async function loadAktivitaetenDetailStream(id, token){
     d.stream = stream;
     if(Array.isArray(stream.watts) && stream.watts.some(w => w != null)){
       const weightKg = state.profilPage.athleteDetail && state.profilPage.athleteDetail.weight;
-      const metrics = computeStreamMetrics(stream, null, weightKg);
+      // Same normalization as processProfilRide()'s powerZonesNorm above —
+      // real zone boundaries when Profil's Trainingsdaten (state.profilPage.
+      // zonesRaw) have been loaded, so zoneTimes below comes back as this
+      // ride's actual time-in-zone breakdown instead of an all-zero array.
+      // Not guaranteed loaded (see renderAktivitaetenDetailChartSection()'s
+      // "Zeit je Zone" section, which simply omits itself when it isn't) —
+      // this call site doesn't trigger a fetch, matching the
+      // buildPotentialChip()-style "silently unavailable" convention.
+      const powerZonesRaw = state.profilPage.zonesRaw && state.profilPage.zonesRaw.power && state.profilPage.zonesRaw.power.zones;
+      const powerZonesNorm = Array.isArray(powerZonesRaw) ? powerZonesRaw.map(z=>({ max: z.max===-1 ? null : z.max })) : null;
+      const metrics = computeStreamMetrics(stream, powerZonesNorm, weightKg);
       const maxWatts = stream.watts.reduce((m, w) => (w != null && w > m) ? w : m, 0);
       d.metrics = metrics ? { ...metrics, maxWatts: Math.round(maxWatts) } : { maxWatts: Math.round(maxWatts) };
     }
@@ -7201,6 +7291,23 @@ function renderAktivitaetenListCard(){
   return card;
 }
 
+// Adapts one ride's zoneTimes (raw seconds per zone, see computeStreamMetrics())
+// into the same {zones, totalMin} shape actualWeekZoneBreakdown() builds for
+// the weekly Trainer-tab aggregate, so this one ride can reuse
+// appendZoneBars()/barRow() for visual consistency instead of a new chart
+// type. No qualityPct overlay — that's intervalZoneTimes' minimum-duration
+// "quality interval" concept for weekly training-load purposes; this section
+// deliberately shows the plain per-zone time for this one ride instead (see
+// renderAktivitaetenDetailChartSection()'s comment).
+function rideZoneBreakdown(zoneTimes){
+  const totalSec = zoneTimes.reduce((a,b) => a+b, 0);
+  const zones = POWER_ZONE_META.map((z,i) => ({
+    name: z.name, color: z.color, minutes: zoneTimes[i]/60,
+    pct: totalSec>0 ? zoneTimes[i]/totalSec*100 : 0
+  }));
+  return { zones, totalMin: totalSec/60 };
+}
+
 function renderAktivitaetenDetailChartSection(a){
   const ap = state.aktivitaetenPage;
   const d = ap.detail;
@@ -7239,6 +7346,23 @@ function renderAktivitaetenDetailChartSection(a){
         if(d.metrics.avgPower != null) cards.push(metricCard("Ø Leistung", `${d.metrics.avgPower} W`, null));
         if(d.metrics.maxWatts != null) cards.push(metricCard("Max. Leistung", `${d.metrics.maxWatts} W`, null));
         if(cards.length) card.appendChild(el("div", {class:"metric-grid", style:"margin-top:14px; margin-bottom:0;"}, cards));
+
+        // "Zeit je Zone" (Task 2): needs real zone boundaries, which
+        // loadAktivitaetenDetailStream() only has when Profil's
+        // Trainingsdaten (state.profilPage.zonesRaw) were already loaded —
+        // NOT guaranteed (see that function's comment). Same silent-omission
+        // convention as buildPotentialChip(): no data -> no section, no
+        // error, no auto-fetch prompt, rather than a broken/all-zero chart.
+        // Checking zoneTimes' own sum (not just zonesRaw's presence) also
+        // covers the case where the stream was fetched before zonesRaw
+        // became available — zoneTimes would then be a stale all-zero array
+        // even though zonesRaw exists now.
+        if(Array.isArray(d.metrics.zoneTimes) && d.metrics.zoneTimes.some(t => t > 0)){
+          card.appendChild(el("div", {style:"display:flex; align-items:center; gap:var(--space-2); font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:16px 0 4px;"}, [
+            "Zeit je Zone"
+          ]));
+          appendZoneBars(card, rideZoneBreakdown(d.metrics.zoneTimes));
+        }
       }
     }
   }
@@ -12077,7 +12201,9 @@ function renderEinstellungenPage(){
   // KOM/QOM show/hide toggles (Task 1) — gate the KOM/QOM stat chips built by
   // buildXomChip() (used in computeSegmentStatChips()/computeRideEffortStatChips()
   // on both "Meine Segmente" and completed-ride segments) and the matching
-  // "Nähe zum KOM/QOM"-Sortierungsoptionen in "Abgeschlossene Segmente" (see
+  // "Nähe zum KOM/QOM"-Sortierungsoptionen on BOTH sort dropdowns -- "Meine
+  // Segmente" and "Abgeschlossene Segmente" -- via the generalized
+  // syncXomSortOptionsFor() helper (see syncSegmentSortXomOptions()/
   // syncXomSortOptions()). Both default to true, so this is purely opt-out.
   const segmentDisplayCard = el('div', {class:'card'});
   segmentDisplayCard.appendChild(el('h2', {}, ['Segmente']));
