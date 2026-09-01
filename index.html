@@ -823,6 +823,15 @@ let state = {
   // `!= null` (not `||`) so an explicit saved `false` survives a reload
   // instead of being coerced back to the true default.
   hideIrrelevantSegments: savedSettings.hideIrrelevantSegments != null ? savedSettings.hideIrrelevantSegments : true,
+  // Whether the KOM/QOM stat chips (see buildXomChip(), computeSegmentStatChips(),
+  // computeRideEffortStatChips()) are shown on segment rows, and whether their
+  // sort options appear in "Abgeschlossene Segmente"'s sort dropdown (see
+  // syncXomSortOptions()). Both default to true so existing users see no
+  // change until they touch these toggles in Einstellungen. `!= null` (not
+  // `||`) for the same reason as hideIrrelevantSegments above -- an explicit
+  // saved `false` must survive a reload.
+  showKomChip: savedSettings.showKomChip != null ? savedSettings.showKomChip : true,
+  showQomChip: savedSettings.showQomChip != null ? savedSettings.showQomChip : true,
   // Per-category whether connecting (fresh OAuth or a stored-token revisit)
   // should immediately auto-fetch that category, same as the app always did
   // before this setting existed. `!= null` (not `||`) for the same reason as
@@ -1981,6 +1990,8 @@ function saveSettings(){
       avgSpeedKmh: state.avgSpeedKmh,
       routePointDistanceKm: state.routePointDistanceKm,
       hideIrrelevantSegments: state.hideIrrelevantSegments,
+      showKomChip: state.showKomChip,
+      showQomChip: state.showQomChip,
       autoLoadActivities: state.autoLoadActivities,
       autoLoadSegments: state.autoLoadSegments,
       autoLoadTraining: state.autoLoadTraining,
@@ -3599,6 +3610,8 @@ const CHANGELOG = [
     features:[
       'Kopfzeile mit dem Menü-Button bleibt jetzt beim Scrollen sichtbar oben stehen, statt mit der Seite mit hochzuscrollen.',
       'Menüreihenfolge aufgeräumt: „Reifendruck" steht jetzt direkt vor „Änderungen", „Einstellungen" ist als eigener Eintrag unterhalb einer Trennlinie immer erreichbar — auch ohne Strava-Verbindung.',
+      'KOM/QOM-Anzeige lässt sich jetzt in den Einstellungen einzeln ein-/ausschalten — betrifft die Stat-Chips bei Segmenten (Meine Segmente & abgeschlossene Segmente) sowie die passenden Sortieroptionen.',
+      '„Meine Segmente" zeigt jetzt eine Übersichtskarte mit allen markierten Segmenten auf einen Blick, oberhalb der Liste.',
     ],
     improvements:[
       'Reifendruck: „Aufgepumpt auf" verschwindet, sobald schon ein Ausgangswert gemerkt ist — „Nachmessen & neu aufpumpen" reicht dann allein aus und funktioniert jetzt auch ohne Eingabe bei „Gemessen" (setzt dann einfach den neuen Ausgangswert, ohne die Verlustrate neu zu berechnen).',
@@ -5208,11 +5221,37 @@ let routeMapLayers = null; // L.layerGroup holding everything drawn on top of th
 let mountedRouteKey = null; // identifies which route/segment leafletMapInstance is currently showing
 let routeMarkerByIndex = {}; // routePoints index -> Leaflet marker (for weather-chip clicks)
 
+// The starred segments currently visible on "Meine Segmente" (respects
+// state.hideIrrelevantSegments via sortedVisibleSegments — the exact same
+// list the page's rows come from, see renderSegmentsCard()) that have
+// geometry already loaded — i.e. what the overview map
+// (mountSegmentsOverviewView()) can actually draw. Every starred segment's
+// detail (incl. geometry) is eagerly fetched by loadSegmentExtras() for the
+// whole bucket, so this never triggers a new fetch — it just filters down to
+// whichever details have already arrived, skipping any segment still loading
+// or genuinely lacking a polyline. Shared by currentRouteKey() (decides
+// whether the overview map view is even active) and
+// mountSegmentsOverviewView() (the actual polylines) and renderSegmentsCard()
+// (whether to show the map container at all) so all three can never disagree
+// about which segments are "on the map".
+function segmentsWithOverviewGeometry(){
+  const bucket = segmentBucket("starred");
+  return sortedVisibleSegments(bucket).filter(seg => {
+    const detail = bucket.details[seg.id];
+    return !!(detail && detail.map && (detail.map.polyline || detail.map.summary_polyline));
+  });
+}
+
 // Distinguishes "still the same route/segment, just re-rendering with new
 // data" (keep the map + tiles, only redraw the overlay layer) from
 // "switched to a different route" (full teardown + fresh mount needed).
 function currentRouteKey(){
   if(isShowingSegmentDetail()) return "segment-" + state.selectedSegmentSource + "-" + state.selectedSegmentId;
+  // "Meine Segmente" list page (Task 2): the shared overview key only while
+  // there's at least one starred segment with usable geometry — otherwise
+  // null, same as the route-page branch below when there's no route yet, so
+  // mountRouteMap() tears down/no-ops instead of showing a blank canvas.
+  if(state.activePage === "segments") return segmentsWithOverviewGeometry().length ? "segments-overview" : null;
   if(!state.fullRouteCoords.length) return null;
   const a = state.selectedActivity;
   return "route-" + (a ? (a.id || a.name || "") : "");
@@ -5249,6 +5288,8 @@ function mountRouteMap(){
 
   if(isShowingSegmentDetail()){
     mountSegmentView(leafletMapInstance, routeMapLayers, state.selectedSegmentId, isNewRoute);
+  } else if(state.activePage === "segments"){
+    mountSegmentsOverviewView(leafletMapInstance, routeMapLayers, isNewRoute);
   } else {
     mountFullRouteView(leafletMapInstance, routeMapLayers, isNewRoute);
   }
@@ -5303,6 +5344,34 @@ function mountSegmentView(map, layers, segId, isNewRoute){
       iconSize: [26,26], iconAnchor: [13,13]
     });
     L.marker(midPoint, { icon }).addTo(layers).bindPopup(label);
+  }
+}
+
+// "Meine Segmente" overview map (Task 2): every visible starred segment with
+// already-loaded geometry (see segmentsWithOverviewGeometry()), each as its
+// own static polyline in one consistent color — the same neutral --route
+// blue mountSegmentView() itself falls back to when there's no wind data for
+// a segment. This is a static overview, not a per-segment detail view, so
+// there's deliberately no wind coloring/popups/direction arrows/start-finish
+// markers and no click-to-select here, unlike mountSegmentView() above — just
+// the shapes, so the rider can see where all their starred segments are
+// relative to each other. On a fresh mount, fits the map to the combined
+// bounds of every polyline drawn (same [30,30] padding convention as
+// mountSegmentView()'s single-segment fitBounds above).
+function mountSegmentsOverviewView(map, layers, isNewRoute){
+  const bucket = segmentBucket("starred");
+  const drawnLines = [];
+  segmentsWithOverviewGeometry().forEach(seg => {
+    const detail = bucket.details[seg.id];
+    const poly = detail && detail.map && (detail.map.polyline || detail.map.summary_polyline);
+    if(!poly) return;
+    const coords = decodePolyline(poly);
+    const latlngs = coords.map(c => [c[0], c[1]]);
+    const line = L.polyline(latlngs, { color:"#82a2d1", weight:5, opacity:0.95, lineCap:"round", lineJoin:"round" }).addTo(layers);
+    drawnLines.push(line);
+  });
+  if(isNewRoute && drawnLines.length){
+    map.fitBounds(L.featureGroup(drawnLines).getBounds(), { padding:[30,30] });
   }
 }
 
@@ -5441,8 +5510,8 @@ function computeSegmentStatChips(seg, bucket){
     if(prWatts) secondary.push(`${prWatts.measured ? "" : "~"}${prWatts.watts} W`);
     const potential = prWatts ? buildPotentialChip(prWatts.watts, pr) : null;
     if(potential) hero.push(potential);
-    if(detail.xoms && detail.xoms.kom) hero.push(buildXomChip(detail.xoms.kom, pr, "KOM"));
-    if(detail.xoms && detail.xoms.qom) hero.push(buildXomChip(detail.xoms.qom, pr, "QOM"));
+    if(state.showKomChip && detail.xoms && detail.xoms.kom) hero.push(buildXomChip(detail.xoms.kom, pr, "KOM"));
+    if(state.showQomChip && detail.xoms && detail.xoms.qom) hero.push(buildXomChip(detail.xoms.qom, pr, "QOM"));
     if(detail.total_elevation_gain != null) secondary.push(`${Math.round(detail.total_elevation_gain)} Hm`);
     const effortCount = detail.athlete_segment_stats && detail.athlete_segment_stats.effort_count;
     if(effortCount) secondary.push(`${effortCount}× gefahren`);
@@ -5554,8 +5623,8 @@ function computeRideEffortStatChips(effort, prWatts, detail){
   if(detail){
     const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
     if(pr != null) secondary.push(`PR ${fmtDuration(pr)}`);
-    if(detail.xoms && detail.xoms.kom) hero.push(buildXomChip(detail.xoms.kom, pr, "KOM"));
-    if(detail.xoms && detail.xoms.qom) hero.push(buildXomChip(detail.xoms.qom, pr, "QOM"));
+    if(state.showKomChip && detail.xoms && detail.xoms.kom) hero.push(buildXomChip(detail.xoms.kom, pr, "KOM"));
+    if(state.showQomChip && detail.xoms && detail.xoms.qom) hero.push(buildXomChip(detail.xoms.qom, pr, "QOM"));
     if(detail.total_elevation_gain != null) secondary.push(`${Math.round(detail.total_elevation_gain)} Hm`);
     const effortCount = detail.athlete_segment_stats && detail.athlete_segment_stats.effort_count;
     if(effortCount) secondary.push(`${effortCount}× gefahren`);
@@ -5965,10 +6034,39 @@ const routeSegmentSortSelect = el("select", {
   el("option", {value:"effort"}, ["Am häufigsten gefahren"]),
   el("option", {value:"shortest"}, ["Länge: kurz → lang"]),
   el("option", {value:"longest"}, ["Länge: lang → kurz"]),
-  el("option", {value:"steepest"}, ["Steilste zuerst"]),
-  el("option", {value:"kom"}, ["Nähe zum KOM (%)"]),
-  el("option", {value:"qom"}, ["Nähe zum QOM (%)"])
+  el("option", {value:"steepest"}, ["Steilste zuerst"])
 ]);
+
+// Kept as detached nodes, appended/removed by syncXomSortOptions() (Task 1:
+// KOM/QOM show/hide toggles in Einstellungen) rather than always living in
+// routeSegmentSortSelect's option list above -- these two only make sense
+// while the corresponding stat chip is actually shown.
+const routeSegmentSortKomOption = el("option", {value:"kom"}, ["Nähe zum KOM (%)"]);
+const routeSegmentSortQomOption = el("option", {value:"qom"}, ["Nähe zum QOM (%)"]);
+
+// Keeps routeSegmentSortSelect's KOM/QOM options in sync with the
+// Einstellungen toggles (state.showKomChip/showQomChip). appendChild on an
+// already-attached option just moves it to the end, so calling this on every
+// render is cheap and idempotent, and always keeps KOM before QOM at the
+// tail of the list regardless of which (if either) is currently shown. If
+// the sort dropdown is currently sitting on "kom"/"qom" and that option is
+// the one being hidden, falls back to "default" (the sensible baseline sort)
+// rather than leaving the <select> pointed at a value with no matching
+// <option> anymore.
+function syncXomSortOptions(){
+  if(state.showKomChip){
+    if(!routeSegmentSortKomOption.parentNode) routeSegmentSortSelect.appendChild(routeSegmentSortKomOption);
+  } else {
+    routeSegmentSortKomOption.remove();
+    if(state.routeSegmentSortBy === "kom") state.routeSegmentSortBy = "default";
+  }
+  if(state.showQomChip){
+    if(!routeSegmentSortQomOption.parentNode) routeSegmentSortSelect.appendChild(routeSegmentSortQomOption);
+  } else {
+    routeSegmentSortQomOption.remove();
+    if(state.routeSegmentSortBy === "qom") state.routeSegmentSortBy = "default";
+  }
+}
 
 // The plain starred-segments list (sort dropdown + rows) — content/behavior
 // unchanged from before Task 2, just now rendered from renderSegmentsPage()
@@ -6010,6 +6108,17 @@ function renderSegmentsCard(){
     "Nicht relevante Segmente ausblenden",
     ()=>{ state.hideIrrelevantSegments = !state.hideIrrelevantSegments; saveSettings(); render(); }
   ));
+
+  // Overview map (Task 2): all starred segments with already-loaded geometry
+  // on one shared map, above the list, mirroring how the route page always
+  // shows its map. Only attached to the DOM when there's actually something
+  // to draw — mountRouteMap()/currentRouteKey() key this same check off
+  // segmentsWithOverviewGeometry() too, so omitting the container here (zero
+  // starred segments, or none with geometry loaded yet) never leaves a blank
+  // Leaflet canvas behind.
+  if(segmentsWithOverviewGeometry().length){
+    card.appendChild(routeMapContainer);
+  }
 
   const bucket = segmentBucket("starred");
   sortedVisibleSegments(bucket).forEach(seg=>{
@@ -6127,6 +6236,7 @@ function renderRouteSegmentsCard(){
     return card;
   }
 
+  syncXomSortOptions();
   syncPersistentInputValue(routeSegmentSortSelect, state.routeSegmentSortBy);
   card.appendChild(el("div", {style:"margin-bottom:14px;"}, [
     el("label", {}, ["Sortierung"]),
@@ -11949,6 +12059,23 @@ function renderEinstellungenPage(){
     'Wenn eine Kategorie deaktiviert ist, wird sie nach dem Verbinden nicht automatisch geladen — stattdessen erscheint an ihrer Stelle ein „laden"-Button.'
   ]));
   frag.appendChild(autoLoadCard);
+
+  // KOM/QOM show/hide toggles (Task 1) — gate the KOM/QOM stat chips built by
+  // buildXomChip() (used in computeSegmentStatChips()/computeRideEffortStatChips()
+  // on both "Meine Segmente" and completed-ride segments) and the matching
+  // "Nähe zum KOM/QOM"-Sortierungsoptionen in "Abgeschlossene Segmente" (see
+  // syncXomSortOptions()). Both default to true, so this is purely opt-out.
+  const segmentDisplayCard = el('div', {class:'card'});
+  segmentDisplayCard.appendChild(el('h2', {}, ['Segmente']));
+  segmentDisplayCard.appendChild(renderToggleSwitch(
+    state.showKomChip, "KOM anzeigen",
+    ()=>{ state.showKomChip = !state.showKomChip; saveSettings(); render(); }
+  ));
+  segmentDisplayCard.appendChild(renderToggleSwitch(
+    state.showQomChip, "QOM anzeigen",
+    ()=>{ state.showQomChip = !state.showQomChip; saveSettings(); render(); }
+  ));
+  frag.appendChild(segmentDisplayCard);
 
   frag.appendChild(buildEquipmentModeCard());
 
