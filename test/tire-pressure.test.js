@@ -345,3 +345,77 @@ test('computeTirePressureReminder', async (t) => {
     assert.equal(result.front, false);
   });
 });
+
+// ---------------------------------------------------------------------
+// applyNachmessenUpdate(w, measured, neu, now) -- "Nachmessen & neu
+// aufpumpen" button logic (see buildTireWheelCard). Folds the old
+// standalone "Aufgepumpt" reset into this same button for the
+// already-has-a-baseline case: with Gemessen filled in, behaves exactly as
+// before (loss-rate learning + history entry); with Gemessen left empty, it
+// still resets the baseline from "Neu aufgepumpt auf" but skips all of the
+// rate-learning/history side effects.
+// ---------------------------------------------------------------------
+test('applyNachmessenUpdate', async (t) => {
+  function wheelWithBaseline(){
+    return { lastBaselineBar: 6.0, lastBaselineAtMs: Date.now() - 48 * 3600000, learnedRateBarPerDay: 0.15, history: [] };
+  }
+
+  await t.test('Gemessen and Neu both filled -- unchanged behavior: rate learning happens, history gets an entry', () => {
+    const { get } = loadApp();
+    const applyNachmessenUpdate = get('applyNachmessenUpdate');
+    const w = wheelWithBaseline();
+    const now = Date.now();
+    const changed = applyNachmessenUpdate(w, 5.4, 6.2, now); // 0.6 bar lost over 48h -> 0.3 bar/day
+    assert.equal(changed, true);
+    assert.equal(w.lastBaselineBar, 6.2);
+    assert.equal(w.lastBaselineAtMs, now);
+    // EMA: 0.3*0.3 + 0.7*0.15 = 0.195
+    assert.ok(Math.abs(w.learnedRateBarPerDay - 0.195) < 1e-9, `expected learnedRateBarPerDay ~0.195, got ${w.learnedRateBarPerDay}`);
+    assert.equal(w.history.length, 1);
+    assert.equal(w.history[0].measuredBar, 5.4);
+    assert.equal(w.history[0].priorBar, 6.0);
+  });
+
+  await t.test('Gemessen empty/NaN, Neu filled -- baseline updates, NO rate learning, NO history entry', () => {
+    const { get } = loadApp();
+    const applyNachmessenUpdate = get('applyNachmessenUpdate');
+    const w = wheelWithBaseline();
+    const now = Date.now();
+    const changed = applyNachmessenUpdate(w, NaN, 6.2, now);
+    assert.equal(changed, true);
+    assert.equal(w.lastBaselineBar, 6.2);
+    assert.equal(w.lastBaselineAtMs, now);
+    assert.equal(w.learnedRateBarPerDay, 0.15); // untouched
+    assert.equal(w.history.length, 0);
+  });
+
+  await t.test('Neu invalid (empty/NaN) -- no-op, nothing changes, regardless of Gemessen', () => {
+    const { get } = loadApp();
+    const applyNachmessenUpdate = get('applyNachmessenUpdate');
+    const w = wheelWithBaseline();
+    const before = JSON.parse(JSON.stringify(w));
+    const changed = applyNachmessenUpdate(w, 5.4, NaN, Date.now());
+    assert.equal(changed, false);
+    assert.deepEqual(w, before);
+  });
+
+  await t.test('Neu invalid (0) -- no-op, nothing changes', () => {
+    const { get } = loadApp();
+    const applyNachmessenUpdate = get('applyNachmessenUpdate');
+    const w = wheelWithBaseline();
+    const before = JSON.parse(JSON.stringify(w));
+    const changed = applyNachmessenUpdate(w, 5.4, 0, Date.now());
+    assert.equal(changed, false);
+    assert.deepEqual(w, before);
+  });
+
+  await t.test('Neu invalid (negative) -- no-op, nothing changes, even with Gemessen empty', () => {
+    const { get } = loadApp();
+    const applyNachmessenUpdate = get('applyNachmessenUpdate');
+    const w = wheelWithBaseline();
+    const before = JSON.parse(JSON.stringify(w));
+    const changed = applyNachmessenUpdate(w, NaN, -1, Date.now());
+    assert.equal(changed, false);
+    assert.deepEqual(w, before);
+  });
+});

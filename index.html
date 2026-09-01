@@ -156,7 +156,32 @@
   @media (min-width:900px){ .app{ max-width: 900px; } }
   @media (min-width:1200px){ .app{ max-width: none; padding-left: clamp(20px, 4vw, 96px); padding-right: clamp(20px, 4vw, 96px); } }
 
-  .brand{ display:flex; align-items:baseline; justify-content:space-between; margin-bottom: 22px; }
+  /* Sticky header: this is a phone-first PWA, so the hamburger button (the
+     only way back into the nav drawer) needs to stay reachable on a long
+     scrolled page instead of scrolling away with the rest of .brand's
+     content. Negative margins matching .app's own padding (28px top, 20px
+     sides, growing via clamp() above 1200px -- see .app above) pull .brand
+     out to flush against the viewport edges; matching padding on the same
+     sides puts the h1/status/hamburger content back where it visually sat
+     before. margin-bottom is left untouched (not negated) so the existing
+     22px gap before the page content below is unaffected. z-index:30 sits
+     above normal page content but below both nav-backdrop (40) and
+     nav-drawer (41), so opening the drawer still overlays this bar
+     correctly instead of the bar covering it. */
+  .brand{
+    display:flex; align-items:baseline; justify-content:space-between;
+    position: sticky; top: 0; z-index: 30;
+    margin: -28px -20px 22px; padding: 28px 20px 0;
+    background: var(--asphalt);
+  }
+  @media (min-width:1200px){
+    .brand{
+      margin-left: calc(-1 * clamp(20px, 4vw, 96px));
+      margin-right: calc(-1 * clamp(20px, 4vw, 96px));
+      padding-left: clamp(20px, 4vw, 96px);
+      padding-right: clamp(20px, 4vw, 96px);
+    }
+  }
   .brand .brand-left{ display:flex; align-items:baseline; gap:12px; }
   .brand h1{
     font-family:'Space Grotesk', sans-serif;
@@ -2534,6 +2559,32 @@ function computeTirePressureReminder(data){
   return result;
 }
 
+// "Nachmessen & neu aufpumpen" button logic (see buildTireWheelCard): folds
+// two cases into one so the button works whether or not "Gemessen" was
+// filled in. If `measured` is a finite number, runs the loss-rate-learning
+// path (rate computed from the prior baseline -> measured, folded into the
+// learned EMA, appended to history) before resetting the baseline. If not
+// (field left empty/invalid), skips all of that and just resets the
+// baseline, same as the old standalone "Aufgepumpt" button. Mutates `w` in
+// place, matching how the onclick handler it replaces already worked; a
+// no-op (leaves `w` untouched) if `neu` isn't a valid positive number --
+// returns false in that case (true otherwise) so the caller can skip the
+// save/render that follows, same as the early `return` this replaces.
+function applyNachmessenUpdate(w, measured, neu, now){
+  if(!(isFinite(neu) && neu > 0)) return false;
+  if(isFinite(measured)){
+    const hoursElapsed = (now - w.lastBaselineAtMs) / 3600000;
+    const rate = computeLossRateBarPerDay(w.lastBaselineBar, measured, hoursElapsed);
+    if(rate != null){
+      w.learnedRateBarPerDay = updateLearnedRateBarPerDay(w.learnedRateBarPerDay, rate);
+      w.history.push({ measuredAtMs: now, priorBar: w.lastBaselineBar, measuredBar: measured, hoursElapsed, rateBarPerDay: rate });
+    }
+  }
+  w.lastBaselineBar = Math.round(neu * 10) / 10;
+  w.lastBaselineAtMs = now;
+  return true;
+}
+
 // ---------- Profil: per-ride estimation math ----------
 // Ported from the Artifact's estimateFtpFromBestEfforts()/computeStreamMetrics()
 // etc. (see strava-ftp-forecast/index.html ~L747-921), adapted to work
@@ -3522,7 +3573,6 @@ const NAV_ITEMS = [
   {id:"profil", label:"Profil"},
   {id:"aktivitaeten", label:"Aktivitäten"},
   {id:"trainer", label:"Trainer"},
-  {id:"einstellungen", label:"Einstellungen"},
   {id:"reifendruck", label:"Reifendruck"},
   {id:"changelog", label:"Änderungen"}
 ];
@@ -3545,6 +3595,14 @@ const CHANGELOG_SEEN_KEY = 'velocast_changelog_seen';
 // A date with no items in a category simply omits that category's heading
 // rather than showing an empty section.
 const CHANGELOG = [
+  { date:'01.09.2026',
+    features:[
+      'Kopfzeile mit dem Menü-Button bleibt jetzt beim Scrollen sichtbar oben stehen, statt mit der Seite mit hochzuscrollen.',
+      'Menüreihenfolge aufgeräumt: „Reifendruck" steht jetzt direkt vor „Änderungen", „Einstellungen" ist als eigener Eintrag unterhalb einer Trennlinie immer erreichbar — auch ohne Strava-Verbindung.',
+    ],
+    improvements:[
+      'Reifendruck: „Aufgepumpt auf" verschwindet, sobald schon ein Ausgangswert gemerkt ist — „Nachmessen & neu aufpumpen" reicht dann allein aus und funktioniert jetzt auch ohne Eingabe bei „Gemessen" (setzt dann einfach den neuen Ausgangswert, ohne die Verlustrate neu zu berechnen).',
+    ]},
   { date:'29.08.2026',
     features:[
       'Neue Seite „Reifendruck": berechnet einen empfohlenen Zieldruck getrennt für Vorder- und Hinterrad, merkt sich das letzte Aufpumpen und lernt aus „Nachmessen & neu aufpumpen"-Einträgen, wie schnell die Reifen Luft verlieren — inklusive Hinweis-Banner, wenn der geschätzte aktuelle Druck vermutlich unter der eingestellten Schwelle liegt.',
@@ -3665,19 +3723,27 @@ function renderNavDrawer(){
     class: "nav-backdrop" + (state.navOpen ? " open" : ""),
     onclick: close
   });
-  const items = NAV_ITEMS.map(item => el("div", {
+  // Factored out so "Einstellungen" (below) can render with the exact same
+  // active-state highlighting and click behavior as a NAV_ITEMS entry, even
+  // though it no longer lives in that array.
+  const navItem = (item) => el("div", {
     class: "nav-item" + (state.activePage === item.id ? " active" : ""),
     onclick: ()=>{ state.activePage = item.id; if(item.id === "changelog") markChangelogSeen(); close(); }
   }, item.id === "changelog" && hasUnseenChangelog()
       ? [item.label, el("span", {class:"dot on", style:"margin-left:6px; margin-right:0;"}, [])]
       : [item.label]
-  ));
+  );
+  const items = NAV_ITEMS.map(navItem);
+  // "Einstellungen" sits below the divider but, unlike the Strava-only
+  // actions further down, must stay reachable regardless of state.connected
+  // (it was previously a NAV_ITEMS entry, always rendered) — so it's built
+  // via the same navItem() helper rather than folded into connectedActions.
+  const einstellungenItem = navItem({id:"einstellungen", label:"Einstellungen"});
   // Bottom-of-drawer utility actions — only meaningful while connected
   // (nothing to log out of / no app permissions to review otherwise), so
-  // they're appended conditionally after the page-nav items rather than
-  // living in NAV_ITEMS (which drives page tabs, not one-shot actions).
+  // they're appended conditionally after "Einstellungen" rather than living
+  // in NAV_ITEMS (which drives page tabs, not one-shot actions).
   const connectedActions = state.connected ? [
-    el("div", {class:"nav-drawer-divider"}),
     el("a", {
       class:"nav-action",
       href:"https://www.strava.com/settings/apps",
@@ -3694,6 +3760,8 @@ function renderNavDrawer(){
   const drawer = el("div", {class: "nav-drawer" + (state.navOpen ? " open" : "")}, [
     el("div", {class:"nav-drawer-title"}, ["Velo", el("span",{},["Cast"])]),
     ...items,
+    el("div", {class:"nav-drawer-divider"}),
+    einstellungenItem,
     ...connectedActions
   ]);
   return [backdrop, drawer];
@@ -12026,7 +12094,12 @@ function buildTireWheelCard(data, wheel, label){
   const target = getWheelTargetBar(data, wheel); // null when calc is off and no manual target entered yet
   const hasBaseline = w.lastBaselineBar != null && w.lastBaselineAtMs != null;
 
-  const card = el('div', {class: 'card'});
+  // id: 'tp-card-' + wheel is unconditional -- unlike every input inside this
+  // card, which comes and goes with hasBaseline/calcOn, the card root itself
+  // always renders. refreshTirePressureWheelsSection() relies on that to
+  // detect "are the wheel cards mounted" without being tripped up by which
+  // inner fields happen to exist right now.
+  const card = el('div', {class: 'card', id: 'tp-card-' + wheel});
   card.appendChild(el('h2', {}, [label]));
 
   if(!calcOn){
@@ -12072,26 +12145,28 @@ function buildTireWheelCard(data, wheel, label){
   // so a value the rider typed by hand is never clobbered by a later
   // settings-driven target change. Falls back to '' (no auto-fill) while
   // calc is off and no manual target has been entered yet.
-  const aufpumpenInput = el('input', {
-    type: 'number', step: '0.1', min: '0', value: target != null ? target.toFixed(1) : '', style: 'width:90px;',
-    id: 'tp-aufpumpen-' + wheel, oninput: e => { e.target.dataset.auto = 'false'; }
-  });
-  aufpumpenInput.dataset.auto = 'true';
-  card.appendChild(el('div', {class: 'tsettings-row'}, [
-    el('div', {class: 'tsettings-row-main'}, [
-      el('label', {}, ['Aufgepumpt auf']),
-      el('span', {class: 'tsettings-input-wrap'}, [aufpumpenInput, el('span', {class: 'tsettings-unit'}, ['bar'])])
-    ])
-  ]));
-  card.appendChild(el('button', {class: 'btn secondary', style: 'margin-top:8px;', onclick: () => {
-    const bar = parseFloat(aufpumpenInput.value);
-    if(!(isFinite(bar) && bar > 0)) return;
-    w.lastBaselineBar = Math.round(bar * 10) / 10;
-    w.lastBaselineAtMs = Date.now();
-    saveTirePressureData(data);
-    state.tirePressureReminder = computeTirePressureReminder(data);
-    render();
-  }}, ['Aufgepumpt']));
+  if(!hasBaseline){
+    const aufpumpenInput = el('input', {
+      type: 'number', step: '0.1', min: '0', value: target != null ? target.toFixed(1) : '', style: 'width:90px;',
+      id: 'tp-aufpumpen-' + wheel, oninput: e => { e.target.dataset.auto = 'false'; }
+    });
+    aufpumpenInput.dataset.auto = 'true';
+    card.appendChild(el('div', {class: 'tsettings-row'}, [
+      el('div', {class: 'tsettings-row-main'}, [
+        el('label', {}, ['Aufgepumpt auf']),
+        el('span', {class: 'tsettings-input-wrap'}, [aufpumpenInput, el('span', {class: 'tsettings-unit'}, ['bar'])])
+      ])
+    ]));
+    card.appendChild(el('button', {class: 'btn secondary', style: 'margin-top:8px;', onclick: () => {
+      const bar = parseFloat(aufpumpenInput.value);
+      if(!(isFinite(bar) && bar > 0)) return;
+      w.lastBaselineBar = Math.round(bar * 10) / 10;
+      w.lastBaselineAtMs = Date.now();
+      saveTirePressureData(data);
+      state.tirePressureReminder = computeTirePressureReminder(data);
+      render();
+    }}, ['Aufgepumpt']));
+  }
 
   if(hasBaseline){
     const gemessenInput = el('input', {type: 'number', step: '0.1', min: '0', style: 'width:90px;'});
@@ -12120,16 +12195,7 @@ function buildTireWheelCard(data, wheel, label){
     remeasureBlock.appendChild(el('button', {class: 'btn secondary', style: 'margin-top:4px;', onclick: () => {
       const measured = parseFloat(gemessenInput.value);
       const neu = parseFloat(neuInput.value);
-      if(!(isFinite(measured) && isFinite(neu) && neu > 0)) return;
-      const now = Date.now();
-      const hoursElapsed = (now - w.lastBaselineAtMs) / 3600000;
-      const rate = computeLossRateBarPerDay(w.lastBaselineBar, measured, hoursElapsed);
-      if(rate != null){
-        w.learnedRateBarPerDay = updateLearnedRateBarPerDay(w.learnedRateBarPerDay, rate);
-        w.history.push({ measuredAtMs: now, priorBar: w.lastBaselineBar, measuredBar: measured, hoursElapsed, rateBarPerDay: rate });
-      }
-      w.lastBaselineBar = Math.round(neu * 10) / 10;
-      w.lastBaselineAtMs = now;
+      if(!applyNachmessenUpdate(w, measured, neu, Date.now())) return;
       saveTirePressureData(data);
       state.tirePressureReminder = computeTirePressureReminder(data);
       render();
@@ -12179,10 +12245,11 @@ function refreshTirePressureWheelsSection(data){
   const settingsReady = s.calculatorEnabled === false || (isFinite(s.riderWeightKg) && s.riderWeightKg > 0
     && isFinite(s.bikeWeightKg) && s.bikeWeightKg > 0
     && isFinite(s.tireWidthMm) && s.tireWidthMm > 0);
-  // tp-aufpumpen-front always exists once the wheel cards are showing,
-  // regardless of calculator mode (unlike tp-target-front, which only
-  // renders with the calculator on) -- so it's the reliable presence marker.
-  const wheelsPresent = !!document.getElementById('tp-aufpumpen-front');
+  // tp-card-front always exists once the wheel cards are showing, regardless
+  // of calculator mode OR baseline state (unlike tp-target-front, which only
+  // renders with the calculator on, and tp-aufpumpen-front, which disappears
+  // once a baseline is logged) -- so it's the one reliable presence marker.
+  const wheelsPresent = !!document.getElementById('tp-card-front');
   if(settingsReady !== wheelsPresent){
     populateTirePressureWheelsSection(container, data);
     return;
