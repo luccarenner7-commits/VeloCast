@@ -348,10 +348,17 @@
   .swatch{ width:10px; height:10px; border-radius:2px; }
 
   /* Route map — same large-container radius as .card since it visually
-     behaves like one. */
+     behaves like one. position+z-index here (not just Leaflet's own
+     runtime position:relative) is required so this container establishes
+     its own stacking context -- otherwise Leaflet's internal panes/
+     controls (z-index up to 1000 in leaflet.css) compete directly with
+     the page's own stacking order instead of being contained inside the
+     map, and can render on top of the nav drawer (z-index 41) or other
+     UI. */
   #route-map{
     width:100%; height:340px; border-radius:var(--r-lg); overflow:hidden;
     border:1px solid var(--line); background: var(--asphalt);
+    position:relative; z-index:0;
   }
   .leaflet-popup-content-wrapper{ background: var(--asphalt-2); color: var(--chalk); border-radius:var(--r-sm); }
   .leaflet-popup-content{ font-family:'IBM Plex Mono', monospace; font-size:12px; margin:8px 10px; }
@@ -5367,7 +5374,14 @@ function mountSegmentsOverviewView(map, layers, isNewRoute){
     if(!poly) return;
     const coords = decodePolyline(poly);
     const latlngs = coords.map(c => [c[0], c[1]]);
-    const line = L.polyline(latlngs, { color:"#82a2d1", weight:5, opacity:0.95, lineCap:"round", lineJoin:"round" }).addTo(layers);
+    // A plain #82a2d1 line at weight 5 reads fine as the single highlighted
+    // route on mountSegmentView(), but with many overview lines at once it
+    // gets lost against OSM's own light road/water/forest tile colors. A
+    // dark casing underneath (same #333a47 neutral-dark already used as
+    // mountFullRouteView()'s uncovered-route base line) fixes contrast on
+    // any tile background without changing the route color itself.
+    L.polyline(latlngs, { color:"#333a47", weight:8, opacity:0.7, lineCap:"round", lineJoin:"round" }).addTo(layers);
+    const line = L.polyline(latlngs, { color:"#82a2d1", weight:4, opacity:1, lineCap:"round", lineJoin:"round" }).addTo(layers);
     drawnLines.push(line);
   });
   if(isNewRoute && drawnLines.length){
