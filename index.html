@@ -295,6 +295,17 @@
     margin: 0 0 14px; color: var(--chalk);
     text-transform: uppercase; letter-spacing:0.06em;
   }
+  /* Bare page-title heading (Reifendruck, see renderReifendruckPage()) --
+     same type treatment as .card h2 (don't invent a new heading style),
+     used directly in the page instead of wrapped in its own bordered .card
+     (that wrapper was pure wasted chrome for a single line of text).
+     margin-bottom matches .card's own margin-bottom so the spacing rhythm
+     before the next card is unchanged. */
+  .page-title{
+    font-family:'Space Grotesk', sans-serif; font-size:15px; font-weight:600;
+    margin: 0 0 16px; color: var(--chalk);
+    text-transform: uppercase; letter-spacing:0.06em;
+  }
   .muted{ color: var(--chalk-dim); font-size: 14px; line-height:1.55; }
 
   .btn{
@@ -316,6 +327,20 @@
   .settings-row{ display:grid; grid-template-columns: repeat(3, minmax(190px,1fr)); gap:10px; margin-bottom:16px; }
   .settings-row > div{ min-width:0; }
   @media (max-width:620px){ .settings-row{ grid-template-columns: 1fr; } }
+
+  /* Reifendruck wheel cards (Task 1): single column on mobile, 2-column row
+     from .app's own tablet/desktop breakpoint (min-width:900px, see .app
+     above) rather than inventing a new one. margin-bottom:0 on the child
+     cards hands vertical spacing entirely to `gap`, so mobile's stacked
+     cards get exactly one 16px gap instead of double-spacing (each card's
+     own margin-bottom stacked on top of the grid gap too). :only-child
+     covers populateTirePressureWheelsSection()'s empty-state case (a single
+     card while settings aren't filled in yet), which would otherwise only
+     fill the first column at desktop width. */
+  .tp-wheels-row{ display:grid; grid-template-columns: 1fr; gap:16px; margin-bottom:16px; }
+  .tp-wheels-row > .card{ margin-bottom:0; }
+  .tp-wheels-row > .card:only-child{ grid-column: 1 / -1; }
+  @media (min-width:900px){ .tp-wheels-row{ grid-template-columns: 1fr 1fr; } }
 
   /* Route source tabs. "Active" is a UI-selection state, not a wind
      judgment — kept neutral (chalk on asphalt-3) rather than tail-green so
@@ -1094,7 +1119,18 @@ let state = {
   // notification, no dismissal tracking" scope.
   tirePressure: null,
   tirePressureReminder: null,
-  tirePressureReminderDismissed: false
+  tirePressureReminderDismissed: false,
+  // Kettenverschleiß (Task 2) -- deliberately independent from the
+  // Ausrüstung gear-wear feature above (own storage key, own reset state,
+  // no GEAR_COMPONENTS involvement): see CHAIN_WEAR_KEY/loadChainWearData().
+  // Same {loaded-in-init, session-only-dismissed} shape as tirePressure*
+  // above, just sourced from the Aktivitäten list cache's summed distance
+  // (see getChainWearDistanceM() below) instead of a Strava gear object --
+  // chainWearReminder is a plain boolean (danger level reached), not a
+  // per-wheel object, since there's only one chain.
+  chainWear: null,
+  chainWearReminder: false,
+  chainWearReminderDismissed: false
 };
 
 function el(tag, attrs, children){
@@ -2442,6 +2478,135 @@ function gearWearStatus(totalDistanceM, resetKm, intervalKm){
   return { sinceKm, pct: Math.min(999, pct), level };
 }
 
+// ---------- Kettenverschleiß (unabhängig von Ausrüstung) ----------
+// A separate, independent wear tracker for the Reifendruck page -- explicit
+// rider decision: does NOT share data with GEAR_COMPONENTS/PROFIL_GEAR_RESET_KEY
+// above (different storage key, no gear-id keying, only one component). It
+// reuses gearWearStatus() directly (generic, doesn't care about the source
+// of totalDistanceM) instead of duplicating the wear-math. Two deliberate
+// deviations from the Ausrüstung pattern: the interval ("Schwelle") is
+// rider-editable here instead of a hardcoded GEAR_COMPONENTS.intervalKm, and
+// this tool shows a dismissible startup/session banner (see
+// computeChainWearReminder()/renderChainWearBanner() below), which Ausrüstung
+// has no equivalent of.
+const CHAIN_WEAR_KEY = 'velocast_chain_wear';
+function defaultChainWearData(){
+  return { thresholdKm: 3000, resetAtMs: 0 };
+}
+// Same "any failure silently falls back to a safe default" discipline as
+// loadTirePressureData()/loadGearResets().
+function loadChainWearData(){
+  try{
+    const raw = localStorage.getItem(CHAIN_WEAR_KEY);
+    if(raw){
+      const parsed = JSON.parse(raw);
+      if(parsed && typeof parsed === 'object'){
+        const out = defaultChainWearData();
+        if(isFinite(parsed.thresholdKm) && parsed.thresholdKm > 0) out.thresholdKm = parsed.thresholdKm;
+        if(isFinite(parsed.resetAtMs) && parsed.resetAtMs >= 0) out.resetAtMs = parsed.resetAtMs;
+        return out;
+      }
+    }
+  }catch(e){}
+  return defaultChainWearData();
+}
+function saveChainWearData(data){
+  try{ localStorage.setItem(CHAIN_WEAR_KEY, JSON.stringify(data)); }catch(e){}
+}
+// VeloCast doesn't track odometer/gear-tagged distance independently of
+// Strava's gear objects -- this tool has no gear object to read from at all,
+// so "lifetime km" is derived straight from the rider's own ridden activities
+// instead. Same RIDE_SPORT_TYPES/`a.sport_type||a.type` filter convention as
+// every other call site of that Set (see e.g. loadActivitiesStep() below).
+// Pure function of its `activities` param (not a direct state read) so it
+// stays unit-testable in isolation, same reasoning as
+// computeChainWearReminder() below. See getChainWearDistanceM() right below
+// for which activities list this actually gets called with.
+// `sinceMs` (optional): only sum activities that started at or after this
+// timestamp. Needed because loadAktivitaetenListCache() below is not an
+// append-only ledger -- paging further back on the Aktivitäten tab ("Weitere
+// laden") backfills OLDER activities into the same cache, so a plain sum
+// over the whole cache is not monotonic in time and can't be used as a
+// reset baseline (see applyChainWearReset()'s comment for the bug this
+// caused). Filtering by date instead of by distance keeps the sum immune to
+// that backfill: an activity from before the reset point never counts
+// toward wear-since-reset, no matter when it gets paged into the cache.
+function sumRiddenDistanceM(activities, sinceMs){
+  return (activities||[])
+    .filter(a => a && RIDE_SPORT_TYPES.has(a.sport_type || a.type))
+    .filter(a => !sinceMs || new Date(a.start_date_local || a.start_date).getTime() >= sinceMs)
+    .reduce((sum, a) => sum + (a.distance||0), 0);
+}
+// Bug fix: every call site below used to pass state.activities, which is
+// fetchActivities()'s hardcoded `per_page=8` result (index.html's
+// fetchActivities(), ~line 2153) -- only a rolling window of the 8 most
+// recent rides, NOT lifetime distance. With typical ~60km rides that window
+// sums to a roughly constant ~480km forever, so the "danger" reminder could
+// never fire, and worse, resetting the chain baseline pinned resetAtKm to
+// that same near-constant window sum -- as new rides pushed old ones out of
+// the 8-item window, the window sum stayed flat (or even dropped), so wear
+// never visibly accumulated again after a reset.
+//
+// Fix: read loadAktivitaetenListCache() (velocast_activity_list_cache)
+// instead. That cache is a persistent, ever-growing (up to
+// AKTIVITAETEN_LIST_CACHE_MAX) accumulation of every activity the
+// Aktivitäten tab has ever paged in across sessions -- a much better proxy
+// for lifetime ridden distance than the 8-item rolling window. It does NOT
+// require a new network fetch (no extra API call from this page) and
+// degrades gracefully: if the rider has never opened Aktivitäten yet, the
+// cache is simply empty and this returns 0 (no crash), then grows as more
+// pages get cached over time.
+//
+// Deliberately not pp.gear[].distance (Strava's own gear odometer, which is
+// what Ausrüstung/GEAR_COMPONENTS reads for the exact same "lifetime
+// distance" need, see renderProfilKernGearCard() above) -- that field is
+// scoped to one specific bike/gear object and requires the Profil page's
+// full FTP-analysis pipeline to have loaded first, whereas this tool has no
+// bike-selection UI and only cares about one chain, so it's simpler and
+// more available to keep deriving lifetime km straight from ridden
+// activities as the existing sumRiddenDistanceM() comment already committed
+// to -- just from the right (accumulating, date-filterable) activities list.
+function getChainWearDistanceM(sinceMs){
+  return sumRiddenDistanceM(Object.values(loadAktivitaetenListCache()), sinceMs);
+}
+// Startup/mutation-site check (see init() and every chainWear-mutating call
+// site in buildChainWearCard()): true once wear has reached gearWearStatus()'s
+// "danger" level (pct>=100, i.e. sinceKm>=thresholdKm) -- deliberately the
+// harder "threshold reached" bar, not the softer 80% "warn" pre-level, to
+// match renderChainWearBanner()'s "Kette vermutlich verschlissen" wording.
+// A plain boolean (not a {front,rear}-shaped object like
+// computeTirePressureReminder()'s result) since there's only one chain to
+// track here. `distanceSinceResetM` must already be pre-filtered to
+// chainWear.resetAtMs (via getChainWearDistanceM(chainWear.resetAtMs)) --
+// resetKm is passed as 0 here since the date filter already excludes
+// pre-reset riding, see sumRiddenDistanceM()'s comment for why a
+// distance-based resetKm baseline doesn't work with this cache.
+function computeChainWearReminder(chainWear, distanceSinceResetM){
+  return gearWearStatus(distanceSinceResetM, 0, chainWear.thresholdKm).level === 'danger';
+}
+// Pure "Zurückgesetzt" baseline update, extracted out of buildChainWearCard()'s
+// reset-button onclick closure so it's unit-testable on its own (that
+// closure previously wasn't reachable at all from a test -- same reasoning
+// as computeChainWearReminder()/sumRiddenDistanceM() being kept pure above).
+//
+// Bug fix: this used to pin resetAtKm to the current lifetime-distance
+// total. That broke as soon as the rider paged further back on the
+// Aktivitäten tab afterwards -- loadAktivitaetenListCache() backfills OLDER
+// activities into the same cache (it's not append-only from "now"
+// forward), so the lifetime total can retroactively grow past a reset point
+// with rides that happened *before* the reset, making sinceKm balloon on a
+// freshly-replaced chain. Fixed by baselining on a timestamp instead of a
+// distance: resetAtMs = now, and getChainWearDistanceM(resetAtMs) only ever
+// sums activities that started at or after that moment, so backfilled older
+// rides can never retroactively count. Returns a new object rather than
+// mutating `chainWear` in place, same "caller decides what to do with the
+// result" convention as applyNachmessenUpdate(). Takes no distance argument
+// now -- the reset point is simply "this instant", not a snapshot of a
+// number that can later be invalidated by cache backfill.
+function applyChainWearReset(chainWear){
+  return { ...chainWear, resetAtMs: Date.now() };
+}
+
 // ---------- Reifendruckrechner mit Reminder ----------
 // Deliberately simple, explainable reference-table model (not a "real"
 // calibrated formula) -- base pressure by tire width in mm, linearly
@@ -3624,6 +3789,8 @@ const CHANGELOG = [
       '„Meine Segmente": neue Sortierung „Bestes Potential zuerst".',
       'KOM-/QOM-Sortierung ist jetzt auch bei „Meine Segmente" auswählbar (vorher nur bei „Abgeschlossene Segmente" verfügbar) und blendet sich dort passend zu den Einstellungen ein/aus.',
       'Aktivitäten-Detailansicht zeigt jetzt „Zeit je Zone" für die einzelne Fahrt, sofern Trainingsdaten (Profil) geladen sind.',
+      'Reifendruck: Vorder- und Hinterrad stehen jetzt nebeneinander auf breiten Bildschirmen (Tablet/Desktop), die überflüssige separate Titel-Karte ist weg — insgesamt kompakter.',
+      'Neues Werkzeug „Kette" auf der Reifendruck-Seite: verfolgt den Kettenverschleiß anhand der eigenen gefahrenen Kilometer, mit einstellbarer Wechsel-Schwelle (Standard 3000 km), „Zurückgesetzt"-Button beim Kettenwechsel und Hinweis-Banner, sobald die Schwelle erreicht ist.',
     ],
     improvements:[
       'Reifendruck: „Aufgepumpt auf" verschwindet, sobald schon ein Ausgangswert gemerkt ist — „Nachmessen & neu aufpumpen" reicht dann allein aus und funktioniert jetzt auch ohne Eingabe bei „Gemessen" (setzt dann einfach den neuen Ausgangswert, ohne die Verlustrate neu zu berechnen).',
@@ -3836,6 +4003,18 @@ function resetConnectionState(){
   state.athlete = null;
   state.accessToken = null;
   state.activities = [];
+  // The Kettenverschleiß CARD keeps reading correctly even while
+  // disconnected (getChainWearDistanceM() reads the persistent Aktivitäten
+  // list cache, which deliberately survives a disconnect -- see the
+  // "left alone" comment near aktivitaetenPage below, same as the
+  // Reifendruck page itself staying reachable while disconnected). But the
+  // reminder BANNER is a startup/session notice, same category as
+  // tirePressureReminder -- without an explicit reset here it would keep
+  // showing "Kette vermutlich verschlissen" indefinitely across a
+  // disconnect/reconnect cycle instead of being freshly recomputed on the
+  // next connected session, so clear it here like every other in-memory
+  // startup flag this function resets.
+  state.chainWearReminder = false;
   state.selectedActivity = null;
   state.routePoints = [];
   state.fullRouteCoords = [];
@@ -3944,6 +4123,8 @@ function render(){
   renderNavDrawer().forEach(n => app.appendChild(n));
   const tirePressureBanner = renderTirePressureBanner();
   if(tirePressureBanner) app.appendChild(tirePressureBanner);
+  const chainWearBanner = renderChainWearBanner();
+  if(chainWearBanner) app.appendChild(chainWearBanner);
 
   if(state.activePage === "segments"){
     app.appendChild(renderSegmentsPage());
@@ -4194,6 +4375,14 @@ async function loadActivitiesStep(){
   startupProgressStep("Lade Aktivitäten…"); render();
   try{
     state.activities = await fetchActivities(state.accessToken);
+    // Kettenverschleiß no longer sources its distance from state.activities
+    // (that's fetchActivities()'s 8-item rolling window -- see
+    // getChainWearDistanceM()'s comment), so this fetch resolving doesn't by
+    // itself change the reminder's answer. Still recomputed here (harmless,
+    // cheap) so a reload that also happens to pick up fresh
+    // Aktivitäten-cache entries elsewhere in this same startup sequence
+    // isn't stuck on init()'s earlier reading.
+    state.chainWearReminder = computeChainWearReminder(state.chainWear, getChainWearDistanceM(state.chainWear.resetAtMs));
     startupProgressStep("Lade Route & Wetter…"); render();
     if(state.activities.length){
       await selectActivity(state.activities[0]);
@@ -12551,15 +12740,29 @@ function renderReifendruckPage(){
   const frag = document.createDocumentFragment();
   const data = state.tirePressure;
 
-  const headerCard = el('div', {class: 'card'});
-  headerCard.appendChild(el('h2', {style: 'margin:0;'}, ['Reifendruck']));
-  frag.appendChild(headerCard);
+  // No other loaded (non-empty/non-error) page repeats its own nav label as
+  // a bare title-only card (renderProfilPage()/renderTrainerPage()'s happy
+  // paths have no page-title element at all; their `<h2>title</h2>` only
+  // shows up inside the loading/error/empty-state guard cards). Since
+  // Reifendruck's title genuinely doesn't fit inside either functional card
+  // below (it names the whole page, not just "Angaben"), a lightweight
+  // heading directly in the page -- not wrapped in its own bordered `.card`
+  // -- is the closest match: `.page-title` reuses `.card h2`'s exact type
+  // treatment (see CSS) instead of inventing a new heading style.
+  frag.appendChild(el('h2', {class: 'page-title'}, ['Reifendruck']));
 
   frag.appendChild(renderTirePressureSettingsCard(data));
 
-  const wheelsContainer = el('div', {id: 'tp-wheels-container'});
+  // .tp-wheels-row (see CSS): 2-column on >=900px (.app's own tablet/
+  // desktop breakpoint), single column on mobile. Class lives on the
+  // container itself so it applies whichever populateTirePressureWheelsSection()
+  // fills it with (the two wheel cards, or the single empty-state card --
+  // :only-child in the CSS handles that single-card case).
+  const wheelsContainer = el('div', {id: 'tp-wheels-container', class: 'tp-wheels-row'});
   populateTirePressureWheelsSection(wheelsContainer, data);
   frag.appendChild(wheelsContainer);
+
+  frag.appendChild(buildChainWearCard());
 
   return frag;
 }
@@ -12599,6 +12802,89 @@ function renderTirePressureBanner(){
   ]);
 }
 
+// Kettenverschleiß card (Task 2) -- same barRow()/"Zurückgesetzt" visual
+// treatment as renderProfilKernGearCard()'s Ausrüstung bars, but a single
+// independent component instead of a per-gear-object GEAR_COMPONENTS loop.
+// `totalDistanceM` is captured once here and reused in both closures below
+// (reset button, threshold input) rather than re-summed at click time --
+// same "closure captures the value as of this render()" convention as
+// renderProfilKernGearCard()'s `g.distance` closures.
+function buildChainWearCard(){
+  const chainWear = state.chainWear;
+  const distanceSinceResetM = getChainWearDistanceM(chainWear.resetAtMs);
+  const status = gearWearStatus(distanceSinceResetM, 0, chainWear.thresholdKm);
+  const color = status.level === 'danger' ? 'var(--head)' : status.level === 'warn' ? 'var(--cross)' : 'var(--tail)';
+
+  const card = el('div', {class: 'card'});
+  card.appendChild(el('h2', {}, ['Kette']));
+
+  const row = barRow('Verschleiß', Math.min(100, status.pct), color, `${Math.round(status.sinceKm)} / ${chainWear.thresholdKm} km`);
+  row.appendChild(el('button', {
+    class: 'btn secondary', style: 'margin-left:8px; padding:2px 9px; font-size:11px; flex-shrink:0;',
+    onclick: () => {
+      state.chainWear = applyChainWearReset(chainWear);
+      saveChainWearData(state.chainWear);
+      state.chainWearReminder = computeChainWearReminder(state.chainWear, getChainWearDistanceM(state.chainWear.resetAtMs));
+      render();
+    }
+  }, ['Zurückgesetzt']));
+  card.appendChild(row);
+
+  // Unlike GEAR_COMPONENTS.intervalKm (a hardcoded constant), the threshold
+  // here is rider-editable -- same onchange-persist convention as
+  // settingsFieldRow()/tirePressureNumberRow() (onchange, not oninput, so a
+  // render() never fires mid-keystroke). Invalid/cleared input resets back
+  // to the last valid value, same reset-and-reflect-in-the-DOM idiom as
+  // tirePressureNumberRow()'s `defaultValue` handling.
+  const thresholdInput = el('input', {
+    type: 'number', id: 'chain-threshold', step: 100, min: '1', value: chainWear.thresholdKm,
+    onchange: (e) => {
+      const v = parseFloat(e.target.value);
+      if(isFinite(v) && v > 0){
+        chainWear.thresholdKm = v;
+      } else {
+        e.target.value = chainWear.thresholdKm;
+      }
+      saveChainWearData(chainWear);
+      state.chainWearReminder = computeChainWearReminder(chainWear, distanceSinceResetM);
+      render();
+    }
+  });
+  card.appendChild(el('div', {class: 'tsettings-row', style: 'margin-top:12px;'}, [
+    el('div', {class: 'tsettings-row-main'}, [
+      el('label', {for: 'chain-threshold'}, ['Schwelle']),
+      el('span', {class: 'tsettings-input-wrap'}, [thresholdInput, el('span', {class: 'tsettings-unit'}, ['km'])])
+    ])
+  ]));
+
+  return card;
+}
+
+// Dismissible startup/session notice, exact same pattern as
+// renderTirePressureBanner() above (session-only dismissed flag, clickable
+// card that navigates to Reifendruck, `e.stopPropagation()` on the × so
+// dismissing doesn't also navigate) -- triggers on the harder "danger"
+// level (pct>=100) specifically, not the softer "warn" pre-level.
+function renderChainWearBanner(){
+  if(!state.chainWearReminder || state.chainWearReminderDismissed) return null;
+  const chainWear = state.chainWear;
+  const distanceSinceResetM = getChainWearDistanceM(chainWear.resetAtMs);
+  const status = gearWearStatus(distanceSinceResetM, 0, chainWear.thresholdKm);
+  const text = `Kette vermutlich verschlissen (${Math.round(status.sinceKm)} / ${chainWear.thresholdKm} km) — Seite „Reifendruck" öffnen?`;
+
+  return el('div', {class: 'card', style: 'border-color:var(--cross); display:flex; align-items:center; justify-content:space-between; gap:10px; cursor:pointer;', onclick: () => {
+    state.activePage = 'reifendruck';
+    render();
+  }}, [
+    el('div', {style: 'color:var(--cross); font-size:13px;'}, [text]),
+    el('button', {class: 'btn secondary', style: 'flex-shrink:0;', onclick: (e) => {
+      e.stopPropagation();
+      state.chainWearReminderDismissed = true;
+      render();
+    }}, ['×'])
+  ]);
+}
+
 // ---------- init ----------
 async function init(){
   // Synchronous localStorage load + reminder check, done before the first
@@ -12606,6 +12892,15 @@ async function init(){
   // instead of popping in a frame later.
   state.tirePressure = loadTirePressureData();
   state.tirePressureReminder = computeTirePressureReminder(state.tirePressure);
+
+  // Same synchronous-before-first-paint idea as tirePressure above --
+  // getChainWearDistanceM() reads straight from localStorage
+  // (loadAktivitaetenListCache()), so unlike the old state.activities-based
+  // version this is already correct on first paint, not stuck at 0km until
+  // fetchActivities() resolves. Still recomputed again in loadActivitiesStep()
+  // for good measure (harmless, cheap).
+  state.chainWear = loadChainWearData();
+  state.chainWearReminder = computeChainWearReminder(state.chainWear, getChainWearDistanceM(state.chainWear.resetAtMs));
 
   render();
 
