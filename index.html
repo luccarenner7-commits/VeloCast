@@ -5011,6 +5011,13 @@ async function ensureRideSegments(){
 
 const SEGMENTJAEGER_XOM_TOLERANCE = 0.08; // 8%, see the task brief's default-selection rule
 const SEGMENTJAEGER_TOP_RANK = 10;
+// Above this "Genutztes Potential" % (own PR watts as a share of the
+// rider's MMP-curve ceiling for that duration, see segmentPotentialValue()),
+// a segment is treated as already maxed out -- closing the remaining gap to
+// the record isn't realistically a matter of pacing/execution on a future
+// attempt, it needs an actual fitness gain, so it's excluded from the
+// default selection even if the time-gap rule alone would have picked it.
+const SEGMENTJAEGER_POTENTIAL_CEILING = 95;
 
 // Pure eligibility check for ONE segment's default selection — no state.*
 // reads (showKomChip/showQomChip are passed in explicitly instead, see
@@ -5026,11 +5033,6 @@ const SEGMENTJAEGER_TOP_RANK = 10;
 // would leave the rider confused about why it's highlighted.
 //
 // True when EITHER:
-//  - `detail` has a KOM and/or QOM time AND the rider's all-time PR on this
-//    segment is within SEGMENTJAEGER_XOM_TOLERANCE of it — (pr - xom) / xom
-//    <= 0.08 (a zero/negative delta, i.e. the PR already matches or beats the
-//    record, still counts as "within tolerance") — but the KOM side of this
-//    only counts when showKomChip is true, and likewise QOM/showQomChip, OR
 //  - this specific ride's effort already ranked top-10 — either on the
 //    segment's overall leaderboard (kom_rank) or the rider's own leaderboard
 //    (pr_rank). Strava only ever populates either field at all when the
@@ -5038,11 +5040,33 @@ const SEGMENTJAEGER_TOP_RANK = 10;
 //    needing its own numeric check, but the <= 10 guard is kept as a
 //    defensive belt-and-braces in case that assumption is ever wrong. This
 //    rule is the rider's own placement, not a KOM/QOM *display* fact, so it's
-//    unaffected by showKomChip/showQomChip either way.
+//    unaffected by showKomChip/showQomChip — and, per explicit product
+//    decision, unaffected by potentialPercent too: an already-achieved
+//    top-10 effort is proof enough on its own, regardless of how much power
+//    headroom is left, OR
+//  - `detail` has a KOM and/or QOM time AND the rider's all-time PR on this
+//    segment is within SEGMENTJAEGER_XOM_TOLERANCE of it — (pr - xom) / xom
+//    <= 0.08 (a zero/negative delta, i.e. the PR already matches or beats the
+//    record, still counts as "within tolerance") — but the KOM side of this
+//    only counts when showKomChip is true, and likewise QOM/showQomChip —
+//    AND `potentialPercent` (see segmentPotentialValue(), the "Genutztes
+//    Potential" %) is either unavailable (no MMP curve loaded — can't
+//    judge, so this exclusion simply doesn't apply, falling back to the
+//    record-gap rule alone) or below SEGMENTJAEGER_POTENTIAL_CEILING: a
+//    close-to-the-record PR that already extracts ~all of the rider's own
+//    power ceiling for that duration isn't a realistic target for a future
+//    attempt — closing the gap needs an actual fitness gain, not a better
+//    pacing/execution on the same segment.
 // A missing PR and/or missing xoms — can't judge realism — correctly falls
 // through to `false` (deselected by default), per explicit product decision
 // (see the task brief).
-function segmentjaegerIsDefaultEligible(detail, effort, showKomChip, showQomChip){
+function segmentjaegerIsDefaultEligible(detail, effort, showKomChip, showQomChip, potentialPercent){
+  const viaTopTen = !!effort && (
+    (effort.kom_rank != null && effort.kom_rank <= SEGMENTJAEGER_TOP_RANK) ||
+    (effort.pr_rank != null && effort.pr_rank <= SEGMENTJAEGER_TOP_RANK)
+  );
+  if(viaTopTen) return true;
+
   const pr = detail && detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
   const nearRecord = (xomTime) => {
     if(pr == null || !xomTime) return false;
@@ -5055,11 +5079,10 @@ function segmentjaegerIsDefaultEligible(detail, effort, showKomChip, showQomChip
     (!!showKomChip && nearRecord(xoms.kom)) ||
     (!!showQomChip && nearRecord(xoms.qom))
   );
-  const viaTopTen = !!effort && (
-    (effort.kom_rank != null && effort.kom_rank <= SEGMENTJAEGER_TOP_RANK) ||
-    (effort.pr_rank != null && effort.pr_rank <= SEGMENTJAEGER_TOP_RANK)
-  );
-  return viaRecord || viaTopTen;
+  if(!viaRecord) return false;
+
+  const alreadyMaxedOut = potentialPercent != null && potentialPercent >= SEGMENTJAEGER_POTENTIAL_CEILING;
+  return !alreadyMaxedOut;
 }
 
 // Runs segmentjaegerIsDefaultEligible() over every segment in `segments` —
@@ -5067,11 +5090,16 @@ function segmentjaegerIsDefaultEligible(detail, effort, showKomChip, showQomChip
 // ensureSegmentjaegerSelection() below for when this actually runs).
 // `showKomChip`/`showQomChip` are just forwarded through to each per-segment
 // check — see segmentjaegerIsDefaultEligible()'s own comment for why they're
-// parameters here rather than a global state.* read.
-function segmentjaegerComputeDefaults(segments, details, efforts, showKomChip, showQomChip){
+// parameters here rather than a global state.* read. `potentials` is a plain
+// {segId: percent|null} map (the caller computes each value via
+// segmentPotentialValue(), which needs the actual bucket/state — kept out of
+// this function so it stays a pure map-in/map-out transform, no bucket
+// coupling, same split as details/efforts above).
+function segmentjaegerComputeDefaults(segments, details, efforts, showKomChip, showQomChip, potentials){
   const out = {};
   segments.forEach(seg => {
-    out[seg.id] = segmentjaegerIsDefaultEligible(details[seg.id], efforts[seg.id], showKomChip, showQomChip);
+    const potentialPercent = potentials ? potentials[seg.id] : null;
+    out[seg.id] = segmentjaegerIsDefaultEligible(details[seg.id], efforts[seg.id], showKomChip, showQomChip, potentialPercent);
   });
   return out;
 }
@@ -5138,7 +5166,17 @@ function ensureSegmentjaegerSelection(){
     state.routeSegments.forEach(seg => { restored[seg.id] = stored[seg.id] === true; });
     state.segmentjaegerSelection = restored;
   } else {
-    const defaults = segmentjaegerComputeDefaults(state.routeSegments, state.routeSegmentDetails, state.routeSegmentEfforts, state.showKomChip, state.showQomChip);
+    // Genutztes Potential" per segment, same computation/bucket the "Meine
+    // Segmente"/route-page stat chips already use (segmentPotentialValue()) —
+    // computed here (not inside segmentjaegerComputeDefaults() itself) so
+    // that function stays a pure map-in/map-out transform with no bucket/
+    // state coupling. Returns null per segment when no MMP curve is loaded,
+    // which segmentjaegerIsDefaultEligible() already treats as "can't
+    // judge, don't exclude" — no separate fallback needed here.
+    const bucket = segmentBucket("route");
+    const potentials = {};
+    state.routeSegments.forEach(seg => { potentials[seg.id] = segmentPotentialValue(seg, bucket); });
+    const defaults = segmentjaegerComputeDefaults(state.routeSegments, state.routeSegmentDetails, state.routeSegmentEfforts, state.showKomChip, state.showQomChip, potentials);
     state.segmentjaegerSelection = defaults;
     saveSegmentjaegerSelection(activity.id, defaults);
   }

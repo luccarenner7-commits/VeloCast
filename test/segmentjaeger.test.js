@@ -25,6 +25,11 @@ test('segmentjaegerIsDefaultEligible', async (t) => {
   // matching today's default-on settings (state.showKomChip/showQomChip
   // both default true) -- see the dedicated
   // "respects showKomChip/showQomChip" block below for the false cases.
+  // None of these pass a 5th (potentialPercent) argument, so it's always
+  // `undefined` here -- exercises the "no potential data available, can't
+  // judge, don't exclude" fallback path (`!= null` treats undefined the same
+  // as null) -- see the dedicated "SEGMENTJAEGER_POTENTIAL_CEILING" block
+  // below for the cases where a real potential value is supplied.
 
   await t.test('no detail, no effort -> false (nothing to judge realism by)', () => {
     assert.equal(isEligible(null, null, true, true), false);
@@ -114,6 +119,37 @@ test('segmentjaegerIsDefaultEligible', async (t) => {
     assert.equal(isEligible(null, { kom_rank: 1 }, false, false), true);
     assert.equal(isEligible(null, { pr_rank: 1 }, false, false), true);
   });
+
+  await t.test('SEGMENTJAEGER_POTENTIAL_CEILING: an otherwise record-eligible segment is excluded once potentialPercent reaches the ceiling', () => {
+    const CEILING = get('SEGMENTJAEGER_POTENTIAL_CEILING');
+    // Same at-record fixture as the earlier "PR already at or beating the
+    // record" case -- would be eligible with no/low potential, per the
+    // tests right below.
+    const detail = { athlete_segment_stats: { pr_elapsed_time: 100 }, xoms: { kom: '1:40' } };
+    assert.equal(isEligible(detail, null, true, true, CEILING), false, 'exactly at the ceiling must exclude (>= is inclusive)');
+    assert.equal(isEligible(detail, null, true, true, CEILING + 1), false, 'above the ceiling must exclude');
+  });
+
+  await t.test('the same record-eligible segment stays eligible below the potential ceiling, and when potential data is entirely unavailable', () => {
+    const CEILING = get('SEGMENTJAEGER_POTENTIAL_CEILING');
+    const detail = { athlete_segment_stats: { pr_elapsed_time: 100 }, xoms: { kom: '1:40' } };
+    assert.equal(isEligible(detail, null, true, true, CEILING - 1), true, 'just under the ceiling must not exclude');
+    assert.equal(isEligible(detail, null, true, true, 0), true, 'low potential (lots of headroom) must not exclude');
+    assert.equal(isEligible(detail, null, true, true, null), true, 'no potential data at all -- can\'t judge, falls back to the record-gap rule alone');
+    assert.equal(isEligible(detail, null, true, true, undefined), true, 'undefined behaves the same as null (no 5th arg passed)');
+  });
+
+  await t.test('a segment NOT eligible via the record-gap rule stays ineligible regardless of potential -- the ceiling only ever excludes, never includes', () => {
+    const farDetail = { athlete_segment_stats: { pr_elapsed_time: 300 }, xoms: { kom: '1:40' } };
+    assert.equal(isEligible(farDetail, null, true, true, 0), false);
+    assert.equal(isEligible(farDetail, null, true, true, 50), false);
+  });
+
+  await t.test('the top-10-this-ride rule stays eligible even at/above the potential ceiling -- an achieved placement is proof enough on its own, per explicit product decision', () => {
+    const CEILING = get('SEGMENTJAEGER_POTENTIAL_CEILING');
+    assert.equal(isEligible(null, { kom_rank: 1 }, true, true, CEILING), true);
+    assert.equal(isEligible(null, { pr_rank: 1 }, true, true, 100), true);
+  });
 });
 
 test('segmentjaegerComputeDefaults', async (t) => {
@@ -148,6 +184,27 @@ test('segmentjaegerComputeDefaults', async (t) => {
     const details = { 1: { athlete_segment_stats: { pr_elapsed_time: 100 }, xoms: { kom: '1:40' } } };
     assert.deepEqual(plain(computeDefaults(segments, details, {}, true, true)), { 1: true });
     assert.deepEqual(plain(computeDefaults(segments, details, {}, false, true)), { 1: false });
+  });
+
+  await t.test('forwards each segment\'s own potentials[seg.id] to its eligibility check, independent of the other segments', () => {
+    const CEILING = get('SEGMENTJAEGER_POTENTIAL_CEILING');
+    const segments = [{ id: 1 }, { id: 2 }, { id: 3 }];
+    // All three are record-eligible on their own (same at-record fixture) --
+    // only their potentials differ.
+    const details = {
+      1: { athlete_segment_stats: { pr_elapsed_time: 100 }, xoms: { kom: '1:40' } },
+      2: { athlete_segment_stats: { pr_elapsed_time: 100 }, xoms: { kom: '1:40' } },
+      3: { athlete_segment_stats: { pr_elapsed_time: 100 }, xoms: { kom: '1:40' } },
+    };
+    const potentials = { 1: CEILING, 2: CEILING - 1 }; // 3: no entry at all -> undefined
+    const result = computeDefaults(segments, details, {}, true, true, potentials);
+    assert.deepEqual(plain(result), { 1: false, 2: true, 3: true });
+  });
+
+  await t.test('a missing potentials argument entirely (undefined) never throws -- every segment falls back to "no data, don\'t exclude"', () => {
+    const segments = [{ id: 1 }];
+    const details = { 1: { athlete_segment_stats: { pr_elapsed_time: 100 }, xoms: { kom: '1:40' } } };
+    assert.deepEqual(plain(computeDefaults(segments, details, {}, true, true)), { 1: true });
   });
 });
 
@@ -329,6 +386,43 @@ test('ensureSegmentjaegerSelection', async (t) => {
     ensure();
 
     assert.deepEqual(plain(state.segmentjaegerSelection), { 1: true, 2: false });
+  });
+
+  await t.test('end-to-end: a maxed-out-potential segment is excluded by ensureSegmentjaegerSelection() itself, not just by the underlying pure helpers', () => {
+    // Proves the segmentBucket("route")/segmentPotentialValue() wiring
+    // inside ensureSegmentjaegerSelection() is actually connected -- the
+    // unit tests above only exercise segmentjaegerIsDefaultEligible()/
+    // segmentjaegerComputeDefaults() directly with a hand-built
+    // potentialPercent, they don't prove ensureSegmentjaegerSelection()
+    // itself computes that number correctly from state.
+    const { get } = loadApp();
+    const state = get('state');
+    const ensure = get('ensureSegmentjaegerSelection');
+    state.selectedActivity = activity(555);
+    state.routeSegmentsFetched = true;
+    state.routeSegments = [{ id: 1 }, { id: 2 }];
+    // Both segments are record-eligible on their own (at-record KOM).
+    state.routeSegmentDetails = {
+      1: { athlete_segment_stats: { pr_elapsed_time: 100 }, xoms: { kom: '1:40' } },
+      2: { athlete_segment_stats: { pr_elapsed_time: 100 }, xoms: { kom: '1:40' } },
+    };
+    state.routeSegmentEfforts = {
+      1: { elapsed_time: 300 }, // matches the mmpCurve point below exactly
+      2: { elapsed_time: 300 },
+    };
+    // Segment 1's own ride watts equal the rider's MMP-curve ceiling for
+    // that duration -> 100% potential, well above the 95% ceiling.
+    // Segment 2's ride watts are well under the ceiling -> low potential,
+    // stays eligible.
+    state.routeSegmentPrWatts = {
+      1: { watts: 300, measured: true },
+      2: { watts: 150, measured: true },
+    };
+    state.profilPage.riderProfile = { mmpCurve: { 180: 300, 300: 300 } };
+
+    ensure();
+
+    assert.deepEqual(plain(state.segmentjaegerSelection), { 1: false, 2: true });
   });
 });
 
