@@ -95,9 +95,13 @@ function makeDocumentStub() {
 }
 
 // In-memory localStorage -- isolated per context, never touches the real
-// filesystem/host storage.
-function makeLocalStorageStub() {
-  const data = new Map();
+// filesystem/host storage. `seed` pre-populates entries (e.g. a serialized
+// "velocast_settings" blob) so top-level code that reads localStorage
+// during script evaluation itself (e.g. `const savedSettings =
+// loadSettings()` at index.html's top level) sees them, which a post-load
+// localStorage.setItem() call could never do.
+function makeLocalStorageStub(seed) {
+  const data = new Map(Object.entries(seed || {}));
   return {
     getItem(k) { return data.has(k) ? data.get(k) : null; },
     setItem(k, v) { data.set(k, String(v)); },
@@ -115,7 +119,7 @@ function makeLocalStorageStub() {
 // state.profilPage.riderProfile) can never leak into another test -- see
 // the task's fresh-context-per-test guidance. Re-evaluating the ~11.6k line
 // script per test is fast enough in practice for this suite's size.
-function loadApp({ onFetchCall } = {}) {
+function loadApp({ onFetchCall, initialLocalStorage } = {}) {
   const html = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
   const scriptSrc = extractInlineScript(html);
 
@@ -126,7 +130,7 @@ function loadApp({ onFetchCall } = {}) {
 
   const sandbox = {
     console,
-    localStorage: makeLocalStorageStub(),
+    localStorage: makeLocalStorageStub(initialLocalStorage),
     fetch: fetchStub,
     navigator: { userAgent: 'node-test-sandbox', onLine: true },
     URLSearchParams,
@@ -157,7 +161,7 @@ function loadApp({ onFetchCall } = {}) {
   // touching index.html itself. Listed explicitly (rather than trying to
   // auto-discover every top-level const) so a typo here fails loudly as a
   // ReferenceError instead of silently returning undefined.
-  const exposedSrc = `${scriptSrc}\n;globalThis.__exposed = { state, BEARING_SMOOTHING_WINDOW_KM, MMP_DURATIONS_SEC, CEILING_WINDOW_DAYS, POWER_ZONE_META, computeTargetPressureBar, computeLossRateBarPerDay, updateLearnedRateBarPerDay, estimateCurrentPressureBar, isPressureLow, getWheelTargetBar, computeTirePressureReminder, defaultTirePressureData, applyNachmessenUpdate, gearWearStatus, sumRiddenDistanceM, getChainWearDistanceM, computeChainWearReminder, applyChainWearReset, defaultChainWearData, loadAktivitaetenListCache, saveAktivitaetenListCache };\n`;
+  const exposedSrc = `${scriptSrc}\n;globalThis.__exposed = { state, BEARING_SMOOTHING_WINDOW_KM, MMP_DURATIONS_SEC, CEILING_WINDOW_DAYS, POWER_ZONE_META, computeTargetPressureBar, computeLossRateBarPerDay, updateLearnedRateBarPerDay, estimateCurrentPressureBar, isPressureLow, getWheelTargetBar, computeTirePressureReminder, defaultTirePressureData, applyNachmessenUpdate, gearWearStatus, sumRiddenDistanceM, getChainWearDistanceM, computeChainWearReminder, applyChainWearReset, defaultChainWearData, loadAktivitaetenListCache, saveAktivitaetenListCache, decodePolyline, haversineKm, buildCumulativeDistances, estimateArrival, indexAtDistance, weightedLinearRegression, parseIsoDateUTC, toIsoDate, addDaysUTC, mondayOfUTC, computeTestDueSignal, TEST_DURATIONS_SEC, TEST_DURATION_CLASS, TEST_STALENESS_DAYS, xmlEscape, fitCrc, fitString, slugify };\n`;
 
   const ctx = vm.createContext(sandbox);
   const script = new vm.Script(exposedSrc, { filename: 'index.html-inline-script.js' });

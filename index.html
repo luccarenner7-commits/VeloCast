@@ -155,6 +155,16 @@
   .app{ max-width: 720px; margin: 0 auto; padding: 28px 20px 60px; }
   @media (min-width:900px){ .app{ max-width: 900px; } }
   @media (min-width:1200px){ .app{ max-width: none; padding-left: clamp(20px, 4vw, 96px); padding-right: clamp(20px, 4vw, 96px); } }
+  /* Mobile density pass: phones got the same 28px page padding as desktop,
+     just reflowed to one column -- structurally fine (grid/flex auto-fit
+     already prevents anything from being cut off), but visually looser
+     than a phone-native layout should be. Same 620px cutoff .settings-row
+     already uses below, so this isn't a new arbitrary breakpoint. The
+     matching .card/.page-title density tightening lives further down,
+     right after those rules are defined (equal-specificity + later source
+     position is what makes a @media override actually win the cascade --
+     see that block's own comment for why this one can't just live here). */
+  @media (max-width:620px){ .app{ padding: 20px 14px 40px; } }
 
   /* Sticky header: this is a phone-first PWA, so the hamburger button (the
      only way back into the nav drawer) needs to stay reachable on a long
@@ -181,6 +191,13 @@
       padding-left: clamp(20px, 4vw, 96px);
       padding-right: clamp(20px, 4vw, 96px);
     }
+  }
+  /* .brand's negative-margin/padding trick above must track .app's own
+     top/side padding exactly (see .brand's comment) -- .app tightens its
+     padding below 620px, so .brand's offsets have to match here too or the
+     sticky header would misalign against the narrower mobile padding. */
+  @media (max-width:620px){
+    .brand{ margin: -20px -14px 16px; padding: 20px 14px 0; }
   }
   .brand .brand-left{ display:flex; align-items:baseline; gap:12px; }
   .brand h1{
@@ -305,6 +322,16 @@
     font-family:'Space Grotesk', sans-serif; font-size:15px; font-weight:600;
     margin: 0 0 16px; color: var(--chalk);
     text-transform: uppercase; letter-spacing:0.06em;
+  }
+  /* Mobile density pass continued (see .app's own comment above for why) --
+     must come AFTER the .card/.page-title base rules above: same selector
+     specificity, so with an unrelated rule in between (.card h2) a media
+     query placed BEFORE them here would lose the cascade to the later base
+     rule even while its condition matches, silently doing nothing on an
+     actual phone. */
+  @media (max-width:620px){
+    .card{ padding: 16px; margin-bottom: 12px; }
+    .page-title{ margin-bottom: 12px; }
   }
   .muted{ color: var(--chalk-dim); font-size: 14px; line-height:1.55; }
 
@@ -1266,7 +1293,11 @@ function smoothedBearingAt(coords, cumDist, idx){
 function pickRoutePoints(coords, cumDist, stepKm){
   if(coords.length < 2) return [];
 
-  const step = Math.max(1, stepKm);
+  // Callers own their own step floor (WIND_FIELD_MIN_STEP_KM=0.5 for the
+  // wind field, routePointDistanceKm/LIST_ITEM_WIND_STEP_KM=1 elsewhere) --
+  // this is just a safety floor against a zero/negative stepKm causing an
+  // infinite loop below, not an intended minimum sample spacing.
+  const step = Math.max(0.05, stepKm);
   const totalDistance = cumDist[cumDist.length - 1] || 0;
   const points = [];
   let targetDistance = 0;
@@ -3434,7 +3465,7 @@ function buildRiderProfile(pp, ftpAnalysis){
   const dataFtp = ftpAnalysis ? ftpAnalysis.currentCeiling : null;
   const profileFtp = (pp.athleteDetail && pp.athleteDetail.ftp) || null;
   const ftp = dataFtp || profileFtp;
-  const ftpSource = dataFtp ? "aus deinen Fahrten (42-Tage-Bestwert)" : "aus deinem Strava-Profil";
+  const ftpSource = dataFtp ? `aus deinen Fahrten (${CEILING_WINDOW_DAYS}-Tage-Bestwert)` : "aus deinem Strava-Profil";
   const weight = (pp.athleteDetail && pp.athleteDetail.weight) || null;
 
   let riderType='Unbestimmt', riderTypeWhy='Zu wenig Bestleistungs-Daten für eine Einordnung.', ratio5_20=null;
@@ -5225,14 +5256,15 @@ function renderRouteMapSection(card){
           ])
         ]));
       }
-      card.appendChild(el("div", {style:"display:flex; align-items:center; gap:8px; margin-top:14px; cursor:pointer;", onclick:()=>{ state.windFieldEnabled = !state.windFieldEnabled; render(); }}, [
-        el("div", {style:`width:34px; height:20px; border-radius:var(--r-full); flex-shrink:0; background:${state.windFieldEnabled ? "var(--route)" : "var(--asphalt-3)"}; position:relative; transition:background 0.15s;`}, [
-          el("div", {style:`width:16px; height:16px; border-radius:50%; background:#fff; position:absolute; top:2px; left:${state.windFieldEnabled ? "16px" : "2px"}; transition:left 0.15s;`})
-        ]),
-        el("span", {class:"muted", style:"font-size:12px; display:flex; align-items:center; gap:6px;"}, [
-          "Windfeld der Umgebung anzeigen" + (state.windFieldEnabled && state.loading.windField ? " (lädt…)" : ""),
-          state.windFieldEnabled ? infoButton("Windstärke: helles Blau <15 · Blau <30 · dunkleres Blau <45 · dunkelblau ≥45 km/h") : ""
-        ])
+      card.appendChild(el("div", {style:"margin-top:14px;"}, [
+        renderToggleSwitch(
+          state.windFieldEnabled,
+          [
+            "Windfeld der Umgebung anzeigen" + (state.windFieldEnabled && state.loading.windField ? " (lädt…)" : ""),
+            state.windFieldEnabled ? infoButton("Windstärke: helles Blau <15 · Blau <30 · dunkleres Blau <45 · dunkelblau ≥45 km/h") : ""
+          ],
+          ()=>{ state.windFieldEnabled = !state.windFieldEnabled; render(); }
+        )
       ]));
     }
 
@@ -5496,6 +5528,29 @@ function mountRouteMap(){
   }
 }
 
+// Shared builder for every rotated map-direction icon (Leaflet L.divIcon
+// html string) — replaces three previously independent inline SVG strings
+// (segment wind marker, Windfeld overlay arrow, route-direction chevron)
+// that all drew "an arrow rotated to point somewhere" with slightly
+// different, hand-picked line/chevron coordinates and no shared code. Wind
+// icons (outline line+chevron, optional center dot) and the plain
+// travel-direction icon (filled solid arrowhead, always neutral chalk) stay
+// visually distinct on purpose — they mean different things (wind
+// direction vs. which way the ride goes) — but are now one drawing
+// function with explicit params instead of three ad-hoc copies.
+function mapDirectionArrowSvg({size, rotateDeg, color, withDot, filled, strokeWidth, dropShadow}){
+  // fill/stroke set via style="" (not bare attributes) so a CSS custom
+  // property color like var(--chalk) reliably resolves once Leaflet inserts
+  // this markup into the live DOM.
+  const shadow = dropShadow ? ` filter: drop-shadow(0 0 ${dropShadow}px rgba(20,23,29,0.9));` : '';
+  const dot = withDot ? `<circle cx="8" cy="8" r="2.4" style="fill:${color}; opacity:0.95;"/>` : '';
+  const body = filled
+    ? `<path d="M8 2.5 L12.5 11 L8 8.8 L3.5 11 Z" style="fill:${color}; opacity:0.95;"/>`
+    : `<line x1="8" y1="13.2" x2="8" y2="3.5" style="stroke:${color}; stroke-width:${strokeWidth}px;" stroke-linecap="round"/>
+       <path d="M4.3 6.8 L8 2.5 L11.7 6.8" fill="none" style="stroke:${color}; stroke-width:${strokeWidth}px;" stroke-linecap="round" stroke-linejoin="round"/>`;
+  return `<svg width="${size}" height="${size}" viewBox="0 0 16 16" style="transform:rotate(${rotateDeg}deg);${shadow}">${dot}${body}</svg>`;
+}
+
 function mountSegmentView(map, layers, segId, isNewRoute){
   const bucket = segmentBucket(state.selectedSegmentSource);
   const seg = bucket.list.find(s => s.id === segId);
@@ -5537,11 +5592,7 @@ function mountSegmentView(map, layers, segId, isNewRoute){
     const rotateDeg = (w.windDir + 180) % 360;
     const icon = L.divIcon({
       className: "",
-      html: `<svg width="26" height="26" viewBox="0 0 16 16" style="transform:rotate(${rotateDeg}deg); filter: drop-shadow(0 0 2px rgba(20,23,29,0.9));">
-               <circle cx="8" cy="8" r="2.4" fill="${color}" opacity="0.95"/>
-               <line x1="8" y1="13.5" x2="8" y2="3" stroke="${color}" stroke-width="1.8" stroke-linecap="round"/>
-               <path d="M3.8 6.6 L8 2 L12.2 6.6" fill="none" stroke="${color}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-             </svg>`,
+      html: mapDirectionArrowSvg({ size:26, rotateDeg, color, withDot:true, filled:false, strokeWidth:1.8, dropShadow:2 }),
       iconSize: [26,26], iconAnchor: [13,13]
     });
     L.marker(midPoint, { icon }).addTo(layers).bindPopup(label);
@@ -5606,10 +5657,7 @@ function mountFullRouteView(map, layers, isNewRoute){
         const rotateDeg = (p.windDir + 180) % 360;
         const icon = L.divIcon({
           className: "",
-          html: `<svg width="11" height="11" viewBox="0 0 16 16" style="transform:rotate(${rotateDeg}deg);">
-                   <line x1="8" y1="13" x2="8" y2="4" stroke="${color}" stroke-width="1.6" stroke-linecap="round"/>
-                   <path d="M4.8 6.6 L8 3 L11.2 6.6" fill="none" stroke="${color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-                 </svg>`,
+          html: mapDirectionArrowSvg({ size:11, rotateDeg, color, withDot:false, filled:false, strokeWidth:1.6, dropShadow:0 }),
           iconSize: [11,11], iconAnchor: [5.5,5.5]
         });
         L.marker([p.lat, p.lon], { icon }).addTo(layers).bindTooltip(`${Math.round(p.windSpeed)} km/h`);
@@ -5648,9 +5696,7 @@ function mountFullRouteView(map, layers, isNewRoute){
       const bearing = bearingBetween(coords[idx-1], coords[idx]);
       const icon = L.divIcon({
         className: "",
-        html: `<svg width="14" height="14" viewBox="0 0 16 16" style="transform:rotate(${bearing}deg); filter: drop-shadow(0 0 1.5px rgba(20,23,29,0.9));">
-                 <path d="M8 2.5 L12.5 11 L8 8.8 L3.5 11 Z" fill="#f2efe9" opacity="0.95"/>
-               </svg>`,
+        html: mapDirectionArrowSvg({ size:14, rotateDeg:bearing, color:"var(--chalk)", withDot:false, filled:true, dropShadow:1.5 }),
         iconSize: [14,14], iconAnchor: [7,7]
       });
       L.marker(coords[idx], { icon, interactive:false }).addTo(layers);
@@ -6085,19 +6131,27 @@ function renderIrrelevantButton(seg){
   }, [el("span", {html: hideIconSvg(hidden)})]);
 }
 
-// Reusable pill-track + circular-thumb toggle switch, visually identical to
-// the "Windfeld der Umgebung anzeigen" switch on the route page (see
-// renderRouteCard()) — reproduced as a shared helper here (rather than
-// inlined again) because THIS switch has two verbatim call sites ("Meine
-// Segmente" and "Abgeschlossene Segmente") that must look and behave
-// identically, both reading/writing the same state.hideIrrelevantSegments
-// field so the two pages' switches always agree with each other.
+// App-wide toggle switch — the single shared component for every on/off
+// setting (Windfeld-Anzeige, KOM/QOM, Auto-Load, Tubeless, Segmente
+// ausblenden, ...). Built on the same accessible <input type="checkbox"> +
+// .tsettings-switch pattern already used by the Trainer-Einstellungen fields
+// (see settingsFieldRow()) instead of a fake div+onclick knob — a real,
+// keyboard-focusable checkbox with a real :checked state, not just a
+// visual mimic. `label` is a single node/string or an array of nodes (e.g.
+// text plus an infoButton()). The whole row is ONE outer <label> (not
+// nested inside .tsettings-switch's own wrapper) so a click anywhere in the
+// row — switch or text — toggles the single nested checkbox via native
+// browser label semantics; no manual onclick needed, and interactive
+// descendants like infoButton() (which stopPropagation()s its own clicks)
+// are unaffected by the row's implicit toggle.
 function renderToggleSwitch(checked, label, onToggle){
-  return el("div", {style:"display:flex; align-items:center; gap:8px; margin-bottom:14px; cursor:pointer;", onclick:onToggle}, [
-    el("div", {style:`width:34px; height:20px; border-radius:var(--r-full); flex-shrink:0; background:${checked ? "var(--route)" : "var(--asphalt-3)"}; position:relative; transition:background 0.15s;`}, [
-      el("div", {style:`width:16px; height:16px; border-radius:50%; background:#fff; position:absolute; top:2px; left:${checked ? "16px" : "2px"}; transition:left 0.15s;`})
-    ]),
-    el("span", {class:"muted", style:"font-size:12px;"}, [label])
+  const cb = el('input', {type:'checkbox', onchange:onToggle});
+  if(checked) cb.checked = true;
+  const pill = el('span', {class:'tsettings-switch'}, [cb, el('span', {class:'tsettings-slider'})]);
+  const labelChildren = Array.isArray(label) ? label : [label];
+  return el('label', {style:'display:flex; align-items:center; gap:8px; margin-bottom:14px; cursor:pointer;'}, [
+    pill,
+    el('span', {class:'muted', style:'font-size:12px; display:flex; align-items:center; gap:6px;'}, labelChildren)
   ]);
 }
 
@@ -6613,7 +6667,7 @@ function buildFtpChart(){
       { label:'Mittel', data:byConf('mittel'), borderColor:c.grade3, backgroundColor:c.grade3, pointRadius:3, showLine:false },
       { label:'Niedrig', data:byConf('niedrig'), borderColor:c.grade2, backgroundColor:c.grade2, pointRadius:2.5, showLine:false },
       { label:'Unbestätigt', data:byConf('unbestätigt'), borderColor:c.head, backgroundColor:c.head, pointRadius:4, pointStyle:'crossRot', showLine:false },
-      { label:'42-Tage-Bestwert', data:a.ceilingSeries.map(p=>({x:p.x,y:p.y})), borderColor:c.tail, borderWidth:1.5, pointRadius:0, tension:0, fill:false },
+      { label:`${CEILING_WINDOW_DAYS}-Tage-Bestwert`, data:a.ceilingSeries.map(p=>({x:p.x,y:p.y})), borderColor:c.tail, borderWidth:1.5, pointRadius:0, tension:0, fill:false },
       { label:'Trend', data:trendLine, borderColor:c.chalkDim, borderDash:[4,4], pointRadius:0, fill:false },
       { label:'Prognose', data:fp, borderColor:c.chalkDim, borderDash:[2,4], pointRadius:0, fill:false },
       ...(currentFtp!=null ? [{ label:'Strava-FTP', data:[{x:todayOffset,y:currentFtp}], borderColor:c.strava, backgroundColor:c.strava, pointRadius:6, pointStyle:'rectRot', showLine:false }] : []),
@@ -6886,7 +6940,7 @@ function renderProfilFtpSection(frag){
 
   frag.appendChild(el("div", {class:"metric-grid"}, [
     metricCard("Aktueller FTP (Strava)", currentFtp?`${currentFtp} W`:"–", wkg?`${wkg} W/kg`:(currentFtp?null:"nicht in Strava-Profil hinterlegt")),
-    metricCard("Trend (42-Tage-Bestwert)", a && a.weeklySlope!=null ? `${a.weeklySlope>0?'+':''}${a.weeklySlope.toFixed(1)} W` : "n/a",
+    metricCard(`Trend (${CEILING_WINDOW_DAYS}-Tage-Bestwert)`, a && a.weeklySlope!=null ? `${a.weeklySlope>0?'+':''}${a.weeklySlope.toFixed(1)} W` : "n/a",
       `${trendArrow} pro Woche · ${results.length} Fahrten (${hi} hoch/${me} mittel/${lo} niedrig${fl?'/'+fl+' unbestätigt':''})`, trendCls),
     metricCard("Prognose in 8 Wochen", a && a.forecast8!=null ? `${a.forecast8} W` : "n/a",
       a && a.forecast4!=null ? `4 Wo.: ${a.forecast4} W · 12 Wo.: ${a.forecast12} W` : null),
@@ -6898,13 +6952,13 @@ function renderProfilFtpSection(frag){
   const c = profilColors();
   chartCard.appendChild(h2WithInfo("FTP-Verlauf & Prognose", [
     legendDot(c.grade4,"Hoch (20-Min)"), legendDot(c.grade3,"Mittel (10-Min)"), legendDot(c.grade2,"Niedrig (5-Min)"),
-    legendDot(c.head,"Unbestätigt"), legendDot(c.tail,"42-Tage-Bestwert"), legendDot(c.chalkDim,"Trend"), legendDot(c.strava,"Strava-FTP")
+    legendDot(c.head,"Unbestätigt"), legendDot(c.tail,`${CEILING_WINDOW_DAYS}-Tage-Bestwert`), legendDot(c.chalkDim,"Trend"), legendDot(c.strava,"Strava-FTP")
   ]));
   chartCard.appendChild(el("div", {class:"chart-box"}, [el("canvas", {id:"velocastFtpChart"})]));
   frag.appendChild(chartCard);
 
   const interpCard = el("div", {class:"card"});
-  const genericIntro = "FTP ist ein Maximalwert: Trend & Prognose zeigen die rollierende 42-Tage-Bestleistung (höchster bestätigter Schätzwert der letzten 6 Wochen, aus 5-/10-/20-Min-Bestleistungen, per HF-Zeitfenster bestätigt).";
+  const genericIntro = `FTP ist ein Maximalwert: Trend & Prognose zeigen die rollierende ${CEILING_WINDOW_DAYS}-Tage-Bestleistung (höchster bestätigter Schätzwert des letzten Jahres, aus 5-/10-/20-Min-Bestleistungen, per HF-Zeitfenster bestätigt).`;
   const paras = [];
   if(a && a.weeklySlope!=null) paras.push(a.weeklySlope>0 ? `Trend: +${a.weeklySlope.toFixed(1)} W/Woche.` : (a.weeklySlope<0 ? `Trend: −${Math.abs(a.weeklySlope).toFixed(1)} W/Woche.` : "Bestwert stabil."));
   if(fl>0) paras.push(`⚠ ${fl} Aktivität${fl===1?'':'en'} unbestätigt, aus Trend ausgeschlossen.`);
@@ -7547,7 +7601,7 @@ function renderAktivitaetenDetailChartSection(a){
         // became available — zoneTimes would then be a stale all-zero array
         // even though zonesRaw exists now.
         if(Array.isArray(d.metrics.zoneTimes) && d.metrics.zoneTimes.some(t => t > 0)){
-          card.appendChild(el("div", {style:"display:flex; align-items:center; gap:var(--space-2); font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:16px 0 4px;"}, [
+          card.appendChild(el("div", {style:"display:flex; align-items:center; gap:var(--space-2); font-size:11px; font-weight:600; letter-spacing:0.05em; color:var(--chalk-dim); text-transform:uppercase; margin:16px 0 4px;"}, [
             "Zeit je Zone"
           ]));
           appendZoneBars(card, rideZoneBreakdown(d.metrics.zoneTimes));
@@ -11048,7 +11102,7 @@ function renderTrainerDecisionDashboard(trainingState, weaknessData, opportunity
       // which would clip the badge for anything longer than the shortest class
       // names (e.g. "VO2max") once appended as a child of the truncating box.
       row.appendChild(el('span', {class:'bar-label', title:c.label}, [c.label]));
-      row.appendChild(el('span', {style:`flex:0 0 auto; padding:1px 7px; border-radius:10px; font-size:10.5px; font-weight:600; color:${badge.fg}; background:${badge.bg};`}, [badge.label]));
+      row.appendChild(el('span', {style:`flex:0 0 auto; padding:1px 7px; border-radius:var(--r-full); font-size:10.5px; font-weight:600; color:${badge.fg}; background:${badge.bg};`}, [badge.label]));
       row.appendChild(el('span',{class:'bar-track'},[el('span',{style:`display:block; height:100%; border-radius:var(--r-full); width:${pct}%; background:${badge.fg};`},[])]));
       row.appendChild(el('span',{class:'bar-num'},[formatBudgetLine(budget)]));
       card.appendChild(row);
@@ -11437,12 +11491,12 @@ function renderTrainerZonesCard(hasWorkout, zoneBreakdown, routeBased, actualWee
   const card = el('div', {class:'card'});
   card.appendChild(el('h2', {}, ['Zonen']));
   if(hasWorkout){
-    card.appendChild(el('div', {style:'display:flex; align-items:center; gap:var(--space-2); font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:2px 0 4px;'}, [
+    card.appendChild(el('div', {style:'display:flex; align-items:center; gap:var(--space-2); font-size:11px; font-weight:600; letter-spacing:0.05em; color:var(--chalk-dim); text-transform:uppercase; margin:2px 0 4px;'}, [
       'Ausgewähltes Workout', infoButton(routeBased?'Geschätzt aus dem Streckenprofil.':(usingHr?'Aus dem HF-Ziel jedes Abschnitts.':'Aus der Zielleistung jedes Abschnitts.'))
     ]));
     appendZoneBars(card, zoneBreakdown);
   }
-  card.appendChild(el('div', {style:'display:flex; align-items:center; gap:var(--space-2); font-size:11px; color:var(--chalk-dim); text-transform:uppercase; margin:16px 0 4px;'}, [
+  card.appendChild(el('div', {style:'display:flex; align-items:center; gap:var(--space-2); font-size:11px; font-weight:600; letter-spacing:0.05em; color:var(--chalk-dim); text-transform:uppercase; margin:16px 0 4px;'}, [
     actualWeekZones.rides>0 ? `Diese Woche, gefahren – ${actualWeekZones.rides} Fahrt${actualWeekZones.rides===1?'':'en'} seit Montag` : 'Diese Woche, gefahren',
     actualWeekZones.rides>0 ? infoButton(`Aus deinen echten Aktivitäten (${usingHr ? 'Stravas 7 Leistungszonen aus deinen Fahrten mit Wattdaten – nur Fahrten mit Leistungsmesser zählen hier, unabhängig vom aktuellen Modus.' : 'Stravas 7 Zonen statt der 6 App-Zonen oben.'}). Der helle Bereich in Tempo/Schwelle/VO2max/Anaerob zeigt, welcher Anteil davon lange genug am Stück in der Zone war, um als hochwertiges Intervall fürs Wochenbudget zu zählen.`) : ''
   ]));
