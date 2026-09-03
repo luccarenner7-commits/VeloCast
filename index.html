@@ -1603,6 +1603,50 @@ function renderRangeRingsRow(){
   return el("div", {style:"display:flex; justify-content:space-around; gap:6px; margin-top:14px;"}, rings);
 }
 
+// Renders one ring showing a single point-in-time value as a 0->value fill
+// (rather than renderRangeRing's min->max band) -- same track-circle +
+// colored-arc + centered-text visual language as the weather rings above,
+// reused here for the Formkurve (CTL/ATL/TSB). No icon glyph (there's no
+// existing icon for these metrics the way there is for temp/rain/wind/uv),
+// so a caption sits below the ring instead.
+function renderValueRing({ label, value, unit, domainMin, domainMax, color, signed }){
+  const size = 76, r = 30, cx = size/2, cy = size/2;
+  const valueToAngle = v => Math.min(1, Math.max(0, (v - domainMin) / (domainMax - domainMin))) * 360;
+  let endAngle = valueToAngle(value);
+  if(endAngle < 8) endAngle = 8;
+  const arcPath = describeArc(cx, cy, r, 0, endAngle);
+  const valueText = `${signed && value>0 ? '+' : ''}${Math.round(value)}${unit}`;
+  const svg = `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#262c37" stroke-width="7"/>
+    <path d="${arcPath}" fill="none" stroke="${color}" stroke-width="7" stroke-linecap="round"/>
+    <text x="${cx}" y="${cy+5}" text-anchor="middle" font-family="'IBM Plex Mono', monospace" font-size="15" font-weight="600" fill="#f2efe9">${valueText}</text>
+  </svg>`;
+  return el("div", {style:"display:flex; flex-direction:column; align-items:center; gap:6px; flex:1; min-width:0;"}, [
+    el("div", {html: svg}),
+    el("div", {class:"legend-note"}, [label])
+  ]);
+}
+
+// Formkurve ring row -- replaces the previous 4-chip metric-grid (CTL/ATL/
+// TSB/Aufbaurate) with 3 rings for CTL/ATL/TSB, matching the Strecke-tab's
+// ring visual language. Aufbaurate lost its dedicated chip here, but stays
+// surfaced via the "Steiler Formaufbau"-warn-callout below when relevant
+// (renderProfilFormSection) -- explicit user decision (all 4 chips out,
+// only 3 rings in). TSB's ring color follows the existing good/warn/danger
+// verdict classification (L.formClass) instead of a fixed identity color,
+// since that classification already exists and reusing it beats inventing
+// a second, parallel set of thresholds just for the ring.
+function renderFormRingsRow(L){
+  const cc = profilColors();
+  const tsbColor = L.formClass === 'good' ? cc.tail : (L.formClass === 'warn' ? cc.cross : cc.head);
+  const rings = [
+    renderValueRing({ label:"Fitness (CTL)", value:L.ctl, unit:"", domainMin:0, domainMax:120, color:cc.route }),
+    renderValueRing({ label:"Ermüdung (ATL)", value:L.atl, unit:"", domainMin:0, domainMax:120, color:cc.cross }),
+    renderValueRing({ label:"Form (TSB)", value:L.tsb, unit:"", domainMin:-50, domainMax:50, color:tsbColor, signed:true }),
+  ];
+  return el("div", {style:"display:flex; justify-content:space-around; gap:6px; margin-top:14px;"}, rings);
+}
+
 async function ensureWindField(){
   if(state.windFieldPoints || state.loading.windField) return;
   state.loading.windField = true; render();
@@ -2539,8 +2583,14 @@ function gearWearStatus(totalDistanceM, resetKm, intervalKm){
 // computeChainWearReminder()/renderChainWearBanner() below), which Ausrüstung
 // has no equivalent of.
 const CHAIN_WEAR_KEY = 'velocast_chain_wear';
+// 250 km, not the old 3000 km wear-replacement figure: this is a re-wax
+// interval (see the "Kette" card, renamed away from "Verschleiß"/wear
+// framing since the underlying tool tracks when to re-wax the chain, not
+// when it's worn out), and hot-wax lubrication typically needs reapplying
+// every ~200-300 km. Rider-editable either way (see the "Schwelle" input in
+// buildChainWearCard()).
 function defaultChainWearData(){
-  return { thresholdKm: 3000, resetAtMs: 0 };
+  return { thresholdKm: 250, resetAtMs: 0 };
 }
 // Same "any failure silently falls back to a safe default" discipline as
 // loadTirePressureData()/loadGearResets().
@@ -2622,7 +2672,7 @@ function getChainWearDistanceM(sinceMs){
 // site in buildChainWearCard()): true once wear has reached gearWearStatus()'s
 // "danger" level (pct>=100, i.e. sinceKm>=thresholdKm) -- deliberately the
 // harder "threshold reached" bar, not the softer 80% "warn" pre-level, to
-// match renderChainWearBanner()'s "Kette vermutlich verschlissen" wording.
+// match renderChainWearBanner()'s "Kette sollte bald neu gewachst werden" wording.
 // A plain boolean (not a {front,rear}-shaped object like
 // computeTirePressureReminder()'s result) since there's only one chain to
 // track here. `distanceSinceResetM` must already be pre-filtered to
@@ -3840,7 +3890,7 @@ const CHANGELOG = [
       'KOM-/QOM-Sortierung ist jetzt auch bei „Meine Segmente" auswählbar (vorher nur bei „Abgeschlossene Segmente" verfügbar) und blendet sich dort passend zu den Einstellungen ein/aus.',
       'Aktivitäten-Detailansicht zeigt jetzt „Zeit je Zone" für die einzelne Fahrt, sofern Trainingsdaten (Profil) geladen sind.',
       'Reifendruck: Vorder- und Hinterrad stehen jetzt nebeneinander auf breiten Bildschirmen (Tablet/Desktop), die überflüssige separate Titel-Karte ist weg — insgesamt kompakter.',
-      'Neues Werkzeug „Kette" auf der Reifendruck-Seite: verfolgt den Kettenverschleiß anhand der eigenen gefahrenen Kilometer, mit einstellbarer Wechsel-Schwelle (Standard 3000 km), „Zurückgesetzt"-Button beim Kettenwechsel und Hinweis-Banner, sobald die Schwelle erreicht ist.',
+      'Neues Werkzeug „Kette" auf der Reifendruck-Seite: verfolgt anhand der eigenen gefahrenen Kilometer, wann die Kette neu gewachst werden sollte, mit einstellbarer Schwelle (Standard 250 km), „Gewachst"-Button und Hinweis-Banner, sobald die Schwelle erreicht ist.',
     ],
     improvements:[
       'Reifendruck: „Aufgepumpt auf" verschwindet, sobald schon ein Ausgangswert gemerkt ist — „Nachmessen & neu aufpumpen" reicht dann allein aus und funktioniert jetzt auch ohne Eingabe bei „Gemessen" (setzt dann einfach den neuen Ausgangswert, ohne die Verlustrate neu zu berechnen).',
@@ -4060,7 +4110,7 @@ function resetConnectionState(){
   // Reifendruck page itself staying reachable while disconnected). But the
   // reminder BANNER is a startup/session notice, same category as
   // tirePressureReminder -- without an explicit reset here it would keep
-  // showing "Kette vermutlich verschlissen" indefinitely across a
+  // showing "Kette sollte bald neu gewachst werden" indefinitely across a
   // disconnect/reconnect cycle instead of being freshly recomputed on the
   // next connected session, so clear it here like every other in-memory
   // startup flag this function resets.
@@ -7440,12 +7490,9 @@ function renderProfilFormSection(frag){
     frag.appendChild(card);
     return;
   }
-  frag.appendChild(el("div", {class:"metric-grid"}, [
-    metricCard("Fitness (CTL)", L.ctl.toFixed(0), "42-Tage-Belastungsschnitt"),
-    metricCard("Ermüdung (ATL)", L.atl.toFixed(0), "7-Tage-Belastungsschnitt"),
-    metricCard("Form (TSB)", `${L.tsb>0?'+':''}${L.tsb.toFixed(0)}`, L.formVerdict, L.tsb>0?"up":(L.tsb<-20?"down":null)),
-    metricCard("Aufbaurate", `${L.rampWeekly>0?'+':''}${L.rampWeekly.toFixed(1)}`, `CTL pro Woche${L.rampWeekly>7?' · sehr steil':''}`, L.rampWeekly>0?"up":(L.rampWeekly<0?"down":null))
-  ]));
+  const ringsCard = el("div", {class:"card"});
+  ringsCard.appendChild(renderFormRingsRow(L));
+  frag.appendChild(ringsCard);
 
   const chartCard = el("div", {class:"card"});
   chartCard.appendChild(h2WithInfo("Formkurve (Fitness / Ermüdung / Form)", "TSS aus Normalized Power (nicht Stravas HF-Relative-Effort). CTL = 42-Tage-Schnitt (Fitness), ATL = 7-Tage-Schnitt (Ermüdung), TSB = CTL − ATL (Form). Die ersten Wochen sind ein Einschwing-Artefakt."));
@@ -13309,7 +13356,7 @@ function buildChainWearCard(){
   const card = el('div', {class: 'card'});
   card.appendChild(el('h2', {}, ['Kette']));
 
-  const row = barRow('Verschleiß', Math.min(100, status.pct), color, `${Math.round(status.sinceKm)} / ${chainWear.thresholdKm} km`);
+  const row = barRow('Seit dem Wachsen', Math.min(100, status.pct), color, `${Math.round(status.sinceKm)} / ${chainWear.thresholdKm} km`);
   row.appendChild(el('button', {
     class: 'btn secondary', style: 'margin-left:8px; padding:2px 9px; font-size:11px; flex-shrink:0;',
     onclick: () => {
@@ -13318,7 +13365,7 @@ function buildChainWearCard(){
       state.chainWearReminder = computeChainWearReminder(state.chainWear, getChainWearDistanceM(state.chainWear.resetAtMs));
       render();
     }
-  }, ['Zurückgesetzt']));
+  }, ['Gewachst']));
   card.appendChild(row);
 
   // Unlike GEAR_COMPONENTS.intervalKm (a hardcoded constant), the threshold
@@ -13361,7 +13408,7 @@ function renderChainWearBanner(){
   const chainWear = state.chainWear;
   const distanceSinceResetM = getChainWearDistanceM(chainWear.resetAtMs);
   const status = gearWearStatus(distanceSinceResetM, 0, chainWear.thresholdKm);
-  const text = `Kette vermutlich verschlissen (${Math.round(status.sinceKm)} / ${chainWear.thresholdKm} km) — Seite „Reifendruck" öffnen?`;
+  const text = `Kette sollte bald neu gewachst werden (${Math.round(status.sinceKm)} / ${chainWear.thresholdKm} km) — Seite „Reifendruck" öffnen?`;
 
   return el('div', {class: 'card', style: 'border-color:var(--cross); display:flex; align-items:center; justify-content:space-between; gap:10px; cursor:pointer;', onclick: () => {
     state.activePage = 'reifendruck';
