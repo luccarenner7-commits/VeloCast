@@ -993,8 +993,26 @@ let state = {
   // only one API call). Cleared both by resetRouteSegments() (new selection)
   // and at the start of every ensureRideSegments() run (retry).
   routeSegmentsError: null,
+  // Segmentjäger (Task, 03.09.2026): which of the currently selected ride's
+  // segments (state.routeSegments) are currently chosen as future KOM/QOM/
+  // PR-attempt targets -- {[segmentId]: boolean}. Deliberately its own field
+  // rather than reusing state.irrelevantSegmentIds' shape/meaning ("hide
+  // this segment everywhere") -- this is "target this segment", a
+  // per-activity choice, not a global per-segment curation flag. Computed/
+  // restored by ensureSegmentjaegerSelection() (see there), persisted by
+  // activity id via saveSegmentjaegerSelection()/loadSegmentjaegerSelections().
+  segmentjaegerSelection: {},
+  // Which activity.id state.segmentjaegerSelection currently reflects --
+  // ensureSegmentjaegerSelection() only (re)computes/restores the selection
+  // when this no longer matches state.selectedActivity.id, so re-rendering
+  // the page or toggling a row never re-runs the default-eligibility
+  // computation and stomps a user's override. Reset implicitly just by
+  // selecting a different activity (selectActivity() doesn't touch this
+  // field directly -- the mismatch against the new activity.id is what
+  // triggers a fresh compute/restore on the next render).
+  segmentjaegerSelectionActivityId: null,
   navOpen: false, // left slide-in nav drawer open/closed
-  activePage: "route", // "route" | "segments" | "profil" | "aktivitaeten" | "trainer" | "einstellungen" | "reifendruck" | "changelog" - which NAV_ITEMS entry is active
+  activePage: "route", // "route" | "segments" | "segmentjaeger" | "profil" | "aktivitaeten" | "trainer" | "einstellungen" | "reifendruck" | "changelog" - which NAV_ITEMS entry is active
   routeSourceTab: "activities", // "routes" | "activities" | "gpx"
   stravaRoutes: [], // saved/planned Strava routes, fetched lazily when that tab opens
   routeInfoTab: "elevation", // "elevation" | "climbs" | "beststart"
@@ -3786,6 +3804,7 @@ async function fetchWeather(lat, lon, targetDate){
 const NAV_ITEMS = [
   {id:"route", label:"Strecke"},
   {id:"segments", label:"Meine Segmente"},
+  {id:"segmentjaeger", label:"Segmentjäger"},
   {id:"profil", label:"Profil"},
   {id:"aktivitaeten", label:"Aktivitäten"},
   {id:"trainer", label:"Trainer"},
@@ -4159,6 +4178,8 @@ function render(){
 
   if(state.activePage === "segments"){
     app.appendChild(renderSegmentsPage());
+  } else if(state.activePage === "segmentjaeger"){
+    app.appendChild(renderSegmentjaegerPage());
   } else if(state.activePage === "profil"){
     app.appendChild(renderProfilPage());
   } else if(state.activePage === "aktivitaeten"){
@@ -4977,6 +4998,164 @@ async function ensureRideSegments(){
   render();
 }
 
+// ---------- Segmentjäger: curated target-segment picker for a ridden ride ----------
+// Builds directly on "Abgeschlossene Segmente" above (same state.routeSegments/
+// routeSegmentDetails/routeSegmentEfforts, no separate fetch). Purpose: for an
+// activity the rider has already completed, suggest which of its segments are
+// realistic to specifically target for a KOM/QOM or personal-best attempt on
+// a future ride. Deliberately only ever reads the ride-completed bucket
+// ensureRideSegments() already fetches — see the comment above that function
+// for why route/GPX-based segment discovery was removed from this app
+// entirely (false positives from proximity-matching); this feature never
+// resurrects any form of that.
+
+const SEGMENTJAEGER_XOM_TOLERANCE = 0.08; // 8%, see the task brief's default-selection rule
+const SEGMENTJAEGER_TOP_RANK = 10;
+
+// Pure eligibility check for ONE segment's default selection — no state.*
+// reads (showKomChip/showQomChip are passed in explicitly instead, see
+// below), so it's directly unit-testable. `detail` is bucket.details[seg.id]
+// (a DetailedSegment, possibly null/undefined if that fetch failed), `effort`
+// is bucket.efforts[seg.id] (this ride's own DetailedSegmentEffort — always
+// present for anything in state.routeSegments, since that's literally where
+// the segment came from, see ensureRideSegments()). `showKomChip`/
+// `showQomChip` mirror state.showKomChip/state.showQomChip (see
+// computeRideEffortStatChips(), which already gates the KOM/QOM chips
+// themselves on these) — pre-selecting a segment off a KOM or QOM gap the
+// row then doesn't even display, because the matching chip is toggled off,
+// would leave the rider confused about why it's highlighted.
+//
+// True when EITHER:
+//  - `detail` has a KOM and/or QOM time AND the rider's all-time PR on this
+//    segment is within SEGMENTJAEGER_XOM_TOLERANCE of it — (pr - xom) / xom
+//    <= 0.08 (a zero/negative delta, i.e. the PR already matches or beats the
+//    record, still counts as "within tolerance") — but the KOM side of this
+//    only counts when showKomChip is true, and likewise QOM/showQomChip, OR
+//  - this specific ride's effort already ranked top-10 — either on the
+//    segment's overall leaderboard (kom_rank) or the rider's own leaderboard
+//    (pr_rank). Strava only ever populates either field at all when the
+//    effort qualifies, so a non-null value already implies "top 10" without
+//    needing its own numeric check, but the <= 10 guard is kept as a
+//    defensive belt-and-braces in case that assumption is ever wrong. This
+//    rule is the rider's own placement, not a KOM/QOM *display* fact, so it's
+//    unaffected by showKomChip/showQomChip either way.
+// A missing PR and/or missing xoms — can't judge realism — correctly falls
+// through to `false` (deselected by default), per explicit product decision
+// (see the task brief).
+function segmentjaegerIsDefaultEligible(detail, effort, showKomChip, showQomChip){
+  const pr = detail && detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
+  const nearRecord = (xomTime) => {
+    if(pr == null || !xomTime) return false;
+    const xomSeconds = parseDuration(xomTime);
+    if(xomSeconds == null || xomSeconds <= 0) return false;
+    return (pr - xomSeconds) / xomSeconds <= SEGMENTJAEGER_XOM_TOLERANCE;
+  };
+  const xoms = detail && detail.xoms;
+  const viaRecord = !!xoms && (
+    (!!showKomChip && nearRecord(xoms.kom)) ||
+    (!!showQomChip && nearRecord(xoms.qom))
+  );
+  const viaTopTen = !!effort && (
+    (effort.kom_rank != null && effort.kom_rank <= SEGMENTJAEGER_TOP_RANK) ||
+    (effort.pr_rank != null && effort.pr_rank <= SEGMENTJAEGER_TOP_RANK)
+  );
+  return viaRecord || viaTopTen;
+}
+
+// Runs segmentjaegerIsDefaultEligible() over every segment in `segments` —
+// the whole-list default, computed exactly once per activity (see
+// ensureSegmentjaegerSelection() below for when this actually runs).
+// `showKomChip`/`showQomChip` are just forwarded through to each per-segment
+// check — see segmentjaegerIsDefaultEligible()'s own comment for why they're
+// parameters here rather than a global state.* read.
+function segmentjaegerComputeDefaults(segments, details, efforts, showKomChip, showQomChip){
+  const out = {};
+  segments.forEach(seg => {
+    out[seg.id] = segmentjaegerIsDefaultEligible(details[seg.id], efforts[seg.id], showKomChip, showQomChip);
+  });
+  return out;
+}
+
+// Per-activity persisted selection — one localStorage blob shaped
+// {[activityId]: {[segmentId]: boolean}}, same "everything in one key, keyed
+// by id" shape as PROFIL_GEAR_RESET_KEY's per-gear-id map (see
+// loadGearResets()). Keyed by activity.id, always present for a genuine
+// ridden Strava activity — no fallback-key case to handle here. Same
+// defensive-read discipline as every other localStorage reader in this file:
+// never throws on missing/corrupt JSON, silently drops anything that isn't
+// exactly the expected shape rather than trusting it.
+const SEGMENTJAEGER_SELECTION_KEY = 'velocast_segmentjaeger_selection';
+function loadSegmentjaegerSelections(){
+  try{
+    const raw = localStorage.getItem(SEGMENTJAEGER_SELECTION_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    if(!parsed || typeof parsed !== 'object') return {};
+    const out = {};
+    Object.entries(parsed).forEach(([activityId, sel]) => {
+      if(!sel || typeof sel !== 'object') return;
+      const clean = {};
+      Object.entries(sel).forEach(([segId, v]) => {
+        // Must actually BE a boolean (not e.g. a truthy string) — an
+        // explicit `false` is exactly the value this feature most needs to
+        // survive a round-trip (a user-deselected default-eligible segment),
+        // so this can't use a `||`/truthiness shortcut here either.
+        if(typeof v === 'boolean') clean[segId] = v;
+      });
+      out[String(activityId)] = clean;
+    });
+    return out;
+  }catch(e){ return {}; }
+}
+function saveSegmentjaegerSelection(activityId, selection){
+  const all = loadSegmentjaegerSelections();
+  all[String(activityId)] = selection;
+  try{ localStorage.setItem(SEGMENTJAEGER_SELECTION_KEY, JSON.stringify(all)); }catch(e){}
+}
+
+// Populates state.segmentjaegerSelection for the currently selected activity
+// — computed/restored at most once per activity (guarded by
+// state.segmentjaegerSelectionActivityId), so re-rendering the page or
+// toggling a row never re-runs the default computation and stomps a user's
+// override. Waits for routeSegmentsFetched (not just routeSegments.length) so
+// details/efforts (loadSegmentExtras(), awaited inside ensureRideSegments()
+// before that flag flips) are actually in place before the eligibility check
+// reads them — computing defaults off partially-loaded details would
+// silently under-select. Called directly from renderSegmentjaegerPage()
+// during render, same "mutate state synchronously mid-render, no nested
+// render() call" pattern renderRouteSourceTabs() already uses for its own
+// state.routeSourceTab fallback.
+function ensureSegmentjaegerSelection(){
+  const activity = state.selectedActivity;
+  if(!activity || !state.routeSegmentsFetched || !state.routeSegments.length) return;
+  if(state.segmentjaegerSelectionActivityId === activity.id) return;
+  const stored = loadSegmentjaegerSelections()[String(activity.id)];
+  if(stored){
+    // Restore, never recompute — an activity's segment set is deterministic
+    // (same activity -> same segment_efforts), so every id should already be
+    // a key in `stored`; anything genuinely missing (defensive only) reads
+    // as deselected rather than silently re-running the default computation.
+    const restored = {};
+    state.routeSegments.forEach(seg => { restored[seg.id] = stored[seg.id] === true; });
+    state.segmentjaegerSelection = restored;
+  } else {
+    const defaults = segmentjaegerComputeDefaults(state.routeSegments, state.routeSegmentDetails, state.routeSegmentEfforts, state.showKomChip, state.showQomChip);
+    state.segmentjaegerSelection = defaults;
+    saveSegmentjaegerSelection(activity.id, defaults);
+  }
+  state.segmentjaegerSelectionActivityId = activity.id;
+}
+
+// Row click handler — toggles one segment's target selection and persists
+// the whole updated map immediately (not just on navigating away), so a
+// selection survives even an unexpected tab close.
+function toggleSegmentjaegerSelection(seg){
+  const activity = state.selectedActivity;
+  if(!activity) return;
+  state.segmentjaegerSelection[seg.id] = !state.segmentjaegerSelection[seg.id];
+  saveSegmentjaegerSelection(activity.id, state.segmentjaegerSelection);
+  render();
+}
+
 // Step used to sample a list-chip's polyline into smoothed-bearing points
 // (see pickRoutePoints()/smoothedBearingAt()) -- much finer than the
 // route-page's user-configurable Punktabstand since this only drives a
@@ -5485,6 +5664,16 @@ function currentRouteKey(){
   // null, same as the route-page branch below when there's no route yet, so
   // mountRouteMap() tears down/no-ops instead of showing a blank canvas.
   if(state.activePage === "segments") return segmentsWithOverviewGeometry().length ? "segments-overview" : null;
+  // Segmentjäger: its own key namespace ("segmentjaeger-" prefix, not
+  // "route-") so navigating here with the same activity already selected on
+  // the Strecke page still gets a fresh mount instead of silently reusing
+  // that page's map instance — same "no route yet -> null" fallback as the
+  // route-page branch below.
+  if(state.activePage === "segmentjaeger"){
+    if(!state.fullRouteCoords.length) return null;
+    const a = state.selectedActivity;
+    return "segmentjaeger-" + (a ? (a.id || a.name || "") : "");
+  }
   if(!state.fullRouteCoords.length) return null;
   const a = state.selectedActivity;
   return "route-" + (a ? (a.id || a.name || "") : "");
@@ -5523,6 +5712,8 @@ function mountRouteMap(){
     mountSegmentView(leafletMapInstance, routeMapLayers, state.selectedSegmentId, isNewRoute);
   } else if(state.activePage === "segments"){
     mountSegmentsOverviewView(leafletMapInstance, routeMapLayers, isNewRoute);
+  } else if(state.activePage === "segmentjaeger"){
+    mountSegmentjaegerView(leafletMapInstance, routeMapLayers, isNewRoute);
   } else {
     mountFullRouteView(leafletMapInstance, routeMapLayers, isNewRoute);
   }
@@ -5632,6 +5823,39 @@ function mountSegmentsOverviewView(map, layers, isNewRoute){
   if(isNewRoute && drawnLines.length){
     map.fitBounds(L.featureGroup(drawnLines).getBounds(), { padding:[30,30] });
   }
+}
+
+// Segmentjäger's own map view: the ridden activity's plain route line (same
+// neutral base-line treatment as mountFullRouteView()'s uncovered-route line
+// below — no wind coloring/Windfeld/reversed-direction handling here, this
+// page isn't about wind) plus an overlay for only the currently-SELECTED
+// segments (state.segmentjaegerSelection), drawn with the exact same dark-
+// casing + route-blue treatment mountSegmentsOverviewView() above already
+// uses for "Meine Segmente"'s multi-segment overview. Deselected segments
+// are omitted from the map entirely rather than dimmed — this is a static
+// overview, not an interactive picker (see the task brief: not clickable,
+// matches "Meine Segmente"'s static-map convention); the list below the map
+// is where selection actually happens.
+function mountSegmentjaegerView(map, layers, isNewRoute){
+  if(!state.fullRouteCoords.length) return;
+  const coords = activeRouteCoords();
+  const latlngs = coords.map(c => [c[0], c[1]]);
+  const baseLine = L.polyline(latlngs, { color:"#333a47", weight:3, opacity:0.55, lineCap:"round", lineJoin:"round" }).addTo(layers);
+  const fitTargets = [baseLine];
+
+  const bucket = segmentBucket("route");
+  state.routeSegments.forEach(seg => {
+    if(!state.segmentjaegerSelection[seg.id]) return;
+    const detail = bucket.details[seg.id];
+    const poly = detail && detail.map && (detail.map.polyline || detail.map.summary_polyline);
+    if(!poly) return;
+    const segLatlngs = decodePolyline(poly).map(c => [c[0], c[1]]);
+    L.polyline(segLatlngs, { color:"#333a47", weight:8, opacity:0.7, lineCap:"round", lineJoin:"round" }).addTo(layers);
+    const line = L.polyline(segLatlngs, { color:"#82a2d1", weight:4, opacity:1, lineCap:"round", lineJoin:"round" }).addTo(layers);
+    fitTargets.push(line);
+  });
+
+  if(isNewRoute) map.fitBounds(L.featureGroup(fitTargets).getBounds(), { padding:[26,26] });
 }
 
 function mountFullRouteView(map, layers, isNewRoute){
@@ -5881,7 +6105,18 @@ function computeRideEffortStatChips(effort, prWatts, detail){
       style: isPr ? "color:var(--tail); background:var(--tail-bg);" : null
     });
   }
-  if(prWatts) secondary.push(`${prWatts.measured ? "" : "~"}${prWatts.watts} W`);
+  // "Ø" prefix deliberately added here (NOT in computeSegmentStatChips()'s
+  // identical-looking line for the starred bucket, where prWatts genuinely
+  // IS the athlete's PR-effort wattage) — `prWatts` here is
+  // effort.average_watts for THIS ride's own completion (see
+  // ensureRideSegments()), not the athlete's all-time PR effort's wattage
+  // (that's a different, starred-bucket-only lookup via
+  // fetchSegmentPrWatts()/ensureSegmentPrWatts(), an extra per-segment API
+  // call deliberately not made here). Sitting right next to the "PR
+  // {duration}" secondary text below without a label, this used to read as
+  // if it were the PR's own wattage — the "Ø" (ride average) makes clear
+  // it's this ride's number instead.
+  if(prWatts) secondary.push(`Ø ${prWatts.measured ? "" : "~"}${prWatts.watts} W`);
   const potential = prWatts && effort.elapsed_time != null ? buildPotentialChip(prWatts.watts, effort.elapsed_time) : null;
   if(potential) hero.push(potential);
   if(effort.kom_rank) secondary.push(`Platz ${effort.kom_rank} (Effort)`);
@@ -6594,6 +6829,170 @@ function renderRouteSegmentsCard(){
   // that's the whole point of "Abgeschlossene Segmente".
   const list = sortedRouteSegments(bucket);
   list.forEach(seg => card.appendChild(renderSegmentRow(seg, bucket)));
+  return card;
+}
+
+// ---------- Segmentjäger page ----------
+// Activity picker, mirroring the Strecke page's "Fahrten" tab list
+// (renderRouteSourceTabs()'s state.routeSourceTab === "activities" branch)
+// exactly — same filtered ride-type list, same 5-item cap, same wind-tag
+// helper — but standalone (no tab row above it, this page only ever needs
+// the ridden-activities source, see the task brief for why routes/GPX are
+// out of scope). Selecting an activity goes through the exact same
+// selectActivity() the Strecke page uses, so state.selectedActivity/
+// state.routeSegments/etc. all just work unchanged regardless of which page
+// the selection was made from.
+function renderSegmentjaegerActivityPicker(card){
+  card.appendChild(el("h2", {}, ["Aktivität wählen"]));
+  if(state.loading.activities){
+    card.appendChild(el("div", {class:"loading"}, ["Lade letzte Aktivitäten…"]));
+    return;
+  }
+  const rides = state.activities.filter(a => a.type === "Ride" || a.type === "VirtualRide" || a.type === "GravelRide" || a.type === "MountainBikeRide" || !a.type);
+  if(!rides.length){
+    card.appendChild(el("div", {class:"empty-state"}, ["Keine Aktivitäten gefunden."]));
+    return;
+  }
+  const list = el("div", {});
+  rides.slice(0,5).forEach(a=>{
+    const key = "activity-" + a.id;
+    const isSel = state.selectedActivity && state.selectedActivity.id === a.id;
+    const km = (a.distance/1000).toFixed(1);
+    const date = new Date(a.start_date_local).toLocaleDateString("de-DE", {day:"2-digit", month:"2-digit", year:"numeric"});
+    ensureListItemWindTag(key, a.map && a.map.summary_polyline);
+    const item = el("div", {class:"activity" + (isSel?" selected":""), onclick: ()=>selectActivity(a)}, [
+      el("div", {}, [
+        el("div", {class:"name"}, [a.name]),
+        el("div", {class:"meta"}, [`${date} · ${km} km`])
+      ]),
+      renderListItemWindTag(key)
+    ]);
+    list.appendChild(item);
+  });
+  card.appendChild(list);
+}
+
+// One selectable row in the Segmentjäger list. Reuses the exact same
+// data/formatting building blocks every other segment row in this app uses —
+// computeSegmentStatChips() (which, for the "route" bucket, delegates to
+// computeRideEffortStatChips() — this ride's own time, watts, effort rank,
+// plus the same KOM/QOM delta chips) and statChip() — but with its own DOM
+// assembly and click behavior instead of reusing renderSegmentRow() itself:
+// tapping the row toggles this segment's membership in
+// state.segmentjaegerSelection instead of navigating into a detail view, and
+// per the task brief there are deliberately NO other interactive controls
+// inside the row (no star/"nicht relevant"/leaderboard buttons — segment
+// detail viewing already exists elsewhere in the app, see renderSegmentRow()/
+// selectSegment()). Deselected rows get the same opacity:0.5 "dimmed"
+// treatment already used app-wide for a disabled control (.btn:disabled/
+// .star-btn:disabled/.nav-action:disabled), not a new one-off value.
+function renderSegmentjaegerRow(seg){
+  const bucket = segmentBucket("route");
+  const selected = !!state.segmentjaegerSelection[seg.id];
+  const row = el("div", {
+    class: "segment" + (selected ? " selected" : ""),
+    style: selected ? null : "opacity:0.5;",
+    onclick: ()=>toggleSegmentjaegerSelection(seg)
+  });
+
+  row.appendChild(el("div", {class:"top"}, [
+    el("div", {style:"flex:1; min-width:0;"}, [
+      el("div", {class:"name"}, [seg.name]),
+      el("div", {class:"meta", style:"display:flex; justify-content:space-between; gap:10px;"}, [
+        el("span", {}, [`${(seg.distance/1000).toFixed(1)} km`]),
+        el("span", {}, [`${seg.average_grade}% Ø-Steigung`])
+      ])
+    ])
+  ]));
+
+  const stats = computeSegmentStatChips(seg, bucket);
+  if(stats.hero.length){
+    const chips = el("div", {class:"stat-chips"});
+    stats.hero.forEach(s => chips.appendChild(statChip(s.value, s.label, s.style)));
+    row.appendChild(chips);
+  }
+  if(stats.secondary.length){
+    row.appendChild(el("div", {class:"stat-secondary"}, [stats.secondary.join(" · ")]));
+  }
+  return row;
+}
+
+// Segmentjäger nav page: an activity picker, then — once a genuine ridden
+// activity is selected and its segments have been loaded via this page's own
+// manual "Segmente laden" button (same manual-trigger contract as
+// ensureRideSegments()'s other caller, renderRouteSegmentsCard() on the
+// Strecke page — deliberately no auto-load on activity selection, see
+// ensureRideSegments()'s own comment for why) — the static route+selected-segments map
+// (mountSegmentjaegerView()) and the ride-chronological selection list, all
+// as one card (same single-card-per-page-section convention renderRouteCard()/
+// renderSegmentsCard() already use). Deliberately builds the list straight
+// off state.routeSegments in its existing order — NOT through
+// sortedRouteSegments()/sortedVisibleSegments(), which would both re-sort it
+// and drop segments hidden by the global "nicht relevant" filter; this page
+// intentionally shows every completed segment on the ride, in the order they
+// were actually ridden, so the rider can plan a target list against the real
+// shape of that ride.
+function renderSegmentjaegerPage(){
+  if(!state.connected) return renderStravaConnectCard("Segmentjäger", "Verbinde dich mit Strava, um aus einer bereits gefahrenen Aktivität realistische Segment-Ziele für einen KOM/QOM- oder Bestzeit-Versuch auszuwählen.");
+  // Same global gate renderRouteCard()'s default branch applies (see
+  // render()'s state.needsManualLoad.activities check) — this page's picker
+  // needs state.activities too, and would otherwise silently show "Keine
+  // Aktivitäten gefunden" instead of the actual reason the list is empty.
+  if(state.needsManualLoad.activities) return renderManualLoadCard();
+
+  const card = el("div", {class:"card"});
+  card.appendChild(el("h2", {}, ["Segmentjäger"]));
+  card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px; font-size:12px;"}, [
+    "Wähle eine bereits gefahrene Aktivität — ihre Segmente werden danach als mögliche Ziele für einen KOM/QOM- oder Bestzeit-Versuch vorausgewählt."
+  ]));
+
+  renderSegmentjaegerActivityPicker(card);
+
+  const activity = state.selectedActivity;
+  const isRideActivity = !!(activity && !activity.isRoute && !activity.isGpx);
+  if(!isRideActivity){
+    card.appendChild(el("div", {class:"empty-state", style:"margin-top:14px;"}, [
+      "Wähle oben eine bereits gefahrene Aktivität aus, um mögliche Segment-Ziele zu sehen."
+    ]));
+    return card;
+  }
+
+  if(state.loading.routeSegments){
+    card.appendChild(el("div", {class:"loading", style:"margin-top:14px;"}, ["Lade Segmente…"]));
+    return card;
+  }
+  if(state.routeSegmentsError){
+    card.appendChild(el("div", {class:"error", style:"margin-top:14px;"}, [state.routeSegmentsError]));
+    card.appendChild(el("button", {
+      class:"btn secondary", style:"width:100%; margin-top:8px;",
+      onclick: ()=>ensureRideSegments()
+    }, ["Erneut versuchen"]));
+    return card;
+  }
+  if(!state.routeSegmentsFetched){
+    // Not fetched yet and no error — manual trigger only, same "Segmente
+    // laden" button/pattern as renderRouteSegmentsCard()'s on the Strecke
+    // page (see ensureRideSegments()'s own "EXPLICITLY USER-TRIGGERED ONLY"
+    // contract for why this never fires automatically on activity
+    // selection: an uncapped loadSegmentExtras() call per segment would risk
+    // Strava's rate limit with no user-visible warning).
+    card.appendChild(el("button", {
+      class:"btn secondary", style:"width:100%; margin-top:14px;",
+      onclick: ()=>ensureRideSegments()
+    }, ["Segmente laden"]));
+    return card;
+  }
+  if(!state.routeSegments.length){
+    card.appendChild(el("div", {class:"empty-state", style:"margin-top:14px;"}, ["Auf dieser Fahrt wurden keine Segmente abgeschlossen."]));
+    return card;
+  }
+
+  ensureSegmentjaegerSelection();
+
+  if(state.fullRouteCoords.length) card.appendChild(routeMapContainer);
+
+  state.routeSegments.forEach(seg => card.appendChild(renderSegmentjaegerRow(seg)));
+
   return card;
 }
 
