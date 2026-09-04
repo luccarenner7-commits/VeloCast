@@ -175,3 +175,70 @@ test('computeTestDueSignal', async (t) => {
     assert.deepEqual(plain(result.entries.map((e) => e.durationSec)).sort((a, b) => a - b), TEST_DURATIONS_SEC_REF);
   });
 });
+
+// ---------------------------------------------------------------------
+// localWeekBounds(now) -- local-timezone Monday-through-next-Monday
+// bounds, shared by actualWeekZoneBreakdown() and trainerRiderContext()'s
+// "Woche bisher" ride count. Added as a fix for a real bug (04.09.2026,
+// Nutzer-Feedback): the Trainer tab's "Woche bisher" chip used to show a
+// rolling last-7-days count under a label ("Woche bisher"/"week so far")
+// that reads as a calendar week to a rider -- e.g. showing "5 Fahrten"
+// when only 3 had actually happened since Monday, because two more from
+// the tail end of the PREVIOUS week were still within the trailing 7
+// days. Deliberately local time, not mondayOfUTC() (date-helpers.test.js)
+// -- a UTC boundary would drift against the rider's own wall-clock Monday.
+// ---------------------------------------------------------------------
+test('localWeekBounds', async (t) => {
+  await t.test('a Wednesday resolves to that same week\'s Monday 00:00 through the following Monday 00:00', () => {
+    const { get } = loadApp();
+    const localWeekBounds = get('localWeekBounds');
+    const wednesday = new Date(2026, 8, 2, 15, 30, 0); // Wed 2026-09-02, 15:30 local
+    const { monday, nextMonday } = localWeekBounds(wednesday);
+    assert.equal(monday.getFullYear(), 2026);
+    assert.equal(monday.getMonth(), 7); // August, 0-indexed -- Mon 2026-08-31
+    assert.equal(monday.getDate(), 31); // Mon 2026-08-31
+    assert.equal(monday.getHours(), 0);
+    assert.equal(monday.getMinutes(), 0);
+    assert.equal(nextMonday.getDate(), 7); // Mon 2026-09-07
+    assert.equal(nextMonday.getMonth(), 8);
+  });
+
+  await t.test('a Monday itself resolves to its own midnight, not the previous week\'s', () => {
+    const { get } = loadApp();
+    const localWeekBounds = get('localWeekBounds');
+    const mondayNoon = new Date(2026, 8, 7, 12, 0, 0); // Mon 2026-09-07, noon
+    const { monday } = localWeekBounds(mondayNoon);
+    assert.equal(monday.getDate(), 7);
+    assert.equal(monday.getHours(), 0);
+  });
+
+  await t.test('a Sunday resolves back to the Monday that started its own week (6 days earlier), not the next one', () => {
+    const { get } = loadApp();
+    const localWeekBounds = get('localWeekBounds');
+    const sunday = new Date(2026, 8, 6, 23, 59, 0); // Sun 2026-09-06, 23:59 local
+    const { monday, nextMonday } = localWeekBounds(sunday);
+    assert.equal(monday.getDate(), 31); // still the Monday that started this week
+    assert.equal(monday.getMonth(), 7); // August
+    assert.equal(nextMonday.getDate(), 7); // the Monday right after this Sunday
+  });
+
+  await t.test('nextMonday is always exactly 7 days after monday', () => {
+    const { get } = loadApp();
+    const localWeekBounds = get('localWeekBounds');
+    const { monday, nextMonday } = localWeekBounds(new Date(2026, 2, 15));
+    assert.equal((nextMonday - monday) / (1000 * 60 * 60 * 24), 7);
+  });
+
+  await t.test('REGRESSION: a ride from the tail end of last week must fall OUTSIDE this week\'s bounds, even though it is within the last 7 days', () => {
+    // This is the exact scenario behind the reported bug: today is
+    // Wednesday, and a ride from last Thursday is only 6 days ago (so it
+    // WOULD count toward a rolling "last 7 days" window) but is clearly
+    // in the previous calendar week.
+    const { get } = loadApp();
+    const localWeekBounds = get('localWeekBounds');
+    const wednesday = new Date(2026, 8, 2, 12, 0, 0); // Wed 2026-09-02
+    const { monday } = localWeekBounds(wednesday);
+    const lastThursday = new Date(2026, 7, 27, 18, 0, 0); // Thu 2026-08-27, 6 days before
+    assert.ok(lastThursday < monday, 'a ride 6 days ago from a Wednesday must still be before this week\'s Monday');
+  });
+});

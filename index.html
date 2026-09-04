@@ -9582,12 +9582,26 @@ function trainerRiderContext(pp){
   // uses -- date + moving_time + watts/heartrate -- covering the rider's
   // full activity history, power+HR combined, not just power rides). The
   // power branch is untouched, byte-for-byte the same computation as before.
-  let hoursIn7, ridesIn7, daysSinceHard, daysSinceRide;
+  // hoursIn7/ridesIn7 (rolling last-7-days, used by the volume heuristics
+  // at ~10770 etc.) vs. hoursThisWeek/ridesThisWeek (local calendar week,
+  // Monday through now -- "Woche bisher"'s own display) are deliberately
+  // two different windows, not a rename of the same number: a rolling
+  // window is the right basis for a training-LOAD decision (load doesn't
+  // reset every Monday), but "Woche bisher" ("week so far") reads to a
+  // rider as their literal calendar week, same as the already-existing
+  // "seit Montag" wording on the zone-breakdown card below -- showing the
+  // rolling count there under a calendar-week label is what let it read
+  // "5" when only 3 rides had actually happened since Monday.
+  const { monday: weekStart, nextMonday: weekEnd } = localWeekBounds(today);
+  let hoursIn7, ridesIn7, hoursThisWeek, ridesThisWeek, daysSinceHard, daysSinceRide;
   if(usingHr){
     const blendedRows = state.trainerPage.blendedLoad.activities || [];
     const recentRows = blendedRows.filter(r=>{ const d=new Date(r.date); return !isNaN(d.getTime()) && daysAgo(d)<=7; });
     hoursIn7 = recentRows.reduce((s,r)=>s+(r.moving_time||0),0)/3600;
     ridesIn7 = recentRows.length;
+    const weekRows = blendedRows.filter(r=>{ const d=new Date(r.date); return !isNaN(d.getTime()) && d>=weekStart && d<weekEnd; });
+    hoursThisWeek = weekRows.reduce((s,r)=>s+(r.moving_time||0),0)/3600;
+    ridesThisWeek = weekRows.length;
     // "Hard" mirrors the power path's >=93%-of-threshold definition, just
     // sourced per-ride from whichever metric that ride actually has: NP vs
     // FTP when it's a power ride, avg HR vs LTHR otherwise (same fallback
@@ -9605,6 +9619,9 @@ function trainerRiderContext(pp){
   } else {
     hoursIn7 = results.filter(r=>daysAgo(r.date)<=7).reduce((s,r)=>s+(r.movingSec||0),0)/3600;
     ridesIn7 = results.filter(r=>daysAgo(r.date)<=7).length;
+    const weekRows = results.filter(r=>r.date>=weekStart && r.date<weekEnd);
+    hoursThisWeek = weekRows.reduce((s,r)=>s+(r.movingSec||0),0)/3600;
+    ridesThisWeek = weekRows.length;
     const hardRides = results.filter(r=>r.confidence!=='unbestätigt' && r.estFtp!=null && rp0.ftp && r.estFtp>=rp0.ftp*0.93);
     const lastHard = hardRides.length ? hardRides[hardRides.length-1] : null;
     daysSinceHard = lastHard ? Math.floor(daysAgo(lastHard.date)) : null;
@@ -9628,7 +9645,7 @@ function trainerRiderContext(pp){
   // permanent "–" placeholders next to a working Frische/ACWR card -- the
   // rows already carry ctl/atl/tsb/formVerdict, computed identically to
   // pp.trainingLoad's (see buildBlendedTrainingLoad()'s own comment).
-  return { ...rp0, wPerKg, acwr, freshness, freshnessClass, freshnessWhy, hoursIn7, ridesIn7, daysSinceHard, daysSinceRide, lthr, lthrSource, usingHr, blendedLoad: usingHr ? load : null,
+  return { ...rp0, wPerKg, acwr, freshness, freshnessClass, freshnessWhy, hoursIn7, ridesIn7, hoursThisWeek, ridesThisWeek, daysSinceHard, daysSinceRide, lthr, lthrSource, usingHr, blendedLoad: usingHr ? load : null,
     speedModel: computeSpeedModel(results) };
 }
 
@@ -10634,11 +10651,23 @@ function workoutZoneBreakdown(steps, routeBased, rp){
     pct: totalMin>0 ? mins[i]/totalMin*100 : 0 }));
   return { zones, totalMin };
 }
-function actualWeekZoneBreakdown(results){
-  const now = new Date();
+// Local-calendar-week bounds (Monday 00:00 through the following Monday
+// 00:00, in the browser's local timezone) for `now` -- the "seit Montag"
+// concept actualWeekZoneBreakdown() and trainerRiderContext()'s "Woche
+// bisher" ride count both want. Deliberately LOCAL time, not mondayOfUTC()
+// (used elsewhere for whole-day ISO-string weekly-budget tracking, see
+// weeklyClassProgress()) -- a UTC Monday boundary drifts against the
+// rider's own actual Monday by their UTC offset, which matters here since
+// this feeds a literal on-screen "X Fahrten seit Montag" claim.
+function localWeekBounds(now){
   const day = (now.getDay()+6)%7;
   const monday = new Date(now); monday.setDate(now.getDate()-day); monday.setHours(0,0,0,0);
   const nextMonday = new Date(monday); nextMonday.setDate(monday.getDate()+7);
+  return { monday, nextMonday };
+}
+function actualWeekZoneBreakdown(results){
+  const now = new Date();
+  const { monday, nextMonday } = localWeekBounds(now);
   const secs = POWER_ZONE_META.map(()=>0);
   const qualitySecs = POWER_ZONE_META.map(()=>0);
   let totalSec = 0, rides = 0;
@@ -11951,7 +11980,7 @@ function renderTrainerContextCards(rp){
   const grid = el('div', {class:'metric-grid'}, [
     workMetricCard,
     metricCard('Frische', rp.freshness, `ATL/CTL: ${rp.acwr!=null?rp.acwr.toFixed(2):'–'}`, freshCls),
-    metricCard('Woche bisher', `${rp.hoursIn7.toFixed(1)} h`, `${rp.ridesIn7} Fahrt${rp.ridesIn7===1?'':'en'}`),
+    metricCard('Woche bisher', `${rp.hoursThisWeek.toFixed(1)} h`, `${rp.ridesThisWeek} Fahrt${rp.ridesThisWeek===1?'':'en'} seit Montag`),
     metricCard('Letzte harte Einheit', rp.daysSinceHard!=null?`vor ${rp.daysSinceHard} Tag${rp.daysSinceHard===1?'':'en'}`:'keine erkannt',
       rp.daysSinceRide!=null?`letzte Fahrt vor ${rp.daysSinceRide} Tag${rp.daysSinceRide===1?'':'en'}`:null)
   ]);
