@@ -25,6 +25,15 @@ function plain(x) {
   return JSON.parse(JSON.stringify(x));
 }
 
+// Minimal segment fixture -- same shape convention as
+// test/local-favorites.test.js's own seg() helper. Only used by the
+// segmentjaegerComputeStarSyncPlan()/syncSegmentjaegerStars() tests below,
+// which need actual segment objects (not just ids) since the plan carries
+// full segments in toStar/toUnstar.
+function seg(id, extra) {
+  return Object.assign({ id, name: `Segment ${id}`, distance: 1000, average_grade: 3 }, extra || {});
+}
+
 test('segmentjaegerIsDefaultEligible', async (t) => {
   const { get } = loadApp();
   const isEligible = get('segmentjaegerIsDefaultEligible');
@@ -740,5 +749,117 @@ test('toggleSegmentjaegerSelection', async (t) => {
     toggle({ id: 8 });
 
     assert.deepEqual(plain(state.segmentjaegerSelection), { 7: true, 8: true, 9: true });
+  });
+});
+
+// ---------------------------------------------------------------------
+// segmentjaegerComputeStarSyncPlan(segments, selection, starredMap) -- pure
+// diff between the Segmentjäger selection and the current Strava star
+// state, scoped to exactly the segments passed in (see
+// syncSegmentjaegerStars()'s comment in index.html for why that scope is
+// always just the current ride's own segment list, never anything wider).
+// ---------------------------------------------------------------------
+test('segmentjaegerComputeStarSyncPlan', async (t) => {
+  await t.test('selected but not starred -> toStar', () => {
+    const { get } = loadApp();
+    const plan = get('segmentjaegerComputeStarSyncPlan');
+    const result = plan([seg(1)], { 1: true }, { 1: false });
+    assert.deepEqual(plain(result.toStar), [seg(1)]);
+    assert.deepEqual(plain(result.toUnstar), []);
+  });
+
+  await t.test('not selected but starred -> toUnstar', () => {
+    const { get } = loadApp();
+    const plan = get('segmentjaegerComputeStarSyncPlan');
+    const result = plan([seg(1)], { 1: false }, { 1: true });
+    assert.deepEqual(plain(result.toStar), []);
+    assert.deepEqual(plain(result.toUnstar), [seg(1)]);
+  });
+
+  await t.test('selected and already starred -> no action', () => {
+    const { get } = loadApp();
+    const plan = get('segmentjaegerComputeStarSyncPlan');
+    const result = plan([seg(1)], { 1: true }, { 1: true });
+    assert.deepEqual(plain(result.toStar), []);
+    assert.deepEqual(plain(result.toUnstar), []);
+  });
+
+  await t.test('not selected and not starred -> no action', () => {
+    const { get } = loadApp();
+    const plan = get('segmentjaegerComputeStarSyncPlan');
+    const result = plan([seg(1)], { 1: false }, { 1: false });
+    assert.deepEqual(plain(result.toStar), []);
+    assert.deepEqual(plain(result.toUnstar), []);
+  });
+
+  await t.test('missing entry in selection or starredMap is treated as falsy, not an error', () => {
+    const { get } = loadApp();
+    const plan = get('segmentjaegerComputeStarSyncPlan');
+    // Not present in `selection` at all (undefined) -- same as `false`.
+    const noSelectionEntry = plan([seg(1)], {}, { 1: true });
+    assert.deepEqual(plain(noSelectionEntry.toUnstar), [seg(1)]);
+    // Not present in `starredMap` at all (undefined) -- same as `false`.
+    const noStarredEntry = plan([seg(1)], { 1: true }, {});
+    assert.deepEqual(plain(noStarredEntry.toStar), [seg(1)]);
+  });
+
+  await t.test('mixes independently across multiple segments', () => {
+    const { get } = loadApp();
+    const plan = get('segmentjaegerComputeStarSyncPlan');
+    const result = plan(
+      [seg(1), seg(2), seg(3), seg(4)],
+      { 1: true, 2: false, 3: true, 4: false },
+      { 1: false, 2: true, 3: true, 4: false }
+    );
+    assert.deepEqual(plain(result.toStar), [seg(1)]);
+    assert.deepEqual(plain(result.toUnstar), [seg(2)]);
+  });
+
+  await t.test('empty segment list -> empty plan', () => {
+    const { get } = loadApp();
+    const plan = get('segmentjaegerComputeStarSyncPlan');
+    const result = plan([], { 1: true }, { 1: true });
+    assert.deepEqual(plain(result), { toStar: [], toUnstar: [] });
+  });
+});
+
+// ---------------------------------------------------------------------
+// syncSegmentjaegerStars() -- orchestrator. Calls fetch() (via
+// applySegmentStar()/starSegment()) for any mismatched segment, and the
+// test sandbox's fetch stub always rejects (see test/support/loadApp.js),
+// so only the no-mismatch no-op branch is directly exercised here, same
+// boundary as migrateStarredSegmentsToLocalFavorites() in
+// test/local-favorites.test.js.
+// ---------------------------------------------------------------------
+test('syncSegmentjaegerStars', async (t) => {
+  await t.test('selection already matches star state -> no fetch, stays not-running', async () => {
+    let fetchCalls = 0;
+    const { get } = loadApp({ onFetchCall: () => { fetchCalls++; } });
+    const state = get('state');
+    const sync = get('syncSegmentjaegerStars');
+    // segmentIsStarred() falls back to seg.starred when nothing else is
+    // known (see index.html) -- set it directly so the segment's current
+    // star state is deterministic without a network call.
+    state.routeSegments = [seg(1, { starred: true })];
+    state.segmentjaegerSelection = { 1: true };
+
+    await sync();
+
+    assert.equal(fetchCalls, 0, 'nothing to sync -> no Strava write attempted');
+    assert.equal(state.segmentjaegerSyncRunning, false);
+  });
+
+  await t.test('already running -> re-entrant call is a no-op', async () => {
+    let fetchCalls = 0;
+    const { get } = loadApp({ onFetchCall: () => { fetchCalls++; } });
+    const state = get('state');
+    const sync = get('syncSegmentjaegerStars');
+    state.routeSegments = [seg(1, { starred: false })];
+    state.segmentjaegerSelection = { 1: true }; // mismatched, would normally trigger a call
+    state.segmentjaegerSyncRunning = true;
+
+    await sync();
+
+    assert.equal(fetchCalls, 0, 'must not fire while already running');
   });
 });

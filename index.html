@@ -1024,6 +1024,11 @@ let state = {
   // field directly -- the mismatch against the new activity.id is what
   // triggers a fresh compute/restore on the next render).
   segmentjaegerSelectionActivityId: null,
+  // Guards syncSegmentjaegerStars() against a double-fire while its
+  // sequential star/unstar loop is in flight -- transient only (no
+  // localStorage/saveSettings entry, same as navOpen), always false again
+  // after a page reload.
+  segmentjaegerSyncRunning: false,
   navOpen: false, // left slide-in nav drawer open/closed
   activePage: "route", // "route" | "segments" | "segmentjaeger" | "profil" | "aktivitaeten" | "trainer" | "einstellungen" | "reifendruck" | "changelog" - which NAV_ITEMS entry is active
   routeSourceTab: "activities", // "routes" | "activities" | "gpx"
@@ -5350,6 +5355,70 @@ function toggleSegmentjaegerSelection(seg){
   render();
 }
 
+// ---------- Segmentjäger: Auswahl <-> Strava-Stern abgleichen ----------
+// The Segmentjäger selection above (state.segmentjaegerSelection) is only
+// ever local UI state -- it means nothing to Strava/the Karoo's Live
+// Segments feature, which reads the real Strava star instead (see
+// toggleSegmentStar()). Without an explicit sync step, a segment could be
+// "selected" here and still never show up live on a ride. This pure
+// function is the diff: given this ride's segments, the current selection,
+// and a plain {segId: boolean} snapshot of their current star state (the
+// caller builds that from segmentIsStarred(), kept out of this function so
+// it stays state-free/testable), it returns exactly which segments need a
+// star added or removed to bring Strava in line with the selection. A
+// missing entry in either map (undefined) is treated as falsy on purpose --
+// "not selected"/"not starred" is the correct default, not an error case.
+function segmentjaegerComputeStarSyncPlan(segments, selection, starredMap){
+  const toStar = [], toUnstar = [];
+  (segments || []).forEach(seg => {
+    const shouldBeStarred = !!(selection && selection[seg.id]);
+    const isStarred = !!(starredMap && starredMap[seg.id]);
+    if(shouldBeStarred && !isStarred) toStar.push(seg);
+    else if(!shouldBeStarred && isStarred) toUnstar.push(seg);
+  });
+  return { toStar, toUnstar };
+}
+
+// Orchestrates the actual Strava writes for the plan above -- EXPLICITLY
+// USER-TRIGGERED ONLY (the "Auswahl mit Strava-Stern abgleichen" button on
+// renderSegmentjaegerPage()), same discipline as ensureRideSegments()'s
+// "Segmente laden" button: no auto-firing on selection changes, since that
+// would mean an uncapped, unannounced burst of Strava writes on every tap.
+// Deliberately scoped to state.routeSegments ONLY (this ride's own segment
+// list) -- a segment starred for an unrelated reason on a different ride
+// never appears in that array, so it's never touched here, no matter how
+// the plan diff turns out. Sequential (not parallel), same rate-limit
+// caution as loadSegmentExtras(); only mismatched segments cost a call at
+// all, since segmentjaegerComputeStarSyncPlan() already skips segments
+// whose star state already matches the selection.
+async function syncSegmentjaegerStars(){
+  if(state.segmentjaegerSyncRunning) return;
+  const bucket = segmentBucket("route");
+  const starredMap = {};
+  state.routeSegments.forEach(seg => { starredMap[seg.id] = segmentIsStarred(seg, bucket); });
+  const plan = segmentjaegerComputeStarSyncPlan(state.routeSegments, state.segmentjaegerSelection, starredMap);
+  if(!plan.toStar.length && !plan.toUnstar.length) return;
+
+  // Same stale-selection guard ensureRideSegments() uses: if the user picks
+  // a different activity while this loop is still awaiting, routeSegments
+  // (and this ride's whole segment set) is no longer what the plan was
+  // built for, so any remaining star/unstar calls for it are abandoned.
+  const myGeneration = routeSegmentsGeneration;
+  state.segmentjaegerSyncRunning = true;
+  render();
+  for(const seg of plan.toStar){
+    if(myGeneration !== routeSegmentsGeneration) break;
+    await applySegmentStar(seg, true);
+  }
+  for(const seg of plan.toUnstar){
+    if(myGeneration !== routeSegmentsGeneration) break;
+    await applySegmentStar(seg, false);
+  }
+  if(myGeneration !== routeSegmentsGeneration) return;
+  state.segmentjaegerSyncRunning = false;
+  render();
+}
+
 // Step used to sample a list-chip's polyline into smoothed-bearing points
 // (see pickRoutePoints()/smoothedBearingAt()) -- much finer than the
 // route-page's user-configurable Punktabstand since this only drives a
@@ -6584,19 +6653,16 @@ function segmentIsStarred(seg, bucket){
   return seg.starred === true;
 }
 
-// Stars/un-stars `seg` on the athlete's Strava account via starSegment().
-// Shared by all three segment lists (Meine Segmente, Abgeschlossene
-// Segmente, Segmentjäger — see renderStarButton() below) since a Strava
-// segment id means the same real segment regardless of which list's row
-// triggered this. Deliberately unrelated to the local favorites ("Herz")
-// list above -- starring/un-starring here never touches
-// loadLocalFavoriteSegments(), and toggleLocalFavorite() never touches
-// Strava, by design (see that section's comment for why the two used to be
-// tangled together through the star field and no longer are).
-async function toggleSegmentStar(seg, bucket){
+// Stars/un-stars `seg` on the athlete's Strava account via starSegment(),
+// tracking pending/success/error in state.segmentStars[seg.id]. Shared by
+// toggleSegmentStar() below (single-row star button) AND
+// syncSegmentjaegerStars() (bulk Segmentjäger sync) -- both just need to
+// apply a known target starred state and let this one place own the
+// pending flag + the 401/403 "please reconnect" special-case message, so
+// that handling never has to be kept in sync between two copies.
+async function applySegmentStar(seg, nextStarred){
   const prior = state.segmentStars[seg.id] || {};
   if(prior.pending) return;
-  const nextStarred = !segmentIsStarred(seg, bucket);
   state.segmentStars[seg.id] = { starred: prior.starred, pending: true, error: null };
   render();
   try{
@@ -6613,6 +6679,21 @@ async function toggleSegmentStar(seg, bucket){
     };
   }
   render();
+}
+
+// Stars/un-stars `seg` on the athlete's Strava account -- shared by all
+// three segment lists (Meine Segmente, Abgeschlossene Segmente,
+// Segmentjäger — see renderStarButton() below) since a Strava segment id
+// means the same real segment regardless of which list's row triggered
+// this. Deliberately unrelated to the local favorites ("Herz") list above
+// -- starring/un-starring here never touches loadLocalFavoriteSegments(),
+// and toggleLocalFavorite() never touches Strava, by design (see that
+// section's comment for why the two used to be tangled together through
+// the star field and no longer are).
+async function toggleSegmentStar(seg, bucket){
+  if((state.segmentStars[seg.id] || {}).pending) return;
+  const nextStarred = !segmentIsStarred(seg, bucket);
+  await applySegmentStar(seg, nextStarred);
 }
 
 // Star icon button, placed inline in the stat-chips row — used by
@@ -7225,6 +7306,15 @@ function renderSegmentjaegerRow(seg){
   if(stats.secondary.length){
     row.appendChild(el("div", {class:"stat-secondary"}, [stats.secondary.join(" · ")]));
   }
+  // Same star-error display renderSegmentRow() already has (~L6844) -- a
+  // failed star/unstar here can come from either this row's own star
+  // button OR a bulk syncSegmentjaegerStars() run touching this segment,
+  // both go through the same applySegmentStar()/state.segmentStars, so one
+  // display covers both triggers.
+  const starError = state.segmentStars[seg.id] && state.segmentStars[seg.id].error;
+  if(starError){
+    row.appendChild(el("div", {class:"error", style:"margin-top:8px;"}, [starError]));
+  }
   return row;
 }
 
@@ -7303,6 +7393,31 @@ function renderSegmentjaegerPage(){
   if(state.fullRouteCoords.length) card.appendChild(routeMapContainer);
 
   state.routeSegments.forEach(seg => card.appendChild(renderSegmentjaegerRow(seg)));
+
+  // "Auswahl mit Strava-Stern abgleichen" — see syncSegmentjaegerStars()'s
+  // own comment for why this is a manual button rather than firing on every
+  // row toggle. The plan is recomputed on every render (cheap -- same
+  // segment count as the list just built above, no extra API call), so the
+  // button's count/disabled-state always reflects the CURRENT selection,
+  // including immediately after a partially-failed sync (a failed segment
+  // stays mismatched, so it stays counted).
+  const syncBucket = segmentBucket("route");
+  const syncStarredMap = {};
+  state.routeSegments.forEach(seg => { syncStarredMap[seg.id] = segmentIsStarred(seg, syncBucket); });
+  const syncPlan = segmentjaegerComputeStarSyncPlan(state.routeSegments, state.segmentjaegerSelection, syncStarredMap);
+  const syncCount = syncPlan.toStar.length + syncPlan.toUnstar.length;
+  card.appendChild(el("button", {
+    class: "btn secondary", style: "width:100%; margin-top:14px;",
+    disabled: (state.segmentjaegerSyncRunning || !syncCount) ? "disabled" : null,
+    onclick: ()=>syncSegmentjaegerStars()
+  }, [
+    state.segmentjaegerSyncRunning ? "Wird synchronisiert…"
+      : !syncCount ? "Stern-Status ist aktuell"
+      : `Auswahl mit Strava-Stern abgleichen (${syncCount})`
+  ]));
+  card.appendChild(el("div", {class:"muted", style:"margin-top:6px; font-size:12px;"}, [
+    "Sternt ausgewählte Segmente auf Strava und entfernt die Markierung bei abgewählten — nur für die Segmente dieser Fahrt, alle anderen Sterne bleiben unangetastet."
+  ]));
 
   return card;
 }
