@@ -11963,14 +11963,31 @@ function formatBudgetLine(budget){
   const unitLabel = BUDGET_UNIT_LABEL[budget.unit] || '';
   return `${Math.round(budget.done)}/${Math.round(budget.target)} ${unitLabel}`;
 }
+// Fitness/Ermüdung/Form used to be three metricCard chips here, byte-
+// identical in shape to the ones renderFormRingsRow() replaced on the
+// Profil tab (see TODO.md's "Formkurve: Ringe statt Chips") -- ported the
+// same swap here on Nutzer-Feedback (04.09.2026) instead of showing the
+// exact same three numbers twice on one page (chips here, rings on
+// Profil). `appLoad` is the same value already passed in by the caller
+// (rp.usingHr ? rp.blendedLoad : pp.trainingLoad, index.html ~12773) --
+// identical {ctl, atl, tsb, formClass, ...} shape renderFormRingsRow()
+// already consumes on Profil, so no new data source. `renderFormRingsRow()`
+// doesn't null-check its input (can legitimately be null here -- e.g.
+// HR-mode blendedLoad before its async fetch/cache-restore populates, same
+// case the old chip fallback's `appLoad?...:'–'` already had to cover), so
+// this guards it the same way renderProfilFormSection() does for Profil's
+// own rings. "Ziel" stays a lone metricCard -- no ring equivalent for it --
+// in its own flex row (not `.metric-grid`, which would stretch a single
+// item to the full row width via its `1fr` auto-fit columns).
 function renderTrainerSummaryCards(appLoad, goalLabelText, isAuto){
-  const tsbCls = appLoad ? (appLoad.tsb>0?'up':(appLoad.tsb<-20?'down':null)) : null;
-  return el('div', {class:'metric-grid'}, [
-    metricCard('Fitness (CTL)', appLoad?appLoad.ctl.toFixed(0):'–', '42-Tage-Belastungsschnitt'),
-    metricCard('Ermüdung (ATL)', appLoad?appLoad.atl.toFixed(0):'–', '7-Tage-Belastungsschnitt'),
-    metricCard('Form (TSB)', appLoad?`${appLoad.tsb>0?'+':''}${appLoad.tsb.toFixed(0)}`:'–', appLoad?appLoad.formVerdict:'Noch keine Daten', tsbCls),
+  const ringsCard = el('div', {class:'card'});
+  ringsCard.appendChild(appLoad
+    ? renderFormRingsRow(appLoad)
+    : el('div', {class:'empty-state'}, ['Noch keine Formkurve verfügbar.']));
+  const zielRow = el('div', {style:'display:flex; margin-bottom:16px;'}, [
     metricCard('Ziel', goalLabelText, isAuto?'automatisch · größter Hebel':'manuell gewählt')
   ]);
+  return el('div', {}, [ringsCard, zielRow]);
 }
 function renderTrainerContextCards(rp){
   const freshCls = rp.freshnessClass==='good' ? 'up' : (rp.freshnessClass==='danger' ? 'down' : null);
