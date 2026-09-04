@@ -237,6 +237,12 @@
      at a glance (see renderIrrelevantButton()/hideIconSvg()). */
   .hide-btn.on{ border-color:var(--head); background:var(--head-bg); }
 
+  /* Local-favorite ("Herz") toggle — same .star-btn shape, but its .on tint
+     uses --tail (green) instead of --route, so it can't be mistaken for the
+     real Strava star's on-state when both buttons sit next to each other on
+     a Segmentjäger row (see renderFavoriteButton()/heartIconSvg()). */
+  .favorite-btn.on{ border-color:var(--tail); background:var(--tail-bg); }
+
   /* Left slide-in nav drawer + backdrop. Both are plain el()-built nodes
      recreated on every render() like the rest of the tree (unlike
      routeMapContainer/the settings inputs, neither holds any mid-interaction
@@ -893,6 +899,13 @@ let state = {
   // explicit saved `false` must survive a reload.
   showKomChip: savedSettings.showKomChip != null ? savedSettings.showKomChip : true,
   showQomChip: savedSettings.showQomChip != null ? savedSettings.showQomChip : true,
+  // Minimum recovery time (minutes) the Segmentjäger default-selection pass
+  // requires between the end of one selected segment and the start of the
+  // next before both can be selected — see segmentjaegerComputeDefaults()'s
+  // minGapSec parameter. `!= null` (not `||`) so an explicit `0` ("turn the
+  // rule off entirely") survives a reload, same reasoning as
+  // hideIrrelevantSegments above.
+  segmentjaegerMinGapMinutes: savedSettings.segmentjaegerMinGapMinutes != null ? savedSettings.segmentjaegerMinGapMinutes : 5,
   // Per-category whether connecting (fresh OAuth or a stored-token revisit)
   // should immediately auto-fetch that category, same as the app always did
   // before this setting existed. `!= null` (not `||`) for the same reason as
@@ -2130,6 +2143,7 @@ function saveSettings(){
       hideIrrelevantSegments: state.hideIrrelevantSegments,
       showKomChip: state.showKomChip,
       showQomChip: state.showQomChip,
+      segmentjaegerMinGapMinutes: state.segmentjaegerMinGapMinutes,
       autoLoadActivities: state.autoLoadActivities,
       autoLoadSegments: state.autoLoadSegments,
       autoLoadTraining: state.autoLoadTraining,
@@ -3904,7 +3918,7 @@ const CHANGELOG = [
     ]},
   { date:'28.08.2026',
     features:[
-      'Automatisches Laden beim Verbinden lässt sich jetzt einzeln für „Aktivitäten & Route", „Markierte Segmente" und „Trainingsdaten" ein-/ausschalten (Einstellungen) — vorher ein einzelner Schalter für alles. Ist eine Kategorie deaktiviert, erscheint an ihrer Stelle ein eigener „laden"-Button.',
+      'Automatisches Laden beim Verbinden lässt sich jetzt einzeln für „Aktivitäten & Route", „Favoriten" und „Trainingsdaten" ein-/ausschalten (Einstellungen) — vorher ein einzelner Schalter für alles. Ist eine Kategorie deaktiviert, erscheint an ihrer Stelle ein eigener „laden"-Button.',
       'Ladevorgang beim Start zeigt jetzt eine Fortschrittsanzeige statt flackernder Textwechsel.',
     ],
     fixes:[
@@ -4007,6 +4021,19 @@ function hideIconSvg(hidden){
     <circle cx="12" cy="12" r="3" fill="${hidden ? "none" : color}"/>
     ${slash}
   </svg>`;
+}
+
+// Icon for the local-favorite ("Herz") button — see renderFavoriteButton().
+// Deliberately --tail (green), not --route (already the star's color) or
+// --head (already the "nicht relevant" hide-button's color, see
+// hideIconSvg()'s comment on why that button picked a different hue than
+// the star) -- three icon-buttons can end up next to each other on a
+// Segmentjäger row now, so each needs its own unambiguous color.
+function heartIconSvg(filled){
+  const path = "M12 21 C12 21 3.5 15.6 3.5 9.6 C3.5 6.6 5.9 4.4 8.7 4.4 C10.3 4.4 11.5 5.1 12 6.1 C12.5 5.1 13.7 4.4 15.3 4.4 C18.1 4.4 20.5 6.6 20.5 9.6 C20.5 15.6 12 21 12 21 Z";
+  return filled
+    ? `<svg width="14" height="14" viewBox="0 0 24 24"><path d="${path}" fill="var(--tail)" stroke="var(--tail)" stroke-width="1.3" stroke-linejoin="round"/></svg>`
+    : `<svg width="14" height="14" viewBox="0 0 24 24"><path d="${path}" fill="none" stroke="var(--chalk-dim)" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
 }
 
 function renderNavDrawer(){
@@ -4497,7 +4524,11 @@ async function loadSegmentsStep(){
   state.loading.segments = true;
   startupProgressStep("Lade Segmente & Wind…"); render();
   try{
-    state.segments = await fetchStarredSegments(state.accessToken);
+    // One-time, no-op after the first successful run -- see
+    // migrateStarredSegmentsToLocalFavorites()'s comment for why "Meine
+    // Segmente" moved off Stravas starred list onto this local one.
+    await migrateStarredSegmentsToLocalFavorites(state.accessToken);
+    state.segments = Object.values(loadLocalFavoriteSegments());
     await loadSegmentExtras(state.segments, segmentBucket("starred"), Infinity);
   }catch(e){ state.error = e.message; }
   state.loading.segments = false;
@@ -5060,7 +5091,6 @@ async function ensureRideSegments(){
 // resurrects any form of that.
 
 const SEGMENTJAEGER_XOM_TOLERANCE = 0.08; // 8%, see the task brief's default-selection rule
-const SEGMENTJAEGER_TOP_RANK = 10;
 // Above this "Genutztes Potential" % (own PR watts as a share of the
 // rider's MMP-curve ceiling for that duration, see segmentPotentialValue()),
 // a segment is treated as already maxed out -- closing the remaining gap to
@@ -5068,6 +5098,26 @@ const SEGMENTJAEGER_TOP_RANK = 10;
 // attempt, it needs an actual fitness gain, so it's excluded from the
 // default selection even if the time-gap rule alone would have picked it.
 const SEGMENTJAEGER_POTENTIAL_CEILING = 95;
+
+// Whether `seg` currently has a tailwind at its start, for the wind gate in
+// segmentjaegerIsDefaultEligible() below — extracted as its own pure
+// function (bearing + windRelative(), same math segmentTailwindDiff() above
+// already uses for sorting) so it's independently unit-testable without
+// needing the whole eligibility rule. `weather` is bucket.weather[seg.id]
+// (see loadSegmentExtras()/fetchWeather()) -- fetched WITHOUT an explicit
+// targetDate, so it already defaults to "now", i.e. the closest forecast
+// hour to whenever the segments were last loaded -- exactly the "planning
+// an attempt soon" semantics this gate wants, no separate date picker or
+// extra fetch needed.
+// Returns true (tailwind), false (cross/head), or null when there's nothing
+// to judge (no weather, or the segment has no start/end coords to compute a
+// bearing from) -- null lets the caller treat "no data" as "don't exclude",
+// same fail-open philosophy as the missing-potential-data case below.
+function segmentjaegerFavorableWind(seg, weather){
+  if(!weather || !seg.start_latlng || !seg.end_latlng) return null;
+  const bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
+  return windRelative(bearing, weather.windDir).type === "tail";
+}
 
 // Pure eligibility check for ONE segment's default selection — no state.*
 // reads (showKomChip/showQomChip are passed in explicitly instead, see
@@ -5082,41 +5132,40 @@ const SEGMENTJAEGER_POTENTIAL_CEILING = 95;
 // row then doesn't even display, because the matching chip is toggled off,
 // would leave the rider confused about why it's highlighted.
 //
-// True when EITHER:
-//  - this specific ride's effort already ranked top-10 — either on the
-//    segment's overall leaderboard (kom_rank) or the rider's own leaderboard
-//    (pr_rank). Strava only ever populates either field at all when the
-//    effort qualifies, so a non-null value already implies "top 10" without
-//    needing its own numeric check, but the <= 10 guard is kept as a
-//    defensive belt-and-braces in case that assumption is ever wrong. This
-//    rule is the rider's own placement, not a KOM/QOM *display* fact, so it's
-//    unaffected by showKomChip/showQomChip — and, per explicit product
-//    decision, unaffected by potentialPercent too: an already-achieved
-//    top-10 effort is proof enough on its own, regardless of how much power
-//    headroom is left, OR
-//  - `detail` has a KOM and/or QOM time AND the rider's all-time PR on this
-//    segment is within SEGMENTJAEGER_XOM_TOLERANCE of it — (pr - xom) / xom
-//    <= 0.08 (a zero/negative delta, i.e. the PR already matches or beats the
-//    record, still counts as "within tolerance") — but the KOM side of this
-//    only counts when showKomChip is true, and likewise QOM/showQomChip —
-//    AND `potentialPercent` (see segmentPotentialValue(), the "Genutztes
-//    Potential" %) is either unavailable (no MMP curve loaded — can't
-//    judge, so this exclusion simply doesn't apply, falling back to the
-//    record-gap rule alone) or below SEGMENTJAEGER_POTENTIAL_CEILING: a
-//    close-to-the-record PR that already extracts ~all of the rider's own
-//    power ceiling for that duration isn't a realistic target for a future
-//    attempt — closing the gap needs an actual fitness gain, not a better
-//    pacing/execution on the same segment.
+// True when `detail` has a KOM and/or QOM time AND the rider's all-time PR
+// on this segment is within SEGMENTJAEGER_XOM_TOLERANCE of it — (pr - xom) /
+// xom <= 0.08 (a zero/negative delta, i.e. the PR already matches or beats
+// the record, still counts as "within tolerance") — but the KOM side of this
+// only counts when showKomChip is true, and likewise QOM/showQomChip —
+// AND `potentialPercent` (see segmentPotentialValue(), the "Genutztes
+// Potential" %) is either unavailable (no MMP curve loaded — can't
+// judge, so this exclusion simply doesn't apply, falling back to the
+// record-gap rule alone) or below SEGMENTJAEGER_POTENTIAL_CEILING: a
+// close-to-the-record PR that already extracts ~all of the rider's own
+// power ceiling for that duration isn't a realistic target for a future
+// attempt — closing the gap needs an actual fitness gain, not a better
+// pacing/execution on the same segment — AND `favorableWind` (see
+// segmentjaegerFavorableWind() above) is either unavailable (can't judge,
+// exclusion doesn't apply) or true: per explicit product decision this
+// gate is strict (only a confirmed TAILWIND counts, cross/head both
+// exclude, not just head) since the whole point is picking a genuinely
+// good day for the attempt, not merely avoiding an actively bad one.
 // A missing PR and/or missing xoms — can't judge realism — correctly falls
 // through to `false` (deselected by default), per explicit product decision
-// (see the task brief).
-function segmentjaegerIsDefaultEligible(detail, effort, showKomChip, showQomChip, potentialPercent){
-  const viaTopTen = !!effort && (
-    (effort.kom_rank != null && effort.kom_rank <= SEGMENTJAEGER_TOP_RANK) ||
-    (effort.pr_rank != null && effort.pr_rank <= SEGMENTJAEGER_TOP_RANK)
-  );
-  if(viaTopTen) return true;
-
+// (see the task brief). No "already top-10 on this ride" bypass anymore —
+// removed per explicit product decision (04.09.2026): an achieved placement
+// used to qualify a segment unconditionally, but that meant it could still
+// end up right next to another selected segment with no recovery gap in
+// between (see segmentjaegerComputeDefaults()'s minimum-gap pass below) --
+// simpler to have exactly one path to eligibility than to special-case the
+// interaction between two independent rules. The rank itself is still
+// visible elsewhere (computeRideEffortStatChips()'s "Platz X (Effort)" chip,
+// the segment leaderboard) — this only removes its effect on the default
+// selection. `effort` (this ride's own DetailedSegmentEffort) is no longer a
+// parameter here as a result -- nothing in this function reads it anymore
+// (it was only ever used for the removed rank check); segmentjaegerComputeDefaults()
+// still receives the full `efforts` map for its own minimum-gap pass below.
+function segmentjaegerIsDefaultEligible(detail, showKomChip, showQomChip, potentialPercent, favorableWind){
   const pr = detail && detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
   const nearRecord = (xomTime) => {
     if(pr == null || !xomTime) return false;
@@ -5132,7 +5181,31 @@ function segmentjaegerIsDefaultEligible(detail, effort, showKomChip, showQomChip
   if(!viaRecord) return false;
 
   const alreadyMaxedOut = potentialPercent != null && potentialPercent >= SEGMENTJAEGER_POTENTIAL_CEILING;
-  return !alreadyMaxedOut;
+  if(alreadyMaxedOut) return false;
+
+  // Wind gate: per explicit product decision, only a CONFIRMED tailwind
+  // counts (cross/head both exclude, not just head) -- stricter than the
+  // potential gate above, which only excludes on a confirmed bad reading.
+  // favorableWind === null (no data) falls through without excluding, same
+  // fail-open philosophy as potentialPercent == null above.
+  if(favorableWind === false) return false;
+  return true;
+}
+
+// Seconds between the end of effortA and the start of effortB (both
+// DetailedSegmentEffort-shaped, i.e. bucket.efforts[seg.id]), or null if
+// either's start_date/elapsed_time is missing or unparseable -- "can't
+// judge" rather than "0 seconds apart", so callers can fail open the same
+// way segmentjaegerFavorableWind() does for missing weather. Negative
+// results (effortB actually starts before effortA ends -- e.g. overlapping
+// segments) are returned as-is; callers comparing against a minimum gap
+// treat that the same as any other too-small gap.
+function segmentjaegerGapSeconds(effortA, effortB){
+  if(!effortA || !effortB) return null;
+  const aEnd = effortA.start_date ? new Date(effortA.start_date).getTime() + (effortA.elapsed_time || 0) * 1000 : null;
+  const bStart = effortB.start_date ? new Date(effortB.start_date).getTime() : null;
+  if(aEnd == null || bStart == null || isNaN(aEnd) || isNaN(bStart)) return null;
+  return (bStart - aEnd) / 1000;
 }
 
 // Runs segmentjaegerIsDefaultEligible() over every segment in `segments` —
@@ -5140,16 +5213,44 @@ function segmentjaegerIsDefaultEligible(detail, effort, showKomChip, showQomChip
 // ensureSegmentjaegerSelection() below for when this actually runs).
 // `showKomChip`/`showQomChip` are just forwarded through to each per-segment
 // check — see segmentjaegerIsDefaultEligible()'s own comment for why they're
-// parameters here rather than a global state.* read. `potentials` is a plain
-// {segId: percent|null} map (the caller computes each value via
-// segmentPotentialValue(), which needs the actual bucket/state — kept out of
-// this function so it stays a pure map-in/map-out transform, no bucket
-// coupling, same split as details/efforts above).
-function segmentjaegerComputeDefaults(segments, details, efforts, showKomChip, showQomChip, potentials){
+// parameters here rather than a global state.* read. `potentials`/`winds`
+// are plain {segId: value|null} maps (the caller computes each value via
+// segmentPotentialValue()/segmentjaegerFavorableWind(), which need the
+// actual bucket/state — kept out of this function so it stays a pure
+// map-in/map-out transform, no bucket coupling, same split as
+// details/efforts above).
+//
+// `minGapSec` (see state.segmentjaegerMinGapMinutes) adds a second,
+// LIST-level pass on top of the per-segment eligibility check: `segments`
+// is already in ride-chronological order (see the caller's comment on why
+// this deliberately never goes through sortedRouteSegments()), so a single
+// forward walk is enough. A segment that's independently eligible still
+// gets excluded if it starts too soon after the END of the last segment
+// that actually ended up SELECTED (not just the last eligible one -- a
+// suppressed segment never becomes the new reference point, which is what
+// stops a chain of closely-spaced eligible segments from "passing the
+// baton" to each other one gap-length at a time). The earlier segment
+// always wins a conflict, per explicit product decision -- no scoring/
+// priority between segments, just ride order. `minGapSec` missing/0
+// disables this pass entirely (every independently-eligible segment stays
+// selected, today's behavior); a gap that can't be computed (missing
+// start_date, see segmentjaegerGapSeconds()) never excludes, same fail-open
+// philosophy as the potential/wind gates above.
+function segmentjaegerComputeDefaults(segments, details, efforts, showKomChip, showQomChip, potentials, winds, minGapSec){
   const out = {};
+  let lastSelectedEffort = null;
   segments.forEach(seg => {
     const potentialPercent = potentials ? potentials[seg.id] : null;
-    out[seg.id] = segmentjaegerIsDefaultEligible(details[seg.id], efforts[seg.id], showKomChip, showQomChip, potentialPercent);
+    const favorableWind = winds ? winds[seg.id] : null;
+    const eligible = segmentjaegerIsDefaultEligible(details[seg.id], showKomChip, showQomChip, potentialPercent, favorableWind);
+    if(!eligible){ out[seg.id] = false; return; }
+
+    const gap = lastSelectedEffort ? segmentjaegerGapSeconds(lastSelectedEffort, efforts[seg.id]) : null;
+    const tooClose = !!minGapSec && gap != null && gap < minGapSec;
+    if(tooClose){ out[seg.id] = false; return; }
+
+    out[seg.id] = true;
+    lastSelectedEffort = efforts[seg.id];
   });
   return out;
 }
@@ -5225,8 +5326,13 @@ function ensureSegmentjaegerSelection(){
     // judge, don't exclude" — no separate fallback needed here.
     const bucket = segmentBucket("route");
     const potentials = {};
-    state.routeSegments.forEach(seg => { potentials[seg.id] = segmentPotentialValue(seg, bucket); });
-    const defaults = segmentjaegerComputeDefaults(state.routeSegments, state.routeSegmentDetails, state.routeSegmentEfforts, state.showKomChip, state.showQomChip, potentials);
+    const winds = {};
+    state.routeSegments.forEach(seg => {
+      potentials[seg.id] = segmentPotentialValue(seg, bucket);
+      winds[seg.id] = segmentjaegerFavorableWind(seg, bucket.weather[seg.id]);
+    });
+    const minGapSec = (state.segmentjaegerMinGapMinutes || 0) * 60;
+    const defaults = segmentjaegerComputeDefaults(state.routeSegments, state.routeSegmentDetails, state.routeSegmentEfforts, state.showKomChip, state.showQomChip, potentials, winds, minGapSec);
     state.segmentjaegerSelection = defaults;
     saveSegmentjaegerSelection(activity.id, defaults);
   }
@@ -6369,6 +6475,95 @@ function sortedRouteSegments(bucket){
   return sortSegmentsBy(visibleSegmentList(bucket.list), bucket, state.routeSegmentSortBy);
 }
 
+// ---------- Lokale Segment-Favoriten (Herz) — unabhängig vom Strava-Stern ----------
+// The Strava star (see toggleSegmentStar()/starSegment() below) has always
+// doubled as Lucas' own "don't forget this segment" list -- the "Meine
+// Segmente" page just showed whatever was starred on Strava. That collides
+// with using the star for anything ride-specific (e.g. marking a segment
+// live on a Karoo for today's ride, see renderStarButton() now also being
+// used from the Segmentjäger page): re-starring different segments per ride
+// would silently wipe the old "don't forget" list, since Strava only has
+// ONE star field per segment, not a per-purpose one.
+//
+// Fix: a second, independent, purely local list ("Herz"/favorite) that has
+// nothing to do with Strava at all -- no API call, no OAuth scope, never
+// touched by anything star-related. "Meine Segmente" is now driven by THIS
+// list (see loadSegmentsStep()), not by fetchStarredSegments(). The star
+// button keeps meaning exactly what it always has (a real Strava star) and
+// stays completely untouched by this section -- the two are deliberately
+// never linked in either direction (favoriting doesn't star, unfavoriting
+// doesn't unstar, and vice versa).
+const LOCAL_FAVORITES_KEY = 'velocast_local_favorite_segments';
+// Stores the FULL segment summary object per id (not just the id) so a
+// favorited segment's name/distance/grade can render immediately without a
+// network round-trip -- same reasoning as state.segments already holding
+// full summaries today, not just a list of starred ids.
+function loadLocalFavoriteSegments(){
+  try{
+    const raw = localStorage.getItem(LOCAL_FAVORITES_KEY);
+    if(raw){
+      const parsed = JSON.parse(raw);
+      if(parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    }
+  }catch(e){}
+  return {};
+}
+function saveLocalFavoriteSegments(map){
+  try{ localStorage.setItem(LOCAL_FAVORITES_KEY, JSON.stringify(map)); }catch(e){}
+}
+function isLocalFavorite(seg){
+  return !!loadLocalFavoriteSegments()[seg.id];
+}
+// Synchronous, no network call, no pending/error state to track -- same
+// "pure local curation" shape as toggleSegmentIrrelevant() above. Also
+// keeps state.segments (the "Meine Segmente"/Favoriten page's list, see
+// loadSegmentsStep()) in sync immediately, regardless of which page the
+// toggle happened on -- without this, un-hearting a segment while actually
+// looking at the Favoriten list would leave a stale row behind until the
+// next reload, since that page doesn't otherwise re-read localStorage on
+// every render().
+function toggleLocalFavorite(seg){
+  const map = loadLocalFavoriteSegments();
+  if(map[seg.id]) delete map[seg.id];
+  else map[seg.id] = seg;
+  saveLocalFavoriteSegments(map);
+  state.segments = Object.values(map);
+  render();
+}
+
+// One-time seed of the new local list from whatever's currently starred on
+// Strava, so switching to the local-favorites model doesn't silently lose
+// Lucas' existing "don't forget" list. Gated on a marker so it only ever
+// runs once; adds to the existing local list rather than replacing it (a
+// segment already favorited locally, e.g. by a re-run in a test, is left
+// alone). Deliberately read-only against Strava -- never un-stars or
+// re-stars anything, just copies. Silently no-ops on any failure (no
+// token yet, network error, ...) WITHOUT setting the marker, so it simply
+// retries the next time loadSegmentsStep() runs with a working connection.
+const LOCAL_FAVORITES_MIGRATED_KEY = 'velocast_local_favorites_migrated';
+// Pure merge step, extracted out of migrateStarredSegmentsToLocalFavorites()
+// so the actual "add-only, never overwrite an existing local favorite" rule
+// is unit-testable without a real network fetch (the test sandbox's fetch
+// stub always rejects, see test/support/loadApp.js). Returns a NEW object,
+// same "caller decides what to do with the result" convention as
+// applyChainWearReset().
+function mergeFavoritesFromStarred(existingMap, starredList){
+  const map = { ...existingMap };
+  (starredList || []).forEach(seg => { if(!map[seg.id]) map[seg.id] = seg; });
+  return map;
+}
+async function migrateStarredSegmentsToLocalFavorites(token){
+  if(!token) return;
+  try{
+    if(localStorage.getItem(LOCAL_FAVORITES_MIGRATED_KEY)) return;
+  }catch(e){ return; }
+  try{
+    const starred = await fetchStarredSegments(token);
+    saveLocalFavoriteSegments(mergeFavoritesFromStarred(loadLocalFavoriteSegments(), starred));
+    localStorage.setItem(LOCAL_FAVORITES_MIGRATED_KEY, '1');
+  }catch(e){}
+}
+
 // Whether `seg` is currently starred on Strava, for the star button's
 // initial icon state. Prefers a successful star action already recorded in
 // state.segmentStars (so the icon reflects what THIS session just did,
@@ -6390,14 +6585,14 @@ function segmentIsStarred(seg, bucket){
 }
 
 // Stars/un-stars `seg` on the athlete's Strava account via starSegment().
-// Shared by both segment lists (see renderStarButton() below) since a
-// Strava segment id means the same real segment regardless of which list's
-// row triggered this — starring from "Abgeschlossene Segmente" is exactly
-// as valid an action as starring from "Meine Segmente". Deliberately does
-// NOT try to add/remove `seg` from state.segments (the starred-list bucket)
-// on success — that list is still exclusively driven by
-// fetchStarredSegments(), so a freshly-starred segment only shows up there
-// after the next fetch/reconnect, same as today.
+// Shared by all three segment lists (Meine Segmente, Abgeschlossene
+// Segmente, Segmentjäger — see renderStarButton() below) since a Strava
+// segment id means the same real segment regardless of which list's row
+// triggered this. Deliberately unrelated to the local favorites ("Herz")
+// list above -- starring/un-starring here never touches
+// loadLocalFavoriteSegments(), and toggleLocalFavorite() never touches
+// Strava, by design (see that section's comment for why the two used to be
+// tangled together through the star field and no longer are).
 async function toggleSegmentStar(seg, bucket){
   const prior = state.segmentStars[seg.id] || {};
   if(prior.pending) return;
@@ -6420,12 +6615,15 @@ async function toggleSegmentStar(seg, bucket){
   render();
 }
 
-// Star icon button for renderSegmentRow(), placed inline in the stat-chips
-// row (per the task brief: "one of the chips, or an icon button near them").
-// ev.stopPropagation() keeps a click here from also bubbling up into the
-// row's own onclick (selectSegment() — clicking the row navigates into the
-// segment's map detail view, an unrelated action this button must not
-// trigger).
+// Star icon button, placed inline in the stat-chips row — used by
+// renderSegmentRow() (Meine Segmente/Abgeschlossene Segmente) and
+// renderSegmentjaegerRow() (Segmentjäger, so a segment can be starred for
+// the Karoo's Live Segments directly from the ride-target list). Same
+// button everywhere -- a Strava segment id means the same real segment
+// regardless of which row triggered this. ev.stopPropagation() keeps a
+// click here from also bubbling up into the row's own onclick
+// (selectSegment()'s detail-view navigation, or Segmentjäger's selection
+// toggle — an unrelated action either way, this button must not trigger it).
 function renderStarButton(seg, bucket){
   const st = state.segmentStars[seg.id] || {};
   const starred = segmentIsStarred(seg, bucket);
@@ -6452,6 +6650,21 @@ function renderIrrelevantButton(seg){
     "aria-label": hidden ? "Markierung als nicht relevant aufheben" : "Segment als nicht relevant markieren",
     onclick: (ev)=>{ ev.stopPropagation(); toggleSegmentIrrelevant(seg); }
   }, [el("span", {html: hideIconSvg(hidden)})]);
+}
+
+// Local-favorite ("Herz") toggle button — same icon-button idiom/size as
+// renderStarButton()/renderIrrelevantButton() (ev.stopPropagation() so a
+// click here never also triggers the row's own onclick), but synchronous
+// like renderIrrelevantButton() -- toggleLocalFavorite() is a pure local
+// write, no pending/error/disabled state to render.
+function renderFavoriteButton(seg){
+  const favorited = isLocalFavorite(seg);
+  return el("button", {
+    class: "star-btn favorite-btn" + (favorited ? " on" : ""),
+    type: "button",
+    "aria-label": favorited ? "Aus Favoriten entfernen" : "Zu Favoriten hinzufügen",
+    onclick: (ev)=>{ ev.stopPropagation(); toggleLocalFavorite(seg); }
+  }, [el("span", {html: heartIconSvg(favorited)})]);
 }
 
 // App-wide toggle switch — the single shared component for every on/off
@@ -6540,6 +6753,7 @@ function renderSegmentRow(seg, bucket, opts){
   const stats = computeSegmentStatChips(seg, bucket);
   const chips = el("div", {class:"stat-chips"});
   stats.hero.forEach(s => chips.appendChild(statChip(s.value, s.label, s.style)));
+  chips.appendChild(renderFavoriteButton(seg));
   chips.appendChild(renderStarButton(seg, bucket));
   chips.appendChild(renderIrrelevantButton(seg));
   row.appendChild(chips);
@@ -6732,15 +6946,15 @@ function syncSegmentSortXomOptions(){
 // on the "Meine Segmente" nav page instead of inline below the route card.
 function renderSegmentsCard(){
   const card = el("div", {class:"card"});
-  card.appendChild(el("h2", {}, ["Markierte Segmente"]));
+  card.appendChild(el("h2", {}, ["Favoriten"]));
 
   if(state.loading.segments){
     card.appendChild(el("div", {class:"loading"}, ["Lade Segmente & Wind…"]));
     return card;
   }
   // autoLoadSegments is off (see Einstellungen) and nothing's been fetched
-  // yet -- distinct from the genuine "no starred segments" empty-state below,
-  // which would otherwise wrongly claim the athlete has none.
+  // yet -- distinct from the genuine "no favorites yet" empty-state below,
+  // which would otherwise wrongly claim there are none.
   if(state.needsManualLoad.segments){
     card.appendChild(el("div", {class:"muted", style:"margin-bottom:14px;"}, [
       "Automatisches Laden ist deaktiviert (siehe Einstellungen)."
@@ -6749,7 +6963,7 @@ function renderSegmentsCard(){
     return card;
   }
   if(!state.segments.length){
-    card.appendChild(el("div", {class:"empty-state"}, ["Keine markierten (gesternten) Segmente gefunden."]));
+    card.appendChild(el("div", {class:"empty-state"}, ["Noch keine Favoriten markiert. Herz-Symbol bei einem Segment antippen, um es hier zu sammeln."]));
     return card;
   }
 
@@ -6967,13 +7181,18 @@ function renderSegmentjaegerActivityPicker(card){
 // plus the same KOM/QOM delta chips) and statChip() — but with its own DOM
 // assembly and click behavior instead of reusing renderSegmentRow() itself:
 // tapping the row toggles this segment's membership in
-// state.segmentjaegerSelection instead of navigating into a detail view, and
-// per the task brief there are deliberately NO other interactive controls
-// inside the row (no star/"nicht relevant"/leaderboard buttons — segment
-// detail viewing already exists elsewhere in the app, see renderSegmentRow()/
-// selectSegment()). Deselected rows get the same opacity:0.5 "dimmed"
-// treatment already used app-wide for a disabled control (.btn:disabled/
-// .star-btn:disabled/.nav-action:disabled), not a new one-off value.
+// state.segmentjaegerSelection instead of navigating into a detail view.
+// Two icon buttons live inline in the chips row -- renderFavoriteButton()
+// (local "Herz" list) and renderStarButton() (the real Strava star/Live
+// Segment) -- both completely independent of the row's own selection state
+// and of each other (ev.stopPropagation() inside each keeps a click there
+// from also toggling the selection). No "nicht relevant"/leaderboard button
+// here though -- segment detail viewing already exists elsewhere in the
+// app, see renderSegmentRow()/selectSegment(). Deselected rows get the same
+// opacity:0.5 "dimmed" treatment already used app-wide for a disabled
+// control (.btn:disabled/.star-btn:disabled/.nav-action:disabled), not a
+// new one-off value -- this dims the favorite/star buttons too when the row
+// itself is deselected, same as everything else in the row.
 function renderSegmentjaegerRow(seg){
   const bucket = segmentBucket("route");
   const selected = !!state.segmentjaegerSelection[seg.id];
@@ -6993,12 +7212,16 @@ function renderSegmentjaegerRow(seg){
     ])
   ]));
 
+  // Hero chips + favorite/star buttons always render together in one row,
+  // even when there are no hero chips yet (detail still loading) -- same
+  // reasoning as renderSegmentRow()'s star button always being reachable
+  // regardless of fetch state.
   const stats = computeSegmentStatChips(seg, bucket);
-  if(stats.hero.length){
-    const chips = el("div", {class:"stat-chips"});
-    stats.hero.forEach(s => chips.appendChild(statChip(s.value, s.label, s.style)));
-    row.appendChild(chips);
-  }
+  const chips = el("div", {class:"stat-chips"});
+  stats.hero.forEach(s => chips.appendChild(statChip(s.value, s.label, s.style)));
+  chips.appendChild(renderFavoriteButton(seg));
+  chips.appendChild(renderStarButton(seg, bucket));
+  row.appendChild(chips);
   if(stats.secondary.length){
     row.appendChild(el("div", {class:"stat-secondary"}, [stats.secondary.join(" · ")]));
   }
@@ -12918,7 +13141,7 @@ function renderEinstellungenPage(){
     ()=>{ state[field] = !state[field]; saveSettings(); render(); }
   ));
   autoLoadToggle('autoLoadActivities', "Aktivitäten & Route automatisch laden");
-  autoLoadToggle('autoLoadSegments', "Markierte Segmente automatisch laden");
+  autoLoadToggle('autoLoadSegments', "Favoriten automatisch laden");
   autoLoadToggle('autoLoadTraining', "Trainingsdaten automatisch laden");
   autoLoadCard.appendChild(el('div', {class:'muted', style:'font-size:12px; margin-top:-6px;'}, [
     'Wenn eine Kategorie deaktiviert ist, wird sie nach dem Verbinden nicht automatisch geladen — stattdessen erscheint an ihrer Stelle ein „laden"-Button.'
@@ -12942,6 +13165,35 @@ function renderEinstellungenPage(){
     state.showQomChip, "QOM anzeigen",
     ()=>{ state.showQomChip = !state.showQomChip; saveSettings(); render(); }
   ));
+  // Segmentjäger: Mindestpause zwischen zwei automatisch ausgewählten
+  // Segmenten (see segmentjaegerComputeDefaults()'s minGapSec) — same
+  // tsettings-row/-row-main/-input-wrap/-unit markup buildChainWearCard()'s
+  // threshold field already uses, not settingsFieldRow() (that one is bound
+  // to TRAINING_CONFIG's nested path store, not a plain state field). `min:
+  // '0'` (not '1') since 0 is a legitimate value here -- it turns the rule
+  // off entirely, unlike the chain threshold where 0 would be meaningless.
+  const minGapInput = el('input', {
+    type: 'number', id: 'segmentjaeger-min-gap', step: 1, min: '0', value: state.segmentjaegerMinGapMinutes,
+    onchange: (e) => {
+      const v = parseFloat(e.target.value);
+      if(isFinite(v) && v >= 0){
+        state.segmentjaegerMinGapMinutes = v;
+      } else {
+        e.target.value = state.segmentjaegerMinGapMinutes;
+      }
+      saveSettings();
+      flashSettingsSaved();
+    }
+  });
+  segmentDisplayCard.appendChild(el('div', {class:'tsettings-row', style:'margin-top:12px;'}, [
+    el('div', {class:'tsettings-row-main'}, [
+      el('label', {for:'segmentjaeger-min-gap', style:'display:flex; align-items:center; gap:var(--space-2);'}, [
+        'Segmentjäger: Mindestpause',
+        infoButton('Wie viel Pause (in Minuten, aus der Original-Fahrt) mindestens zwischen zwei automatisch ausgewählten Segmenten liegen muss. Von zwei sonst qualifizierten, zu nah beieinanderliegenden Segmenten bleibt nur das chronologisch frühere in der Standardauswahl. 0 schaltet die Regel aus. Betrifft nur die automatische Standardauswahl, manuelles Auswählen bleibt immer frei.')
+      ]),
+      el('span', {class:'tsettings-input-wrap'}, [minGapInput, el('span', {class:'tsettings-unit'}, ['Min.'])])
+    ])
+  ]));
   frag.appendChild(segmentDisplayCard);
 
   frag.appendChild(buildEquipmentModeCard());
