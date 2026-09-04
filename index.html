@@ -5173,6 +5173,30 @@ function segmentjaegerFavorableWind(seg, weather){
   return windRelative(bearing, weather.windDir).type === "tail";
 }
 
+// Display counterpart to segmentjaegerFavorableWind() above -- that one
+// collapses cross/head into a single "not favorable" boolean for the
+// eligibility gate, this one keeps the full tail/cross/head distinction for
+// showing the actual wind on the row (Nutzer-Feedback 04.09.2026, reverses
+// the earlier "no wind badge here, would cost too much space" decision now
+// that the segment-grid layout has room for it). Deliberately its own chip
+// rather than folded into computeRideEffortStatChips()/computeSegmentStatChips() —
+// those are shared with "Abgeschlossene Segmente" (Strecke-Seite), which
+// already shows wind via the existing arrow-badge+.tag pair in
+// renderSegmentRow()'s .top line; adding it there too would just duplicate
+// the same information in a second place on that page. Same
+// value/label/style chip shape as buildXomChip()/buildPotentialChip(),
+// same fail-open null (no coords/weather -> chip omitted, not a placeholder).
+function buildSegmentjaegerWindChip(seg, weather){
+  if(!weather || !seg.start_latlng || !seg.end_latlng) return null;
+  const bearing = bearingBetween(seg.start_latlng, seg.end_latlng);
+  const rel = windRelative(bearing, weather.windDir);
+  const label = rel.type === "tail" ? "Rückenwind" : rel.type === "head" ? "Gegenwind" : "Seitenwind";
+  const style = rel.type === "tail" ? "color:var(--tail); background:var(--tail-bg);"
+    : rel.type === "head" ? "color:var(--head); background:var(--head-bg);"
+    : "color:var(--cross); background:var(--cross-bg);";
+  return { value: `${Math.round(weather.windSpeed)} km/h`, label, style };
+}
+
 // Pure eligibility check for ONE segment's default selection — no state.*
 // reads (showKomChip/showQomChip are passed in explicitly instead, see
 // below), so it's directly unit-testable. `detail` is bucket.details[seg.id]
@@ -7364,6 +7388,8 @@ function renderSegmentjaegerRow(seg){
   const stats = computeSegmentStatChips(seg, bucket);
   const chips = el("div", {class:"stat-chips"});
   stats.hero.forEach(s => chips.appendChild(statChip(s.value, s.label, s.style)));
+  const windChip = buildSegmentjaegerWindChip(seg, bucket.weather[seg.id]);
+  if(windChip) chips.appendChild(statChip(windChip.value, windChip.label, windChip.style));
   chips.appendChild(renderFavoriteButton(seg));
   chips.appendChild(renderStarButton(seg, bucket));
   row.appendChild(chips);

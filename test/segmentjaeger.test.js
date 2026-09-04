@@ -197,6 +197,43 @@ test('segmentjaegerFavorableWind', async (t) => {
   });
 });
 
+// buildSegmentjaegerWindChip(seg, weather) -- the display counterpart to
+// segmentjaegerFavorableWind() above, keeping the full tail/cross/head
+// distinction (that one collapses cross/head into a single false) for the
+// wind chip shown directly on the Segmentjäger row.
+test('buildSegmentjaegerWindChip', async (t) => {
+  const { get } = loadApp();
+  const windChip = get('buildSegmentjaegerWindChip');
+  const northSeg = { start_latlng: [48.0, 11.0], end_latlng: [48.01, 11.0] };
+
+  await t.test('tailwind -> "Rückenwind" label, --tail styling, rounded speed as the value', () => {
+    const chip = windChip(northSeg, { windDir: 180, windSpeed: 14.6 });
+    assert.deepEqual(plain(chip), { value: '15 km/h', label: 'Rückenwind', style: 'color:var(--tail); background:var(--tail-bg);' });
+  });
+
+  await t.test('headwind -> "Gegenwind" label, --head styling', () => {
+    const chip = windChip(northSeg, { windDir: 0, windSpeed: 20 });
+    assert.equal(chip.label, 'Gegenwind');
+    assert.equal(chip.style, 'color:var(--head); background:var(--head-bg);');
+  });
+
+  await t.test('crosswind -> "Seitenwind" label, --cross styling (unlike segmentjaegerFavorableWind(), this distinguishes it from a headwind)', () => {
+    const chip = windChip(northSeg, { windDir: 90, windSpeed: 10 });
+    assert.equal(chip.label, 'Seitenwind');
+    assert.equal(chip.style, 'color:var(--cross); background:var(--cross-bg);');
+  });
+
+  await t.test('no weather data -> null, chip omitted entirely (not a placeholder)', () => {
+    assert.equal(windChip(northSeg, null), null);
+    assert.equal(windChip(northSeg, undefined), null);
+  });
+
+  await t.test('segment missing start/end coords -> null, even with weather data present', () => {
+    assert.equal(windChip({}, { windDir: 180, windSpeed: 10 }), null);
+    assert.equal(windChip({ start_latlng: [48, 11] }, { windDir: 180, windSpeed: 10 }), null);
+  });
+});
+
 test('segmentjaegerGapSeconds', async (t) => {
   const { get } = loadApp();
   const gapSeconds = get('segmentjaegerGapSeconds');
