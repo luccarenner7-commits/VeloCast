@@ -4712,6 +4712,16 @@ function resetRouteSegments(){
   state.routeSegmentsFetched = false;
   state.routeSegmentsError = null;
   state.loading.routeSegments = false;
+  // syncSegmentjaegerStars() only ever clears this flag itself on its own
+  // non-stale-generation exit path -- if a reset like this one fires while
+  // its star/unstar loop is still mid-await (activity switch, a saved
+  // route picked, a GPX upload), the loop's own routeSegmentsGeneration
+  // check makes it bail out silently WITHOUT reaching that line, so
+  // without this reset the "Auswahl mit Strava-Stern abgleichen" button
+  // would stay stuck on "Wird synchronisiert…" for the rest of the
+  // session. Safe to always clear here (not just when a sync happens to be
+  // running) for the same reason state.loading.routeSegments is above.
+  state.segmentjaegerSyncRunning = false;
   if(state.selectedSegmentSource === "route"){
     state.selectedSegmentId = null;
     state.selectedSegmentSource = null;

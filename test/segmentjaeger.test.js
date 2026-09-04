@@ -873,3 +873,46 @@ test('syncSegmentjaegerStars', async (t) => {
     assert.equal(fetchCalls, 0, 'must not fire while already running');
   });
 });
+
+// ---------------------------------------------------------------------
+// resetRouteSegments() clearing state.segmentjaegerSyncRunning -- regression
+// test for a real bug: syncSegmentjaegerStars() only ever cleared this flag
+// itself on its own non-stale-generation exit path. If a reset fired while
+// its star/unstar loop was still mid-await (activity switch, a saved route
+// picked, a GPX upload -- all three call resetRouteSegments()), the loop's
+// own routeSegmentsGeneration check made it bail out silently WITHOUT
+// reaching that line, permanently stranding the "Auswahl mit Strava-Stern
+// abgleichen" button on "Wird synchronisiert…" for the rest of the session
+// (only a page reload recovered it). Fixed by having resetRouteSegments()
+// clear the flag itself too, same as it already does for
+// state.loading.routeSegments.
+// ---------------------------------------------------------------------
+test('resetRouteSegments', async (t) => {
+  await t.test('clears segmentjaegerSyncRunning, simulating a reset firing mid-sync', () => {
+    const { get } = loadApp();
+    const state = get('state');
+    const reset = get('resetRouteSegments');
+    state.segmentjaegerSyncRunning = true; // simulates a sync stuck mid-await
+
+    reset();
+
+    assert.equal(state.segmentjaegerSyncRunning, false);
+  });
+
+  await t.test('also still clears routeSegments/loading/error state as before (no regression from the new line)', () => {
+    const { get } = loadApp();
+    const state = get('state');
+    const reset = get('resetRouteSegments');
+    state.routeSegments = [{ id: 1 }];
+    state.routeSegmentsFetched = true;
+    state.routeSegmentsError = 'boom';
+    state.loading.routeSegments = true;
+
+    reset();
+
+    assert.deepEqual(plain(state.routeSegments), []);
+    assert.equal(state.routeSegmentsFetched, false);
+    assert.equal(state.routeSegmentsError, null);
+    assert.equal(state.loading.routeSegments, false);
+  });
+});
