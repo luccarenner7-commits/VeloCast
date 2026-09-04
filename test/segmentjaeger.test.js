@@ -580,24 +580,34 @@ test('ensureSegmentjaegerSelection', async (t) => {
     state.selectedActivity = activity(555);
     state.routeSegmentsFetched = true;
     state.routeSegments = [{ id: 1 }, { id: 2 }];
-    // Both segments are record-eligible on their own (at-record KOM).
+    // Both segments are record-eligible on their own (at-record KOM, gap
+    // measured against the genuine PR time below).
     state.routeSegmentDetails = {
-      1: { athlete_segment_stats: { pr_elapsed_time: 100 }, xoms: { kom: '1:40' } },
-      2: { athlete_segment_stats: { pr_elapsed_time: 100 }, xoms: { kom: '1:40' } },
+      1: { athlete_segment_stats: { pr_elapsed_time: 1200 }, xoms: { kom: '20:00' } },
+      2: { athlete_segment_stats: { pr_elapsed_time: 1200 }, xoms: { kom: '20:00' } },
     };
+    // Deliberately a very different duration from the genuine PR (1200s)
+    // above -- if segmentPotentialValue() regressed back to pairing
+    // routeSegmentPrWatts with THIS RIDE's own effort duration instead of
+    // the genuine PR duration (the actual bug Lucas found: a slow/easy
+    // ride through a segment used to compute a misleadingly low
+    // "Potential %", making an already-maxed-out segment look like it
+    // still had headroom), it would divide by the mmpCurve's 60s ceiling
+    // (400W) instead of its 1200s ceiling (100W) -- flipping segment 1
+    // from excluded to eligible below, which this test would catch.
     state.routeSegmentEfforts = {
-      1: { elapsed_time: 300 }, // matches the mmpCurve point below exactly
-      2: { elapsed_time: 300 },
+      1: { elapsed_time: 60 },
+      2: { elapsed_time: 60 },
     };
-    // Segment 1's own ride watts equal the rider's MMP-curve ceiling for
-    // that duration -> 100% potential, well above the 95% ceiling.
-    // Segment 2's ride watts are well under the ceiling -> low potential,
-    // stays eligible.
+    // Segment 1's genuine PR watts are 97% of the rider's MMP-curve
+    // ceiling for the genuine PR duration (1200s -> 100W) -> excluded
+    // (>=95%). Segment 2's genuine PR watts are well under that same
+    // ceiling -> low potential, stays eligible.
     state.routeSegmentPrWatts = {
-      1: { watts: 300, measured: true },
-      2: { watts: 150, measured: true },
+      1: { watts: 97, measured: true },
+      2: { watts: 20, measured: true },
     };
-    state.profilPage.riderProfile = { mmpCurve: { 180: 300, 300: 300 } };
+    state.profilPage.riderProfile = { mmpCurve: { 60: 400, 1200: 100 } };
 
     ensure();
 

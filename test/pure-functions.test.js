@@ -369,19 +369,35 @@ test('segmentPotentialValue', async (t) => {
     assert.equal(buildPotentialChip(285, 60).value, '95%');
   });
 
-  await t.test('ride-completed bucket (efforts set): uses this ride\'s own effort duration, not a PR', () => {
+  await t.test('ride-completed bucket (efforts set): ALWAYS uses the genuine all-time PR duration/watts, never this ride\'s own effort', () => {
+    // Regression for a real bug: this used to pair `prWatts` with
+    // `bucket.efforts[seg.id].elapsed_time` (this specific ride's own
+    // time) whenever `bucket.efforts` was set -- meaning a slow/easy ride
+    // through a segment computed a misleadingly LOW potential % (lots of
+    // headroom left) even when the athlete's genuine PR on that segment
+    // was already maxed out. `bucket.efforts` must no longer affect this
+    // function's behavior at all -- only `bucket.details[seg.id]`'s
+    // `pr_elapsed_time` (the genuine PR duration) is used, exactly like
+    // the starred-bucket case above. Deliberately sets a ride-effort
+    // duration (600s) that would have produced a very different (lower)
+    // % under the old ride-effort-duration behavior, to prove it's no
+    // longer consulted.
     const { get } = loadApp();
     const segmentPotentialValue = get('segmentPotentialValue');
     const state = get('state');
     state.profilPage.riderProfile = { mmpCurve: { 60: 300, 300: 200 } };
-    const bucket = { efforts: { 1: { elapsed_time: 60 } }, details: {}, prWatts: { 1: { watts: 300 } } };
+    const bucket = {
+      efforts: { 1: { elapsed_time: 600 } }, // must be ignored
+      details: { 1: { athlete_segment_stats: { pr_elapsed_time: 60 } } },
+      prWatts: { 1: { watts: 300 } },
+    };
     assert.equal(segmentPotentialValue({ id: 1 }, bucket), 100);
   });
 
-  await t.test('ride-completed bucket: no effort recorded for this segment -> null', () => {
+  await t.test('ride-completed bucket: no detail for this segment -> null, regardless of efforts', () => {
     const { get } = loadApp();
     const segmentPotentialValue = get('segmentPotentialValue');
-    const bucket = { efforts: {}, details: {}, prWatts: { 1: { watts: 300 } } };
+    const bucket = { efforts: { 1: { elapsed_time: 60 } }, details: {}, prWatts: { 1: { watts: 300 } } };
     assert.equal(segmentPotentialValue({ id: 1 }, bucket), null);
   });
 });

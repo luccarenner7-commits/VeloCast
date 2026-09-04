@@ -5070,22 +5070,30 @@ async function ensureRideSegments(){
     const efforts = data.segment_efforts || []; // empty = a normal "no segments on this ride", not an error
     const segments = [];
     const effortsById = {};
-    const prWatts = {};
     efforts.forEach(effort=>{
       const seg = effort.segment;
       if(!seg || !seg.id || effortsById[seg.id]) return; // skip malformed entries + (rare) repeat efforts on the same segment, keep the first
       segments.push(seg);
       effortsById[seg.id] = effort;
-      // This ride's own watts for the effort — no separate PR-activity
-      // lookup needed the way ensureSegmentPrWatts() needs one for the
-      // starred-segments bucket, since it's right here on the effort.
-      prWatts[seg.id] = effort.average_watts != null
-        ? { watts: Math.round(effort.average_watts), measured: !!effort.device_watts }
-        : null;
     });
     state.routeSegments = segments;
     state.routeSegmentEfforts = effortsById;
-    state.routeSegmentPrWatts = prWatts;
+    // state.routeSegmentPrWatts is deliberately NOT pre-populated from
+    // `effort.average_watts` here (this ride's own watts) the way it used
+    // to be -- that made fetchSegmentPrWatts()'s `bucket.prWatts[seg.id]
+    // !== undefined` cache guard below think the genuine PR wattage was
+    // already known and skip fetching it, so every "Potential" figure for
+    // a ridden segment (both the displayed chip AND the Segmentjäger
+    // eligibility ceiling, see segmentPotentialValue()) was silently
+    // computed from THIS ride's effort instead of the athlete's real
+    // best-ever effort on the segment -- a slow/easy ride through a
+    // segment would read as "lots of headroom left" even when the
+    // genuine PR was already maxed out. Leaving it unset here lets
+    // loadSegmentExtras() below fetch the real thing via
+    // fetchSegmentPrWatts(), same as the starred-segments bucket already
+    // does. This ride's own watts are still shown (computeRideEffortStatChips()
+    // reads them straight off `effort.average_watts` itself, no separate
+    // state needed for that).
     // Still fetches per-segment weather + full segment detail (for the
     // map-detail-view polyline, see mountSegmentView()) the same way the
     // starred-segments bucket does — that part of the shared pipeline is
@@ -6267,7 +6275,7 @@ function mountFullRouteView(map, layers, isNewRoute){
 // needed for the ride case either). Takes a bucket (see segmentBucket()) so
 // callers don't need to know which shape applies.
 function computeSegmentStatChips(seg, bucket){
-  if(bucket.efforts) return computeRideEffortStatChips(bucket.efforts[seg.id], bucket.prWatts[seg.id], bucket.details[seg.id]);
+  if(bucket.efforts) return computeRideEffortStatChips(bucket.efforts[seg.id], bucket.details[seg.id], bucket.prWatts[seg.id]);
   const detail = bucket.details[seg.id];
   const hero = [], secondary = [];
   if(detail){
@@ -6383,7 +6391,22 @@ function buildPotentialChip(watts, durationSec){
 // is demoted to the quiet secondary summary line. `detail` can be missing
 // (e.g. a failed detail fetch) same as in the starred branch, so every
 // detail-derived stat below is guarded.
-function computeRideEffortStatChips(effort, prWatts, detail){
+//
+// `prWatts` here is the segment's genuine all-time PR-effort wattage (same
+// fetchSegmentPrWatts()/ensureSegmentPrWatts() lookup the starred bucket
+// already used, now also populated for ridden segments — see
+// ensureRideSegments()'s comment for why it deliberately no longer
+// pre-populates this from `effort.average_watts`) — NOT this ride's own
+// wattage, which used to be passed in here and fed straight into the
+// Potential chip below. That was a real bug once Potential became a
+// Segmentjäger selection criterion: a slow/easy ride through a segment
+// would compute a low "Potential %" (lots of headroom left) even when the
+// athlete's genuine PR on that segment was already maxed out, since the
+// number reflected THIS ride's effort instead of the best one. This ride's
+// own average watts are still shown, just computed inline from `effort`
+// itself (labeled "Ø", ride-average) instead of double-purposed for the
+// Potential calculation.
+function computeRideEffortStatChips(effort, detail, prWatts){
   const hero = [], secondary = [];
   if(!effort) return {hero, secondary};
   if(effort.elapsed_time != null){
@@ -6394,24 +6417,19 @@ function computeRideEffortStatChips(effort, prWatts, detail){
       style: isPr ? "color:var(--tail); background:var(--tail-bg);" : null
     });
   }
-  // "Ø" prefix deliberately added here (NOT in computeSegmentStatChips()'s
-  // identical-looking line for the starred bucket, where prWatts genuinely
-  // IS the athlete's PR-effort wattage) — `prWatts` here is
-  // effort.average_watts for THIS ride's own completion (see
-  // ensureRideSegments()), not the athlete's all-time PR effort's wattage
-  // (that's a different, starred-bucket-only lookup via
-  // fetchSegmentPrWatts()/ensureSegmentPrWatts(), an extra per-segment API
-  // call deliberately not made here). Sitting right next to the "PR
-  // {duration}" secondary text below without a label, this used to read as
-  // if it were the PR's own wattage — the "Ø" (ride average) makes clear
-  // it's this ride's number instead.
-  if(prWatts) secondary.push(`Ø ${prWatts.measured ? "" : "~"}${prWatts.watts} W`);
-  const potential = prWatts && effort.elapsed_time != null ? buildPotentialChip(prWatts.watts, effort.elapsed_time) : null;
-  if(potential) hero.push(potential);
+  if(effort.average_watts != null){
+    const rideWatts = { watts: Math.round(effort.average_watts), measured: !!effort.device_watts };
+    secondary.push(`Ø ${rideWatts.measured ? "" : "~"}${rideWatts.watts} W`);
+  }
   if(effort.kom_rank) secondary.push(`Platz ${effort.kom_rank} (Effort)`);
   if(detail){
     const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
     if(pr != null) secondary.push(`PR ${fmtDuration(pr)}`);
+    // Genuine best-ever potential -- watts and duration both come from the
+    // same real PR effort (prWatts via fetchSegmentPrWatts(), pr via this
+    // same detail), same pairing discipline segmentPotentialValue() uses.
+    const potential = prWatts && pr != null ? buildPotentialChip(prWatts.watts, pr) : null;
+    if(potential) hero.push(potential);
     if(state.showKomChip && detail.xoms && detail.xoms.kom) hero.push(buildXomChip(detail.xoms.kom, pr, "KOM"));
     if(state.showQomChip && detail.xoms && detail.xoms.qom) hero.push(buildXomChip(detail.xoms.qom, pr, "QOM"));
     if(detail.total_elevation_gain != null) secondary.push(`${Math.round(detail.total_elevation_gain)} Hm`);
@@ -6469,17 +6487,18 @@ function compareClosenessNullsLast(a, b){
 // Reusable "Genutztes Potential" % as a plain sortable number (or null when
 // not computable), for the "potential" sort case in sortSegmentsBy() below —
 // same display-vs-sortable-number split as segmentXomCloseness()/
-// buildXomChip(). Mirrors computeSegmentStatChips()/computeRideEffortStatChips()'s
-// own watts+duration lookup for each bucket shape (starred vs. ride-
-// completed) so the sort never disagrees with what the chip itself shows.
+// buildXomChip(). Always the genuine best-ever PR watts+duration pairing
+// (bucket.prWatts[seg.id] + bucket.details[seg.id]'s pr_elapsed_time), the
+// same one computeSegmentStatChips()/computeRideEffortStatChips() use for
+// their own Potential chip — regardless of bucket shape (starred vs.
+// ride-completed) now that both fetch genuine PR watts via
+// fetchSegmentPrWatts() (see ensureRideSegments()'s comment for why the
+// ride-completed bucket used to special-case this off `bucket.efforts` and
+// this ride's own effort instead, and why that was wrong for a criterion
+// meant to represent "how close is my BEST-EVER effort to my ceiling").
 function segmentPotentialValue(seg, bucket){
   const prWatts = bucket.prWatts[seg.id];
   if(!prWatts) return null;
-  if(bucket.efforts){
-    const effort = bucket.efforts[seg.id];
-    if(!effort || effort.elapsed_time == null) return null;
-    return computePotentialPercent(prWatts.watts, effort.elapsed_time);
-  }
   const detail = bucket.details[seg.id];
   if(!detail) return null;
   const pr = detail.athlete_segment_stats && detail.athlete_segment_stats.pr_elapsed_time;
