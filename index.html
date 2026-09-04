@@ -424,9 +424,25 @@
   .leaflet-container{ font-family:'Inter', sans-serif; }
 
   /* Segments */
+  /* Multi-column layout for a *list* of segment cards (Favoriten,
+     Abgeschlossene Segmente, Segmentjäger) -- every row used to be appended
+     straight into the surrounding .card as a single full-width column, so
+     on anything wider than a phone most of the width just sat empty while
+     the list scrolled on forever. Column count follows the SAME breakpoints
+     .app already uses for its own max-width growth (see .app below), so the
+     grid only gains a column where there's genuinely more room, not at an
+     arbitrary new value. gap only sets the column gutter (row spacing keeps
+     coming from .segment's own margin-bottom below, unchanged, so vertical
+     rhythm inside a single column is identical to before this existed).
+     Detail-view single-segment cards (renderRouteCard()/renderSegmentsPage())
+     render one static .segment straight into the card, outside this grid --
+     a 1-item grid would be pointless there, so those are left untouched. */
+  .segment-grid{ display:grid; grid-template-columns:1fr; row-gap:0; column-gap:12px; }
+  @media (min-width:900px){ .segment-grid{ grid-template-columns:repeat(2, 1fr); } }
+  @media (min-width:1200px){ .segment-grid{ grid-template-columns:repeat(3, 1fr); } }
   .segment{
-    display:flex; flex-direction:column; gap:var(--space-4); cursor:pointer;
-    padding:14px; border-radius:var(--r-md); margin-bottom:8px; border:1px solid var(--line);
+    display:flex; flex-direction:column; gap:8px; cursor:pointer;
+    padding:12px; border-radius:var(--r-md); margin-bottom:8px; border:1px solid var(--line);
   }
   .segment:hover{ border-color:var(--route); }
   .segment.static{ cursor:default; }
@@ -436,11 +452,21 @@
   .segment .top{ display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap; }
   .segment .left{ display:flex; align-items:flex-start; gap:12px; min-width:0; flex:1; }
   .segment .arrow-badge{
-    width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+    width:32px; height:32px; border-radius:50%; display:flex; align-items:center; justify-content:center;
     flex-shrink:0;
   }
   .segment .name{ font-weight:600; font-size:14px; }
   .segment .meta{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); margin-top:3px; }
+  /* Denser than the shared .stat-chip/.stat-chips base (those are also used
+     by the Aktivitäten list, the Klimb-Tab, and Trainer-Einstellungen
+     read-only fields -- see their own rules below -- so the compacting here
+     is scoped to .segment specifically instead of touching the shared base
+     rule and bleeding into those unrelated screens). Value stays legible at
+     16px; only the box padding/gap and the label shrink. */
+  .segment .stat-chips{ gap:6px; }
+  .segment .stat-chip{ padding:4px 8px; }
+  .segment .stat-chip .v{ font-size:16px; }
+  .segment .stat-secondary{ margin-top:5px; }
   /* Stat chips: hero-numeral pill — a bold, larger value line over a small
      uppercase label line, instead of one flat string, so the number (PR
      time, watts, climb length…) reads at a glance. */
@@ -7076,9 +7102,11 @@ function renderSegmentsCard(){
   }
 
   const bucket = segmentBucket("starred");
+  const grid = el("div", {class:"segment-grid"});
   sortedVisibleSegments(bucket).forEach(seg=>{
-    card.appendChild(renderSegmentRow(seg, bucket));
+    grid.appendChild(renderSegmentRow(seg, bucket));
   });
+  card.appendChild(grid);
 
   return card;
 }
@@ -7211,7 +7239,9 @@ function renderRouteSegmentsCard(){
   // completed segment for this ride, so the card must show all of them too —
   // that's the whole point of "Abgeschlossene Segmente".
   const list = sortedRouteSegments(bucket);
-  list.forEach(seg => card.appendChild(renderSegmentRow(seg, bucket)));
+  const grid = el("div", {class:"segment-grid"});
+  list.forEach(seg => grid.appendChild(renderSegmentRow(seg, bucket)));
+  card.appendChild(grid);
   return card;
 }
 
@@ -7392,7 +7422,9 @@ function renderSegmentjaegerPage(){
 
   if(state.fullRouteCoords.length) card.appendChild(routeMapContainer);
 
-  state.routeSegments.forEach(seg => card.appendChild(renderSegmentjaegerRow(seg)));
+  const grid = el("div", {class:"segment-grid"});
+  state.routeSegments.forEach(seg => grid.appendChild(renderSegmentjaegerRow(seg)));
+  card.appendChild(grid);
 
   // "Auswahl mit Strava-Stern abgleichen" — see syncSegmentjaegerStars()'s
   // own comment for why this is a manual button rather than firing on every
