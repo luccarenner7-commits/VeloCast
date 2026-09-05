@@ -17,3 +17,13 @@ ALLOWED_ORIGIN = "*"
 # (or, since this project deploys via the Cloudflare dashboard rather than
 # the wrangler CLI: Worker -> Settings -> Variables and Secrets -> Add,
 # type "Secret")
+
+# Required for the /sync route (device sync: Reifendruck, Kette, ...) --
+# needs a KV namespace created once in the Cloudflare dashboard (Worker ->
+# Settings -> Bindings -> Add -> KV Namespace, variable name "SYNC_KV"),
+# same dashboard-based workflow as the secrets above. Fill in the real id
+# after creating it (find it under Storage & Databases -> KV in the
+# dashboard, or `wrangler kv namespace list` if you switch to the CLI).
+# [[kv_namespaces]]
+# binding = "SYNC_KV"
+# id = "REPLACE_ME"

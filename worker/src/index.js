@@ -14,6 +14,15 @@
 //                                der OAuth-Redirect-URL, daher keine
 //                                zusätzliche Prüfung nötig; spart eine zweite
 //                                Pflegestelle in index.html.
+//   GET  /sync                   Geräte-Sync lesen (Reifendruck, Kette, ...)
+//   PUT  /sync                   Geräte-Sync schreiben (merged in KV)
+//                                Beide brauchen `Authorization: Bearer
+//                                <strava_access_token>` -- der Worker prüft
+//                                den Token direkt bei Strava (GET /athlete)
+//                                und nutzt die zurückgegebene athlete.id als
+//                                KV-Key, statt einer vom Client mitgeschickten
+//                                ID zu vertrauen. Braucht ein KV-Binding
+//                                namens SYNC_KV (siehe wrangler.toml).
 //
 // Deploy: set STRAVA_CLIENT_ID / HAMMERHEAD_CLIENT_ID (see wrangler.toml)
 // and the STRAVA_CLIENT_SECRET / HAMMERHEAD_CLIENT_SECRET secrets, then
@@ -24,7 +33,7 @@
 function corsHeaders(env) {
   return {
     "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN || "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
   };
 }
@@ -114,6 +123,57 @@ async function handleHammerheadUpload(request, env) {
   return jsonResponse(await providerRes.json(), providerRes.status, env);
 }
 
+// Verifiziert den mitgeschickten Strava access_token direkt bei Strava
+// (statt einer vom Client mitgeschickten athlete-ID zu vertrauen) und gibt
+// die echte athlete-ID zurück -- ein Client kann sich damit nie als ein
+// anderer Athlet ausgeben, ohne dessen echten Token zu haben. Kein Caching
+// des Verifizierungsergebnisses -- bei diesem Nutzungsvolumen (ein Rider,
+// gelegentliche Syncs) unnötige Komplexität für einen einzigen zusätzlichen
+// Strava-Call pro Sync-Request.
+async function verifyAthleteId(request, env) {
+  const auth = request.headers.get("Authorization");
+  if (!auth || !auth.startsWith("Bearer ")) return null;
+  const res = await fetch("https://www.strava.com/api/v3/athlete", {
+    headers: { Authorization: auth },
+  });
+  if (!res.ok) return null;
+  const athlete = await res.json();
+  return athlete && athlete.id ? String(athlete.id) : null;
+}
+
+async function handleSyncGet(request, env) {
+  const athleteId = await verifyAthleteId(request, env);
+  if (!athleteId) return jsonResponse({ error: "unauthorized" }, 401, env);
+  const raw = await env.SYNC_KV.get(`sync:${athleteId}`);
+  const stored = raw ? JSON.parse(raw) : { keys: {} };
+  return jsonResponse(stored, 200, env);
+}
+
+// Read-Modify-Write-Merge: pro Key gewinnt der neuere `updatedAt`-Zeitstempel
+// -- eine zusätzliche, server-seitige Absicherung des gleichen Pro-Key-
+// Merges, den der Client schon lokal macht (computeSyncMergePlan() in
+// index.html), falls zwei Geräte kurz hintereinander unterschiedliche Keys
+// pushen.
+async function handleSyncPut(request, env) {
+  const athleteId = await verifyAthleteId(request, env);
+  if (!athleteId) return jsonResponse({ error: "unauthorized" }, 401, env);
+  let body;
+  try { body = await request.json(); } catch { return jsonResponse({ error: "invalid_json" }, 400, env); }
+  const incoming = (body && body.keys) || {};
+  const kvKey = `sync:${athleteId}`;
+  const raw = await env.SYNC_KV.get(kvKey);
+  const stored = raw ? JSON.parse(raw) : { keys: {} };
+  if (!stored.keys) stored.keys = {};
+  Object.keys(incoming).forEach((key) => {
+    const entry = incoming[key];
+    if (!entry || typeof entry.updatedAt !== "number") return;
+    const existing = stored.keys[key];
+    if (!existing || entry.updatedAt > existing.updatedAt) stored.keys[key] = entry;
+  });
+  await env.SYNC_KV.put(kvKey, JSON.stringify(stored));
+  return jsonResponse({ ok: true }, 200, env);
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders(env) });
@@ -122,9 +182,11 @@ export default {
     if (request.method === "GET" && pathname === "/hammerhead/client-id") {
       return jsonResponse({ client_id: env.HAMMERHEAD_CLIENT_ID }, 200, env);
     }
+    if (!hasAllowedOrigin(request, env)) return jsonResponse({ error: "forbidden" }, 403, env);
+    if (request.method === "GET" && pathname === "/sync") return handleSyncGet(request, env);
+    if (request.method === "PUT" && pathname === "/sync") return handleSyncPut(request, env);
 
     if (request.method !== "POST") return jsonResponse({ error: "method_not_allowed" }, 405, env);
-    if (!hasAllowedOrigin(request, env)) return jsonResponse({ error: "forbidden" }, 403, env);
     if (pathname === "/hammerhead/token") return handleHammerheadToken(request, env);
     if (pathname === "/hammerhead/upload") return handleHammerheadUpload(request, env);
     return handleStravaToken(request, env);

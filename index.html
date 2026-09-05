@@ -796,6 +796,7 @@ const TOKEN_ENDPOINT = "https://rueckenwind-oauth.lucca-renner7.workers.dev";
 const HAMMERHEAD_CLIENT_ID_ENDPOINT = TOKEN_ENDPOINT + "/hammerhead/client-id";
 const HAMMERHEAD_TOKEN_ENDPOINT = TOKEN_ENDPOINT + "/hammerhead/token";
 const HAMMERHEAD_UPLOAD_ENDPOINT = TOKEN_ENDPOINT + "/hammerhead/upload";
+const SYNC_ENDPOINT = TOKEN_ENDPOINT + "/sync";
 
 function pad2(n){ return String(n).padStart(2,'0'); }
 function toLocalInputValue(date){
@@ -883,6 +884,7 @@ function saveConfirmedTests(obj){
     localStorage.setItem(CONFIRMED_TESTS_KEY, JSON.stringify(trimmed));
   };
   try{ attempt(CONFIRMED_TESTS_MAX); }catch(e){ try{ attempt(50); }catch(e2){} }
+  pushSyncSoon(CONFIRMED_TESTS_KEY);
 }
 function saveConfirmedTest(entry){
   const all = loadConfirmedTests();
@@ -2192,6 +2194,7 @@ function saveSettings(){
       equipmentMode: state.equipmentMode
     }));
   }catch(e){}
+  pushSyncSoon("velocast_settings");
 }
 
 // ---------- Strava API ----------
@@ -2613,7 +2616,7 @@ function loadGearResets(){
     return out;
   }catch(e){ return {}; }
 }
-function saveGearResets(resets){ try{ localStorage.setItem(PROFIL_GEAR_RESET_KEY, JSON.stringify(resets)); }catch(e){} }
+function saveGearResets(resets){ try{ localStorage.setItem(PROFIL_GEAR_RESET_KEY, JSON.stringify(resets)); }catch(e){} pushSyncSoon(PROFIL_GEAR_RESET_KEY); }
 function gearWearStatus(totalDistanceM, resetKm, intervalKm){
   const totalKm = (totalDistanceM||0)/1000;
   const sinceKm = Math.max(0, totalKm - (resetKm||0));
@@ -2662,6 +2665,7 @@ function loadChainWearData(){
 }
 function saveChainWearData(data){
   try{ localStorage.setItem(CHAIN_WEAR_KEY, JSON.stringify(data)); }catch(e){}
+  pushSyncSoon(CHAIN_WEAR_KEY);
 }
 // VeloCast doesn't track odometer/gear-tagged distance independently of
 // Strava's gear objects -- this tool has no gear object to read from at all,
@@ -2870,6 +2874,7 @@ function saveTirePressureData(data){
     ['front', 'rear'].forEach(wheel => { data[wheel].history = data[wheel].history.slice(-50); });
     localStorage.setItem(TIRE_PRESSURE_KEY, JSON.stringify(data));
   }catch(e){}
+  pushSyncSoon(TIRE_PRESSURE_KEY);
 }
 // Startup check (see init()): {front, rear} booleans, both false if settings
 // aren't filled in yet or a wheel has no baseline yet -- computeTargetPressureBar
@@ -4015,6 +4020,7 @@ function hasUnseenChangelog(){
 }
 function markChangelogSeen(){
   try{ localStorage.setItem(CHANGELOG_SEEN_KEY, CHANGELOG[0].date); }catch(e){}
+  pushSyncSoon(CHANGELOG_SEEN_KEY);
 }
 
 function hamburgerIconSvg(){
@@ -4505,6 +4511,7 @@ async function connectWithCode(code){
     state.athlete = tokenData.athlete;
     await saveToken(tokenData.refresh_token);
     state.connected = true;
+    await pullSyncOnLoad();
     await loadActivitiesAndSegments();
   }catch(e){
     state.error = e.message || "Verbindung fehlgeschlagen.";
@@ -5368,6 +5375,7 @@ function saveSegmentjaegerSelection(activityId, selection){
   const all = loadSegmentjaegerSelections();
   all[String(activityId)] = selection;
   try{ localStorage.setItem(SEGMENTJAEGER_SELECTION_KEY, JSON.stringify(all)); }catch(e){}
+  pushSyncSoon(SEGMENTJAEGER_SELECTION_KEY);
 }
 
 // Populates state.segmentjaegerSelection for the currently selected activity
@@ -6664,6 +6672,7 @@ function loadLocalFavoriteSegments(){
 }
 function saveLocalFavoriteSegments(map){
   try{ localStorage.setItem(LOCAL_FAVORITES_KEY, JSON.stringify(map)); }catch(e){}
+  pushSyncSoon(LOCAL_FAVORITES_KEY);
 }
 function isLocalFavorite(seg){
   return !!loadLocalFavoriteSegments()[seg.id];
@@ -8814,7 +8823,7 @@ function loadConfigOverrides(){
   try{ const raw = localStorage.getItem(TRAINER_SETTINGS_KEY); if(raw){ const p = JSON.parse(raw); if(p && typeof p==='object') return p; } }catch(e){}
   return {};
 }
-function saveConfigOverrides(obj){ try{ localStorage.setItem(TRAINER_SETTINGS_KEY, JSON.stringify(obj)); }catch(e){} }
+function saveConfigOverrides(obj){ try{ localStorage.setItem(TRAINER_SETTINGS_KEY, JSON.stringify(obj)); }catch(e){} pushSyncSoon(TRAINER_SETTINGS_KEY); }
 function deepMergeInto(target, source){
   Object.keys(source||{}).forEach(k => {
     const sv = source[k];
@@ -11021,6 +11030,7 @@ function loadTrainerRoutesByDate(){
 }
 function saveTrainerRoutesByDate(all){
   try{ localStorage.setItem(TRAINER_ROUTES_KEY, JSON.stringify(all)); }catch(e){}
+  pushSyncSoon(TRAINER_ROUTES_KEY);
 }
 function saveTrainerRouteForDate(dateKey, fileName, pts){
   const all = loadTrainerRoutesByDate();
@@ -11300,7 +11310,131 @@ function loadTrainerHistory(){
       typeof e.compliance === 'number' && isFinite(e.compliance) && typeof e.date === 'string');
   }catch(e){ return []; }
 }
-function saveTrainerHistory(list){ try{ localStorage.setItem(TRAINER_HISTORY_KEY, JSON.stringify(list.slice(-100))); }catch(e){} }
+function saveTrainerHistory(list){ try{ localStorage.setItem(TRAINER_HISTORY_KEY, JSON.stringify(list.slice(-100))); }catch(e){} pushSyncSoon(TRAINER_HISTORY_KEY); }
+
+// ---------- device sync ----------
+// Reifendruck, Kettenverschleiß, Einstellungen usw. waren bislang rein
+// geräte-/browser-gebundenes localStorage -- ein Fahrer, der die App auf
+// Laptop UND Handy nutzt, sah auf beiden unterschiedliche Daten. Diese Keys
+// werden jetzt automatisch mit dem bestehenden Cloudflare Worker (SYNC_
+// ENDPOINT, neue /sync-Route) synchronisiert, identifiziert über den eh
+// schon vorhandenen Strava-Login (state.accessToken) -- kein separates
+// Konto/Passwort nötig. Bewusst NUR diese 11 Keys, nicht jeder localStorage-
+// Key: der Rest sind reine, aus der Strava-API neu ladbare Caches
+// (Aktivitätenlisten, HR-/FTP-Analyse-Caches, Top-Strecken-Cache) oder
+// OAuth-Refresh-Tokens, die aus Sicherheitsgründen nie durch einen
+// Sync-Kanal laufen sollten. Dieser Block steht bewusst hier (statt weiter
+// oben bei den anderen storage-Helpern) -- SYNC_KEYS referenziert Key-
+// Konstanten wie PROFIL_GEAR_RESET_KEY/TRAINER_HISTORY_KEY, die als `const`
+// erst an ihrer eigenen Deklarationsstelle weiter oben im Skript existieren
+// (im Gegensatz zu den pushSyncSoon()-Aufrufen in den save*()-Funktionen
+// selbst, die als reine Funktionsdeklarationen unabhängig von der
+// Dateireihenfolge überall aufrufbar sind).
+const SYNC_KEYS = [
+  CONFIRMED_TESTS_KEY, "velocast_settings", PROFIL_GEAR_RESET_KEY,
+  CHAIN_WEAR_KEY, TIRE_PRESSURE_KEY, CHANGELOG_SEEN_KEY,
+  SEGMENTJAEGER_SELECTION_KEY, LOCAL_FAVORITES_KEY, TRAINER_SETTINGS_KEY,
+  TRAINER_HISTORY_KEY, TRAINER_ROUTES_KEY
+];
+// Rein lokale Buchführung (wird selbst NIE synchronisiert): pro Key, wann
+// dieses Gerät ihn zuletzt geändert hat -- Grundlage für den Pro-Key-Merge
+// beim Pull (siehe computeSyncMergePlan()).
+const SYNC_META_KEY = 'velocast_sync_meta';
+function loadSyncMeta(){
+  try{
+    const raw = localStorage.getItem(SYNC_META_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+  }catch(e){ return {}; }
+}
+function saveSyncMeta(meta){
+  try{ localStorage.setItem(SYNC_META_KEY, JSON.stringify(meta)); }catch(e){}
+}
+
+// Reine Entscheidungsfunktion, kein State-/Netzwerkzugriff (gleiches Muster
+// wie segmentjaegerComputeStarSyncPlan()): für jeden vom Server gelieferten
+// Key gewinnt der neuere Zeitstempel -- pro Key statt ein Zeitstempel fürs
+// ganze Bündel, damit zwei Geräte, die offline unterschiedliche Felder
+// ändern (z.B. Laptop = Reifendruck, Handy = Kette), sich beim nächsten
+// Sync nicht gegenseitig überschreiben.
+function computeSyncMergePlan(localMeta, remoteKeys){
+  const toApplyLocally = {};
+  const newLocalMeta = { ...(localMeta || {}) };
+  Object.keys(remoteKeys || {}).forEach(key => {
+    const remote = remoteKeys[key];
+    if(!remote || typeof remote.updatedAt !== 'number') return;
+    const localUpdatedAt = (localMeta && localMeta[key]) || 0;
+    if(remote.updatedAt > localUpdatedAt){
+      toApplyLocally[key] = remote.value;
+      newLocalMeta[key] = remote.updatedAt;
+    }
+  });
+  return { toApplyLocally, newLocalMeta };
+}
+
+// Debounced Push: jede save*()-Funktion der 11 SYNC_KEYS ruft das hier mit
+// ihrem eigenen Key auf. Sammelt "dirty" Keys 2s lang, schickt dann nur die
+// tatsächlich geänderten Keys (nicht das ganze Bündel) -- wichtig, weil
+// TRAINER_ROUTES_KEY potenziell groß ist (Streckenpunkte).
+let syncDirtyKeys = new Set();
+let syncPushTimer = null;
+function pushSyncSoon(key){
+  if(!SYNC_KEYS.includes(key)) return;
+  syncDirtyKeys.add(key);
+  const meta = loadSyncMeta();
+  meta[key] = Date.now();
+  saveSyncMeta(meta);
+  clearTimeout(syncPushTimer);
+  syncPushTimer = setTimeout(pushSyncNow, 2000);
+}
+async function pushSyncNow(){
+  if(!state.accessToken || syncDirtyKeys.size === 0) return;
+  const keys = Array.from(syncDirtyKeys);
+  const meta = loadSyncMeta();
+  const payload = {};
+  keys.forEach(key => {
+    payload[key] = { value: localStorage.getItem(key), updatedAt: meta[key] || Date.now() };
+  });
+  try{
+    await fetch(SYNC_ENDPOINT, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + state.accessToken },
+      body: JSON.stringify({ keys: payload })
+    });
+    keys.forEach(key => syncDirtyKeys.delete(key));
+  }catch(e){
+    // Offline/Worker nicht erreichbar: syncMeta ist schon geschrieben, kein
+    // Datenverlust -- einfach in 30s automatisch erneut versuchen, ohne auf
+    // die nächste Nutzeraktion zu warten.
+    syncPushTimer = setTimeout(pushSyncNow, 30000);
+  }
+}
+
+// Beim Start (init(), direkt nachdem state.accessToken gesetzt wurde und
+// BEVOR irgendetwas in dieser Session geändert werden konnte): holt den
+// aktuellen Sync-Stand, merged ihn rein lokal per computeSyncMergePlan()
+// und lädt bei jeder tatsächlichen Änderung einmalig neu -- die App liest
+// ihre "echten Daten"-Keys ohnehin nur einmal beim Start aus localStorage
+// in state, ein Reload nutzt genau diesen bestehenden Pfad wieder statt ihn
+// ein zweites Mal nachzubauen. Netzwerkfehler/kein Sync-Eintrag vorhanden
+// (z.B. allererster Aufruf) -> fail-open, App startet einfach mit den
+// vorhandenen lokalen Daten weiter.
+async function pullSyncOnLoad(){
+  if(!state.accessToken) return;
+  try{
+    const res = await fetch(SYNC_ENDPOINT, { headers: { Authorization: "Bearer " + state.accessToken } });
+    if(!res.ok) return;
+    const data = await res.json();
+    const localMeta = loadSyncMeta();
+    const { toApplyLocally, newLocalMeta } = computeSyncMergePlan(localMeta, (data && data.keys) || {});
+    if(Object.keys(toApplyLocally).length === 0) return;
+    Object.entries(toApplyLocally).forEach(([key, value]) => {
+      try{ localStorage.setItem(key, value); }catch(e){}
+    });
+    saveSyncMeta(newLocalMeta);
+    location.reload();
+  }catch(e){}
+}
 function recordEvaluation(goal, activityId, evaluation){
   if(!LEARNABLE_GOALS.includes(goal) || evaluation.complianceWeighted == null) return;
   const list = loadTrainerHistory();
@@ -13998,6 +14132,7 @@ async function init(){
         state.accessToken = tokenData.access_token;
         await saveToken(tokenData.refresh_token);
         state.connected = true;
+        await pullSyncOnLoad();
         await loadActivitiesAndSegments();
       }catch(e){
         // stored token invalid, stay on connect screen
