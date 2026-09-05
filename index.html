@@ -1653,13 +1653,14 @@ function renderRangeRingsRow(){
 // reused here for the Formkurve (CTL/ATL/TSB). No icon glyph (there's no
 // existing icon for these metrics the way there is for temp/rain/wind/uv),
 // so a caption sits below the ring instead.
-function renderValueRing({ label, value, unit, domainMin, domainMax, color, signed }){
+function renderValueRing({ label, value, unit, domainMin, domainMax, color, signed, decimals }){
   const size = 76, r = 30, cx = size/2, cy = size/2;
   const valueToAngle = v => Math.min(1, Math.max(0, (v - domainMin) / (domainMax - domainMin))) * 360;
   let endAngle = valueToAngle(value);
   if(endAngle < 8) endAngle = 8;
   const arcPath = describeArc(cx, cy, r, 0, endAngle);
-  const valueText = `${signed && value>0 ? '+' : ''}${Math.round(value)}${unit}`;
+  const shownValue = decimals ? value.toFixed(decimals) : Math.round(value);
+  const valueText = `${signed && value>0 ? '+' : ''}${shownValue}${unit}`;
   // Track/text colors resolved via cssVar() (not raw var(--token) literals)
   // to match `color` itself, which callers already pass in pre-resolved via
   // profilColors() -- keeps this function internally consistent rather than
@@ -11979,11 +11980,24 @@ function formatBudgetLine(budget){
 // own rings. "Ziel" stays a lone metricCard -- no ring equivalent for it --
 // in its own flex row (not `.metric-grid`, which would stretch a single
 // item to the full row width via its `1fr` auto-fit columns).
-function renderTrainerSummaryCards(appLoad, goalLabelText, isAuto){
+function renderTrainerSummaryCards(appLoad, goalLabelText, isAuto, acwr, freshnessClass){
   const ringsCard = el('div', {class:'card'});
-  ringsCard.appendChild(appLoad
+  const ringsRow = appLoad
     ? renderFormRingsRow(appLoad)
-    : el('div', {class:'empty-state'}, ['Noch keine Formkurve verfügbar.']));
+    : el('div', {class:'empty-state'}, ['Noch keine Formkurve verfügbar.']);
+  // Frische (ATL/CTL) as a 4th ring alongside CTL/ATL/TSB, added on top of
+  // renderFormRingsRow() rather than inside it since that function is
+  // shared with the Profil tab, which doesn't show an ACWR/Frische card at
+  // all -- adding it there would put a ring on Profil nothing currently
+  // reads. Color follows the same good/warn/danger verdict classification
+  // the old Frische metricCard already used (rp.freshnessClass), same
+  // reuse-existing-thresholds rationale as the TSB ring's formClass color.
+  if(appLoad && acwr!=null){
+    const cc = profilColors();
+    const freshColor = freshnessClass==='good' ? cc.tail : (freshnessClass==='warn' ? cc.cross : cc.head);
+    ringsRow.appendChild(renderValueRing({ label:"Frische (ATL/CTL)", value:acwr, unit:"", domainMin:0, domainMax:2, color:freshColor, decimals:2 }));
+  }
+  ringsCard.appendChild(ringsRow);
   const zielRow = el('div', {style:'display:flex; margin-bottom:16px;'}, [
     metricCard('Ziel', goalLabelText, isAuto?'automatisch · größter Hebel':'manuell gewählt')
   ]);
@@ -12787,7 +12801,7 @@ function renderTrainerPage(){
   const learnGoalKey = LEARNABLE_GOALS.includes(workoutGoalKey) ? workoutGoalKey : effectiveGoal;
   const analysisRides = pp.results.slice().sort((a,b)=>b.date-a.date).slice(0,25);
 
-  frag.appendChild(renderTrainerSummaryCards(rp.usingHr ? rp.blendedLoad : pp.trainingLoad, GOALS[chosen]?GOALS[chosen].label:chosen, chosen==='auto'));
+  frag.appendChild(renderTrainerSummaryCards(rp.usingHr ? rp.blendedLoad : pp.trainingLoad, GOALS[chosen]?GOALS[chosen].label:chosen, chosen==='auto', rp.acwr, rp.freshnessClass));
   frag.appendChild(renderTrainerContextCards(rp));
   frag.appendChild(renderTrainerGoalBar(chosen, rp));
   frag.appendChild(renderTrainerDecisionDashboard(trainingState, W, dashboardOpportunity, rp.usingHr && !pp.results.length, testSignal));
