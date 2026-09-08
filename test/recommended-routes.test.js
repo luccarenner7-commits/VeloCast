@@ -276,3 +276,47 @@ test('pickRecommendedRoutes', async (t) => {
     assert.deepEqual(plain(out[0].raw), { foo: 'bar' });
   });
 });
+
+// buildRecommendedCandidatePool(): not a pure function (reads state.stravaRoutes/
+// state.activities/state.recommendedOnlySavedRoutes directly), so tests here
+// go through get('state') to set up fixtures rather than passing parameters.
+// Only the state.recommendedOnlySavedRoutes toggle's filtering behavior is
+// covered -- the route/activity-shape mapping itself (selectionId/source/...)
+// is straightforward field copying with no branching worth a dedicated test.
+test('buildRecommendedCandidatePool', async (t) => {
+  function sampleRoute(id) {
+    return { id, name: 'Route ' + id, distance: 40000, elevation_gain: 300, map: { polyline: 'abc' } };
+  }
+  function sampleActivity(id) {
+    return { id, name: 'Ride ' + id, type: 'Ride', distance: 30000, total_elevation_gain: 200, map: { summary_polyline: 'xyz' } };
+  }
+
+  await t.test('recommendedOnlySavedRoutes off (default): both saved routes and activities are pooled', () => {
+    const { get } = loadApp();
+    const state = get('state');
+    state.stravaRoutes = [sampleRoute(1)];
+    state.activities = [sampleActivity(2)];
+    const pool = get('buildRecommendedCandidatePool')();
+    assert.deepEqual(plain(pool.map(c => c.source)), ['route', 'activity']);
+  });
+
+  await t.test('recommendedOnlySavedRoutes on: activities are excluded entirely, only saved routes remain', () => {
+    const { get } = loadApp();
+    const state = get('state');
+    state.stravaRoutes = [sampleRoute(1)];
+    state.activities = [sampleActivity(2)];
+    state.recommendedOnlySavedRoutes = true;
+    const pool = get('buildRecommendedCandidatePool')();
+    assert.deepEqual(plain(pool.map(c => c.source)), ['route']);
+  });
+
+  await t.test('recommendedOnlySavedRoutes on with no saved routes at all: pool is empty, not falling back to activities', () => {
+    const { get } = loadApp();
+    const state = get('state');
+    state.stravaRoutes = [];
+    state.activities = [sampleActivity(2)];
+    state.recommendedOnlySavedRoutes = true;
+    const pool = get('buildRecommendedCandidatePool')();
+    assert.deepEqual(plain(pool), []);
+  });
+});

@@ -1079,6 +1079,12 @@ let state = {
   navOpen: false, // left slide-in nav drawer open/closed
   activePage: "route", // "route" | "segments" | "segmentjaeger" | "profil" | "aktivitaeten" | "trainer" | "einstellungen" | "reifendruck" | "changelog" - which NAV_ITEMS entry is active
   routeSourceTab: "recommended", // "recommended" | "routes" | "activities" | "gpx"
+  // Restricts the "Empfohlen" candidate pool (see buildRecommendedCandidatePool())
+  // to state.stravaRoutes only, excluding state.activities. Off by default
+  // (both sources considered, unchanged existing behavior) -- `!= null` (not
+  // `||`) so an explicit saved `true` survives a reload, same convention as
+  // showKomChip/showQomChip above.
+  recommendedOnlySavedRoutes: savedSettings.recommendedOnlySavedRoutes != null ? savedSettings.recommendedOnlySavedRoutes : false,
   stravaRoutes: [], // saved/planned Strava routes, fetched lazily when that tab opens
   // Cached result for the "Empfohlen" tab: up to 3 wind-favorable candidates
   // (one per distance bucket <50/50-75/>=75km), picked from exactly what's
@@ -2301,7 +2307,8 @@ function saveSettings(){
       // irrelevantSegmentIds' declaration above.
       irrelevantSegmentIds: Object.keys(state.irrelevantSegmentIds),
       trainerGoal: state.trainerPage.goal,
-      equipmentMode: state.equipmentMode
+      equipmentMode: state.equipmentMode,
+      recommendedOnlySavedRoutes: state.recommendedOnlySavedRoutes
     }));
   }catch(e){}
   pushSyncSoon("velocast_settings");
@@ -4971,6 +4978,10 @@ async function ensureStravaRoutesLoaded(){
 // fetch of its own. Activities are filtered to ride-types with the SAME
 // condition the "Fahrten" tab's own row-building code uses (copied, not
 // reinvented, so the two tabs never disagree about what counts as a ride).
+// If state.recommendedOnlySavedRoutes is on, activities are skipped
+// entirely -- lets a rider who keeps their handful of go-to loops saved as
+// named Strava Routes get exactly those back, instead of also being
+// candidate-matched against their much larger and noisier activity history.
 // `selectionId` mirrors each source's own selection-matching convention
 // (see selectStravaRoute()/selectActivity(): a route's state.selectedActivity.id
 // is the prefixed "route-<id>" key, an activity's is the raw numeric id) so
@@ -4991,6 +5002,7 @@ function buildRecommendedCandidatePool(){
       raw: route
     });
   });
+  if(state.recommendedOnlySavedRoutes) return candidates;
   state.activities
     .filter(a => a.type === "Ride" || a.type === "VirtualRide" || a.type === "GravelRide" || a.type === "MountainBikeRide" || !a.type)
     .forEach(a=>{
@@ -5071,13 +5083,15 @@ async function recomputeRecommendedRoutes(poolKey){
 // since the cached computation: neither state.startTime nor the underlying
 // candidate pool (state.stravaRoutes/state.activities, fingerprinted by
 // length -- cheap and good enough, since both only ever grow via their own
-// lazy/startup loaders, never shrink mid-session). Safe to call on every
-// render while the Empfohlen tab is active (see render()'s
-// requestAnimationFrame block) or after every debounced Startzeit change --
-// the loading guard below prevents overlapping fetches.
+// lazy/startup loaders, never shrink mid-session -- plus
+// state.recommendedOnlySavedRoutes, since flipping that toggle changes the
+// pool without changing either length). Safe to call on every render while
+// the Empfohlen tab is active (see render()'s requestAnimationFrame block)
+// or after every debounced Startzeit change -- the loading guard below
+// prevents overlapping fetches.
 async function recomputeRecommendedRoutesIfNeeded(){
   if(state.loading.recommended) return;
-  const poolKey = state.stravaRoutes.length + "|" + state.activities.length;
+  const poolKey = state.stravaRoutes.length + "|" + state.activities.length + "|" + (state.recommendedOnlySavedRoutes ? 1 : 0);
   const cached = state.recommendedRoutes;
   if(cached && cached.computedAtStartTime === state.startTime && cached.poolKey === poolKey) return;
   await recomputeRecommendedRoutes(poolKey);
@@ -13943,6 +13957,27 @@ function renderEinstellungenPage(){
     ])
   ]));
   frag.appendChild(segmentDisplayCard);
+
+  // Restricts the "Empfohlen" tab's candidate pool to saved Strava Routes
+  // only (see buildRecommendedCandidatePool()/state.recommendedOnlySavedRoutes)
+  // -- for riders who keep a handful of named go-to loops saved as Strava
+  // Routes and want exactly those ranked by wind, not their whole activity
+  // history mixed in.
+  const recommendedCard = el('div', {class:'card'});
+  recommendedCard.appendChild(el('h2', {}, ['Empfohlene Strecken']));
+  recommendedCard.appendChild(renderToggleSwitch(
+    state.recommendedOnlySavedRoutes,
+    "Nur gespeicherte Strecken berücksichtigen",
+    ()=>{
+      state.recommendedOnlySavedRoutes = !state.recommendedOnlySavedRoutes;
+      saveSettings();
+      render();
+    }
+  ));
+  recommendedCard.appendChild(el('div', {class:'muted', style:'font-size:12px; margin-top:-6px;'}, [
+    'Wenn aktiv, werden für die Empfohlen-Kacheln nur deine gespeicherten Strava-Routen berücksichtigt, keine vergangenen Fahrten.'
+  ]));
+  frag.appendChild(recommendedCard);
 
   frag.appendChild(buildEquipmentModeCard());
 
