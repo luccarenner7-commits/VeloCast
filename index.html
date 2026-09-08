@@ -505,6 +505,25 @@
   .tag.mini{ padding:3px 6px; font-size:10px; }
   .wind-mix-mini{ display:flex; gap:var(--space-1); flex-shrink:0; }
 
+  /* "Empfohlen" tab tiles — deliberately NOT the full-width .activity rows
+     the Routen/Fahrten tabs use (per product decision): compact, roughly-
+     square cards side by side. "Roughly square" is carried by the fixed-
+     height thumbnail rather than the whole tile (the name/meta/tag below it
+     still needs its own room without fighting variable text length). Same
+     3-columns-desktop/1-column-mobile pattern as the app's other
+     @media (max-width:620px) breakpoints (e.g. .settings-row above). */
+  .recommended-grid{ display:grid; grid-template-columns:repeat(3, 1fr); gap:var(--space-3); margin-bottom:14px; }
+  @media (max-width:620px){ .recommended-grid{ grid-template-columns:1fr; } }
+  .recommended-tile{
+    display:flex; flex-direction:column; gap:6px; cursor:pointer;
+    padding:10px; border:1px solid var(--line); border-radius:var(--r-md); background:var(--asphalt);
+  }
+  .recommended-tile:hover{ border-color:var(--route); }
+  .recommended-tile.selected{ border-color:var(--route); background:var(--route-bg); }
+  .recommended-thumb{ width:100%; height:100px; background:var(--asphalt-3); border-radius:var(--r-sm); overflow:hidden; }
+  .recommended-tile .name{ font-weight:600; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .recommended-tile .meta{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); }
+
   /* Weather chip: temperature is the hero numeral (principle: oversized
      primary metric, muted secondary text underneath). */
   .weather-strip{ display:flex; gap:12px; overflow-x:auto; padding-bottom:4px; }
@@ -1059,8 +1078,18 @@ let state = {
   segmentjaegerSyncRunning: false,
   navOpen: false, // left slide-in nav drawer open/closed
   activePage: "route", // "route" | "segments" | "segmentjaeger" | "profil" | "aktivitaeten" | "trainer" | "einstellungen" | "reifendruck" | "changelog" - which NAV_ITEMS entry is active
-  routeSourceTab: "activities", // "routes" | "activities" | "gpx"
+  routeSourceTab: "recommended", // "recommended" | "routes" | "activities" | "gpx"
   stravaRoutes: [], // saved/planned Strava routes, fetched lazily when that tab opens
+  // Cached result for the "Empfohlen" tab: up to 3 wind-favorable candidates
+  // (one per distance bucket <50/50-75/>=75km), picked from exactly what's
+  // already loaded for the "Routen"/"Fahrten" tabs (state.stravaRoutes/
+  // state.activities) -- no separate fetch/cache machinery of its own. Shape:
+  // {computedAtStartTime, poolKey, tiles:[...]}, or null before the first
+  // computation. `computedAtStartTime`/`poolKey` let
+  // recomputeRecommendedRoutesIfNeeded() skip recomputing when nothing that
+  // could change the result actually changed (see there). See
+  // ensureRecommendedRoutesLoaded()/recomputeRecommendedRoutes().
+  recommendedRoutes: null,
   routeInfoTab: "elevation", // "elevation" | "climbs" | "beststart"
   elevationProfile: null, // {distances:[km,...], elevations:[m,...]} for the current route, or null if not (yet) loaded
   climbIndex: 0, // which detected climb is shown in the Anstiege tab
@@ -1429,6 +1458,87 @@ function computeWindMixForRange(fromKm, toKm){
   const crossPct = Math.round(crossDist / totalDist * 100);
   const headPct = Math.max(0, 100 - tailPct - crossPct);
   return { tailPct, crossPct, headPct };
+}
+
+// ---------- "Empfohlen" tab: wind-based route recommendation ----------
+// Two pure functions behind the Empfohlen tab (renderRecommendedRoutesTab()
+// further down). Both take every input as a parameter -- no state, no
+// network -- so they can be unit-tested directly (test/recommended-routes.test.js)
+// without mocking fetch, and so the (up to ~38-candidate) batched scoring
+// pass in recomputeRecommendedRoutes() stays cheap: one Open-Meteo call for
+// all candidates' start points (see ensureWindField()'s comma-joined
+// lats/lons technique, reused there), then this pure per-candidate math.
+
+// Scores one candidate's coarse ~1km leg breakdown (bearing + own length,
+// built by the caller the same way ensureListItemWindTag() already builds
+// its leg list: pickRoutePoints(coords, LIST_ITEM_WIND_STEP_KM) + a chord
+// bearing per leg) against that SAME candidate's own batched hourly
+// forecast (Open-Meteo's per-location `{time:[...], wind_speed_10m:[...],
+// wind_direction_10m:[...]}` shape). For each leg, walks the route's
+// cumulative distance forward and looks up the nearest hourly slot to that
+// leg's estimated arrival time (estimateArrival(), same helper
+// loadRouteWeather() uses; "nearest hourly slot" is the same technique
+// ensureWindField() already uses for its grid points) -- so a long ride
+// starting into a headwind that turns favorable by the time it arrives
+// later legs is scored with the wind it will actually meet, not "now"'s
+// wind smeared across the whole route. Classifies each leg via
+// windRelative() and distance-weights the tail/cross/head mix across the
+// whole candidate, same pattern as computeWindMixForRange() above (a long
+// tailwind leg + a short headwind leg skews toward tailwind). windScore is
+// the single ranking scalar pickRecommendedRoutes() sorts by.
+function scoreRouteWindForStartTime(legs, hourlyForecast, startDate, avgSpeedKmh){
+  const hours = (hourlyForecast && hourlyForecast.time) || [];
+  const windDirs = (hourlyForecast && hourlyForecast.wind_direction_10m) || [];
+  let tailDist = 0, crossDist = 0, totalDist = 0, cumKm = 0;
+  for(const leg of legs){
+    const dist = leg.distanceKm;
+    cumKm += dist;
+    if(dist <= 0 || !hours.length) continue;
+    const arrival = estimateArrival(startDate, cumKm, avgSpeedKmh);
+    let idx = 0, best = Infinity;
+    hours.forEach((t, hi)=>{
+      const diff = Math.abs(new Date(t) - arrival);
+      if(diff < best){ best = diff; idx = hi; }
+    });
+    // Guard against a malformed forecast slot (missing wind_direction_10m):
+    // windRelative(bearing, undefined) compares against NaN, which fails
+    // both the tail and head angle checks and falls through to "cross" --
+    // silently misreporting "no data" as "100% crosswind". Skip the leg
+    // entirely instead so it just doesn't contribute to the mix.
+    if(!Number.isFinite(windDirs[idx])) continue;
+    const rel = windRelative(leg.bearing, windDirs[idx]);
+    if(rel.type === "tail") tailDist += dist;
+    else if(rel.type === "cross") crossDist += dist;
+    totalDist += dist;
+  }
+  if(totalDist <= 0) return { tailPct:0, crossPct:0, headPct:0, windScore:0 };
+  const tailPct = Math.round(tailDist / totalDist * 100);
+  const crossPct = Math.round(crossDist / totalDist * 100);
+  const headPct = Math.max(0, 100 - tailPct - crossPct);
+  return { tailPct, crossPct, headPct, windScore: tailPct - headPct };
+}
+
+// Groups already wind-scored candidates (each needing at least `distanceKm`
+// and `windScore`, plus whatever else the caller wants passed through
+// untouched) into the Empfohlen tab's three distance buckets --
+// <50km / 50-75km / >=75km, boundaries exactly as specced (50/75 themselves
+// fall into the LOWER-distance side of their bucket, i.e. the upper bucket
+// starts strictly above its lower bound's own membership: 50.0 -> the
+// 50-75 bucket, 75.0 -> the >=75 bucket) -- and keeps only the single
+// highest-windScore candidate per bucket. A bucket with no candidates is
+// silently omitted from the result (never padded with a placeholder), so
+// the caller can end up with anywhere from 0 to 3 tiles.
+function pickRecommendedRoutes(scoredCandidates){
+  const buckets = [[], [], []]; // <50, 50-75, >=75
+  for(const c of scoredCandidates){
+    const km = c.distanceKm;
+    if(km < 50) buckets[0].push(c);
+    else if(km < 75) buckets[1].push(c);
+    else buckets[2].push(c);
+  }
+  return buckets
+    .map(bucket => bucket.reduce((best, c) => (!best || c.windScore > best.windScore) ? c : best, null))
+    .filter(Boolean);
 }
 
 // Whole-route wind mix — same computation as computeWindMixForRange, just
@@ -4207,6 +4317,10 @@ function resetConnectionState(){
   state.routeSegmentsFetched = false;
   state.routeSegmentsError = null;
   state.stravaRoutes = [];
+  // Derived from stravaRoutes/activities above (both just wiped) -- stale
+  // tiles referencing a now-invalidated token's routes/activities must not
+  // survive a disconnect, same reasoning as routeWindCache below.
+  state.recommendedRoutes = null;
   state.elevationProfile = null;
   state.windFieldPoints = null;
   state.windFieldEnabled = false;
@@ -4351,6 +4465,19 @@ function render(){
     mountAktivitaetenChart();
     // Same contract again, for the Trainer tab's single workout-preview chart.
     mountTrainerChart();
+    // "Empfohlen" is the default routeSourceTab, so its computation needs to
+    // kick off on the very first render too, not only on an explicit tab
+    // click (ensureRecommendedRoutesLoaded()'s own guards make repeat calls
+    // on every render cheap/no-op once computed). Deferred into this rAF
+    // block rather than called directly from renderRecommendedRoutesTab()'s
+    // synchronous body for the same reason mountFullRouteView() calls
+    // ensureWindField() from here instead of during the render() tree-build
+    // above: both call render() synchronously before their first await,
+    // which would reenter the render() call still in progress if triggered
+    // any earlier.
+    if(state.connected && state.routeSourceTab === "recommended"){
+      ensureRecommendedRoutesLoaded();
+    }
     // Mac Safari (user-reported) can leave a persistent <select>/<input> that
     // was just detached+reattached by the app.innerHTML="" rebuild above in a
     // stale native-rendering state — e.g. routeSegmentSortSelect showing an
@@ -4824,6 +4951,7 @@ function selectRouteSourceTab(tab){
   state.routeSourceTab = tab;
   render();
   if(tab === "routes") ensureStravaRoutesLoaded();
+  else if(tab === "recommended") ensureRecommendedRoutesLoaded();
 }
 
 async function ensureStravaRoutesLoaded(){
@@ -4836,6 +4964,138 @@ async function ensureStravaRoutesLoaded(){
   }
   state.loading.routes = false;
   render();
+}
+
+// Candidate pool for the "Empfohlen" tab -- exactly what's already loaded
+// for the adjacent "Routen"/"Fahrten" tabs on this same screen, no separate
+// fetch of its own. Activities are filtered to ride-types with the SAME
+// condition the "Fahrten" tab's own row-building code uses (copied, not
+// reinvented, so the two tabs never disagree about what counts as a ride).
+// `selectionId` mirrors each source's own selection-matching convention
+// (see selectStravaRoute()/selectActivity(): a route's state.selectedActivity.id
+// is the prefixed "route-<id>" key, an activity's is the raw numeric id) so
+// a tile's "selected" highlight lines up with the equivalent Routen/Fahrten
+// row without reimplementing that comparison.
+function buildRecommendedCandidatePool(){
+  const candidates = [];
+  state.stravaRoutes.forEach(route=>{
+    const poly = route.map && (route.map.polyline || route.map.summary_polyline);
+    if(!poly) return;
+    candidates.push({
+      selectionId: "route-" + route.id,
+      name: route.name,
+      distanceKm: route.distance / 1000,
+      elevationGain: route.elevation_gain || 0,
+      polyline: poly,
+      source: "route",
+      raw: route
+    });
+  });
+  state.activities
+    .filter(a => a.type === "Ride" || a.type === "VirtualRide" || a.type === "GravelRide" || a.type === "MountainBikeRide" || !a.type)
+    .forEach(a=>{
+      const poly = a.map && a.map.summary_polyline;
+      if(!poly) return;
+      candidates.push({
+        selectionId: a.id,
+        name: a.name,
+        distanceKm: a.distance / 1000,
+        elevationGain: a.total_elevation_gain || 0,
+        polyline: poly,
+        source: "activity",
+        raw: a
+      });
+    });
+  return candidates;
+}
+
+// Recomputes state.recommendedRoutes from scratch: decodes every
+// candidate's polyline, batches ALL of their start coordinates into ONE
+// Open-Meteo call (exact same comma-joined-lats/lons technique as
+// ensureWindField()), then for each candidate builds the same coarse ~1km
+// leg breakdown ensureListItemWindTag() already builds for its list-chip
+// wind mix, and scores it with the pure scoreRouteWindForStartTime() against
+// THAT candidate's own returned forecast. Fails open (empty tiles, no
+// crash) on any network/parsing error, same philosophy as
+// ensureWindField()'s own catch block.
+async function recomputeRecommendedRoutes(poolKey){
+  state.loading.recommended = true; render();
+  let tiles = [];
+  try{
+    const candidates = buildRecommendedCandidatePool();
+    const decoded = candidates
+      .map(c => ({ ...c, coords: decodePolyline(c.polyline) }))
+      .filter(c => c.coords.length >= 2);
+    if(decoded.length){
+      const lats = decoded.map(c => c.coords[0][0].toFixed(3)).join(",");
+      const lons = decoded.map(c => c.coords[0][1].toFixed(3)).join(",");
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=wind_speed_10m,wind_direction_10m&forecast_days=7&timezone=auto`;
+      const res = await fetch(url);
+      if(!res.ok) throw new Error("Winddaten nicht verfügbar");
+      const data = await res.json();
+      const results = Array.isArray(data) ? data : [data];
+      const startDate = new Date(state.startTime);
+      const scored = decoded.map((c, i)=>{
+        const cumDist = buildCumulativeDistances(c.coords);
+        const points = pickRoutePoints(c.coords, cumDist, LIST_ITEM_WIND_STEP_KM);
+        const legs = [];
+        for(let j=0;j<points.length-1;j++){
+          const dist = points[j+1].distanceKm - points[j].distanceKm;
+          if(dist <= 0) continue;
+          const bearing = bearingBetween(c.coords[points[j].idx], c.coords[points[j+1].idx]);
+          legs.push({ bearing, distanceKm: dist });
+        }
+        const wind = scoreRouteWindForStartTime(legs, results[i] && results[i].hourly, startDate, state.avgSpeedKmh);
+        return {
+          selectionId: c.selectionId, name: c.name, distanceKm: c.distanceKm,
+          elevationGain: c.elevationGain, source: c.source, raw: c.raw,
+          // Built once here (not per render()) -- c.polyline can be a
+          // full-resolution route polyline (thousands of points), and this
+          // tile re-renders on every Strecke-page render() while the
+          // Empfohlen tab is active.
+          thumbSvg: buildRouteThumbnailSvg(c.polyline),
+          ...wind
+        };
+      });
+      tiles = pickRecommendedRoutes(scored);
+    }
+  }catch(e){
+    tiles = [];
+  }
+  state.recommendedRoutes = { computedAtStartTime: state.startTime, poolKey, tiles };
+  state.loading.recommended = false;
+  render();
+}
+
+// Skips recomputing when nothing that could change the result has changed
+// since the cached computation: neither state.startTime nor the underlying
+// candidate pool (state.stravaRoutes/state.activities, fingerprinted by
+// length -- cheap and good enough, since both only ever grow via their own
+// lazy/startup loaders, never shrink mid-session). Safe to call on every
+// render while the Empfohlen tab is active (see render()'s
+// requestAnimationFrame block) or after every debounced Startzeit change --
+// the loading guard below prevents overlapping fetches.
+async function recomputeRecommendedRoutesIfNeeded(){
+  if(state.loading.recommended) return;
+  const poolKey = state.stravaRoutes.length + "|" + state.activities.length;
+  const cached = state.recommendedRoutes;
+  if(cached && cached.computedAtStartTime === state.startTime && cached.poolKey === poolKey) return;
+  await recomputeRecommendedRoutes(poolKey);
+}
+
+// Lazy trigger for the "Empfohlen" tab -- mirrors ensureStravaRoutesLoaded()'s
+// lazy-on-tab-switch pattern (and explicitly reuses it, since the
+// recommendation pool needs state.stravaRoutes loaded too), but ALSO needs
+// to fire on the very first render: unlike "routes"/"activities",
+// "recommended" is now the initial default routeSourceTab, so there is no
+// guaranteed prior tab-switch click to hang a trigger off of (see the
+// render()/requestAnimationFrame call site below, deferred there rather
+// than called directly from renderRecommendedRoutesTab() itself, so a
+// render() triggered synchronously by ensureStravaRoutesLoaded() can never
+// reenter the render() call currently building the DOM tree).
+async function ensureRecommendedRoutesLoaded(){
+  await ensureStravaRoutesLoaded();
+  await recomputeRecommendedRoutesIfNeeded();
 }
 
 async function selectStravaRoute(route){
@@ -5603,19 +5863,94 @@ function renderRoutePersistentSettingsRow(card){
   card.appendChild(el("div", {style:"margin-bottom:12px;"}, [infoButton("Wetterwerte werden jeweils für den erwarteten Ankunftszeitpunkt an diesem Punkt berechnet.")]));
 }
 
+// Simple lat/lon -> SVG viewBox linear (equirectangular) projection for the
+// Empfohlen tab's compact route-shape thumbnails -- no need for real map
+// projection math at tile size/zoom, just a recognizable silhouette.
+// Longitude is scaled by cos(mean latitude) so the shape isn't visibly
+// stretched east-west. Same "build an SVG string via template literal"
+// convention as buildElevationChartSvg() above, returned for use via
+// el('div', {html:svg}).
+function buildRouteThumbnailSvg(polyline){
+  const coords = decodePolyline(polyline);
+  if(coords.length < 2) return "";
+  const width = 160, height = 100, pad = 8;
+  const lats = coords.map(c=>c[0]), lons = coords.map(c=>c[1]);
+  const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons), maxLon = Math.max(...lons);
+  const lonScale = Math.cos((minLat + maxLat) / 2 * Math.PI / 180);
+  const spanX = Math.max(1e-6, (maxLon - minLon) * lonScale);
+  const spanY = Math.max(1e-6, maxLat - minLat);
+  const scale = Math.min((width - pad*2) / spanX, (height - pad*2) / spanY);
+  const offX = pad + ((width - pad*2) - spanX*scale) / 2;
+  const offY = pad + ((height - pad*2) - spanY*scale) / 2;
+  const x = lon => offX + (lon - minLon) * lonScale * scale;
+  const y = lat => offY + (maxLat - lat) * scale; // flip: lat increases north, SVG y increases down
+  let path = `M ${x(coords[0][1]).toFixed(1)} ${y(coords[0][0]).toFixed(1)}`;
+  for(let i=1;i<coords.length;i++){
+    path += ` L ${x(coords[i][1]).toFixed(1)} ${y(coords[i][0]).toFixed(1)}`;
+  }
+  return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet" style="width:100%; height:100%; display:block;">
+    <path d="${path}" fill="none" stroke="${cssVar('--route')}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+}
+
+// One compact tile for the Empfohlen tab's grid — same click-through
+// contract as the equivalent Routen/Fahrten row (selectStravaRoute()/
+// selectActivity() on the SAME underlying object recomputeRecommendedRoutes()
+// already attached as `tile.raw`), just a different, denser visual shape
+// (square-ish thumbnail card instead of a full-width row).
+function renderRecommendedTile(tile){
+  const isSel = state.selectedActivity && state.selectedActivity.id === tile.selectionId;
+  const km = tile.distanceKm.toFixed(1);
+  const hm = Math.round(tile.elevationGain || 0);
+  const onclick = tile.source === "route" ? (()=>selectStravaRoute(tile.raw)) : (()=>selectActivity(tile.raw));
+  // Dominant wind type for the single chip shown here (tile is compact —
+  // full tail/cross/head breakdown stays reserved for the Routen/Fahrten
+  // rows' .wind-mix-mini via renderListItemWindTag()).
+  let dominant = { type:"tail", pct:tile.tailPct, label:"Rückenwind" };
+  if(tile.crossPct > dominant.pct) dominant = { type:"cross", pct:tile.crossPct, label:"Seitenwind" };
+  if(tile.headPct > dominant.pct) dominant = { type:"head", pct:tile.headPct, label:"Gegenwind" };
+  return el("div", {class:"recommended-tile" + (isSel?" selected":""), onclick}, [
+    el("div", {class:"recommended-thumb", html: tile.thumbSvg}),
+    el("div", {class:"name"}, [tile.name]),
+    el("div", {class:"meta"}, [`${km} km · ${hm} Hm`]),
+    el("div", {class:"tag mini " + dominant.type}, [`${dominant.label} ${dominant.pct}%`])
+  ]);
+}
+
+// "Empfohlen" tab body: up to 3 tiles (one per distance bucket), computed
+// lazily by ensureRecommendedRoutesLoaded() (see render()'s
+// requestAnimationFrame block for the initial-default-tab trigger, and
+// selectRouteSourceTab() for the explicit-tab-click trigger). Same
+// loading/empty-state shape as the "routes"/"activities" tabs right below
+// this function for consistency, just its own grid instead of a row list.
+function renderRecommendedRoutesTab(card){
+  if(state.loading.recommended){
+    card.appendChild(el("div", {class:"loading"}, ["Berechne Empfehlungen…"]));
+    return;
+  }
+  const tiles = (state.recommendedRoutes && state.recommendedRoutes.tiles) || [];
+  if(tiles.length){
+    card.appendChild(el("div", {class:"recommended-grid"}, tiles.map(renderRecommendedTile)));
+  } else {
+    card.appendChild(el("div", {class:"empty-state"}, ["Keine Streckenvorschläge verfügbar."]));
+  }
+}
+
 function renderRouteSourceTabs(card){
   {
     const tabs = [];
     if(state.connected){
+      tabs.push({id:"recommended", label:"Empfohlen"});
       tabs.push({id:"routes", label:"Routen"});
       tabs.push({id:"activities", label:"Fahrten"});
     }
     tabs.push({id:"gpx", label:"GPX"});
     // routeSourceTab may point at a tab that isn't currently visible (e.g.
-    // "activities" is the initial default but hidden until Strava is
+    // "recommended" is the initial default but hidden until Strava is
     // connected) - fall back to something that's actually shown.
     if(!tabs.some(t => t.id === state.routeSourceTab)){
-      state.routeSourceTab = state.connected ? "routes" : "gpx";
+      state.routeSourceTab = state.connected ? "recommended" : "gpx";
     }
 
     card.appendChild(el("div", {class:"source-tabs"}, tabs.map(t =>
@@ -5625,7 +5960,9 @@ function renderRouteSourceTabs(card){
       }, [t.label])
     )));
 
-    if(state.routeSourceTab === "routes"){
+    if(state.routeSourceTab === "recommended"){
+      renderRecommendedRoutesTab(card);
+    } else if(state.routeSourceTab === "routes"){
       if(state.loading.routes){
         card.appendChild(el("div", {class:"loading"}, ["Lade Routen…"]));
       } else if(state.stravaRoutes.length){
@@ -5928,7 +6265,17 @@ const startTimeInput = el("input", {
   onchange:(e)=>{
     state.startTime = e.target.value;
     clearTimeout(startTimeChangeTimer);
-    startTimeChangeTimer = setTimeout(loadRouteWeather, 600);
+    startTimeChangeTimer = setTimeout(()=>{
+      loadRouteWeather();
+      // Empfohlen's wind ranking depends on state.startTime exactly like the
+      // route-page wind computation above -- same debounce, reused rather
+      // than a second parallel timer. Only recomputes if it was already
+      // computed at least once (state.recommendedRoutes !== null); before
+      // that, the tab's own lazy trigger (see render()'s
+      // requestAnimationFrame block) is what kicks it off, same "compute
+      // once when first opened" contract as the other tabs.
+      if(state.recommendedRoutes) recomputeRecommendedRoutesIfNeeded();
+    }, 600);
   }
 });
 const avgSpeedInput = el("input", {
