@@ -110,6 +110,67 @@ function makeLocalStorageStub(seed) {
   };
 }
 
+// Minimal GPX-only DOMParser stub -- NOT a general XML/DOM parser. Supports
+// exactly the narrow surface parseGpxTrack() (index.html, "---------- GPX
+// import ----------" section) exercises: `new DOMParser().parseFromString(xml,
+// mime)` -> a "document" exposing `.querySelector("parsererror")` (a truthy
+// value on malformed/non-XML input, falsy otherwise -- used purely as an
+// early-bail error signal) and `.querySelectorAll("trkpt, rtept")` (an
+// iterable of element-stubs, immediately spread into an array by the caller).
+// Each element-stub exposes `.getAttribute("lat"|"lon")` (string or null) and
+// `.querySelector("ele")` (another element-stub, or null, with `.textContent`
+// giving the elevation string). Implemented with plain regex scanning rather
+// than a real parser -- this repo deliberately ships zero npm dependencies
+// (no jsdom, no XML library; see package.json), and DOMParser has exactly one
+// call site in the whole app, so a hand-written stub covering only that
+// call's actual usage is the right amount of machinery.
+function makeGpxNodeStub(innerXml, attrs) {
+  return {
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
+    },
+    querySelector(selector) {
+      if (selector !== 'ele') return null;
+      const m = /<ele\b[^>]*>([\s\S]*?)<\/ele>/.exec(innerXml);
+      return m ? { textContent: m[1] } : null;
+    },
+  };
+}
+function parseGpxAttrs(attrsStr) {
+  const attrs = {};
+  const attrRe = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*"([^"]*)"/g;
+  let m;
+  while ((m = attrRe.exec(attrsStr))) attrs[m[1]] = m[2];
+  return attrs;
+}
+class DOMParserStub {
+  parseFromString(xmlText) {
+    const text = String(xmlText == null ? '' : xmlText);
+    // Heuristic "well-formed enough" check, used only to decide
+    // querySelector("parsererror")'s truthy/falsy return -- parseGpxTrack()
+    // bails early on it as a signal and nothing else in the app depends on
+    // it being precise, so "does this even start like XML" is enough: text
+    // must open with an XML declaration or an opening tag.
+    const looksLikeXml = /^\s*(<\?xml\b|<[a-zA-Z])/.test(text);
+    return {
+      querySelector(selector) {
+        if (selector === 'parsererror') return looksLikeXml ? null : { textContent: 'not well-formed' };
+        return null;
+      },
+      querySelectorAll(selector) {
+        if (selector !== 'trkpt, rtept') return [];
+        const out = [];
+        const tagRe = /<(trkpt|rtept)\b([^>]*?)(?:\/>|>([\s\S]*?)<\/\1>)/g;
+        let m;
+        while ((m = tagRe.exec(text))) {
+          out.push(makeGpxNodeStub(m[3] || '', parseGpxAttrs(m[2] || '')));
+        }
+        return out;
+      },
+    };
+  }
+}
+
 // Loads a fresh copy of the app script into a brand-new vm context and
 // returns { ctx, get }, where `get(name)` reads a top-level binding
 // (function/const/`state`) back out of that context's global scope.
@@ -133,6 +194,7 @@ function loadApp({ onFetchCall, initialLocalStorage } = {}) {
     localStorage: makeLocalStorageStub(initialLocalStorage),
     fetch: fetchStub,
     navigator: { userAgent: 'node-test-sandbox', onLine: true },
+    DOMParser: DOMParserStub,
     URLSearchParams,
     history: { replaceState() {} },
     requestAnimationFrame(cb) { return setTimeout(cb, 0); },
@@ -161,7 +223,7 @@ function loadApp({ onFetchCall, initialLocalStorage } = {}) {
   // touching index.html itself. Listed explicitly (rather than trying to
   // auto-discover every top-level const) so a typo here fails loudly as a
   // ReferenceError instead of silently returning undefined.
-  const exposedSrc = `${scriptSrc}\n;globalThis.__exposed = { state, BEARING_SMOOTHING_WINDOW_KM, MMP_DURATIONS_SEC, CEILING_WINDOW_DAYS, POWER_ZONE_META, computeTargetPressureBar, computeLossRateBarPerDay, updateLearnedRateBarPerDay, estimateCurrentPressureBar, isPressureLow, getWheelTargetBar, computeTirePressureReminder, defaultTirePressureData, applyNachmessenUpdate, gearWearStatus, sumRiddenDistanceM, getChainWearDistanceM, computeChainWearReminder, applyChainWearReset, defaultChainWearData, loadAktivitaetenListCache, saveAktivitaetenListCache, decodePolyline, haversineKm, buildCumulativeDistances, estimateArrival, indexAtDistance, weightedLinearRegression, parseIsoDateUTC, toIsoDate, addDaysUTC, mondayOfUTC, computeTestDueSignal, TEST_DURATIONS_SEC, TEST_DURATION_CLASS, TEST_STALENESS_DAYS, xmlEscape, fitCrc, fitString, slugify, segmentjaegerIsDefaultEligible, segmentjaegerComputeDefaults, segmentjaegerFavorableWind, segmentjaegerGapSeconds, loadSegmentjaegerSelections, saveSegmentjaegerSelection, ensureSegmentjaegerSelection, toggleSegmentjaegerSelection, SEGMENTJAEGER_XOM_TOLERANCE, SEGMENTJAEGER_SELECTION_KEY, SEGMENTJAEGER_POTENTIAL_CEILING, segmentPotentialValue, loadLocalFavoriteSegments, saveLocalFavoriteSegments, isLocalFavorite, toggleLocalFavorite, migrateStarredSegmentsToLocalFavorites, mergeFavoritesFromStarred, LOCAL_FAVORITES_KEY, LOCAL_FAVORITES_MIGRATED_KEY, fetchStarredSegments, segmentjaegerComputeStarSyncPlan, syncSegmentjaegerStars, applySegmentStar, resetRouteSegments, computeSegmentStatChips, computeRideEffortStatChips, buildXomChip, segmentIsStarred, fmtDuration, parseDuration, evaluateWorkout, TRAINING_CONFIG, buildZwo, buildFit, buildCourseFit, downsampleRoutePoints, stepTargetValue, computeSyncMergePlan, SYNC_KEYS };\n`;
+  const exposedSrc = `${scriptSrc}\n;globalThis.__exposed = { state, BEARING_SMOOTHING_WINDOW_KM, MMP_DURATIONS_SEC, CEILING_WINDOW_DAYS, POWER_ZONE_META, computeTargetPressureBar, computeLossRateBarPerDay, updateLearnedRateBarPerDay, estimateCurrentPressureBar, isPressureLow, getWheelTargetBar, computeTirePressureReminder, defaultTirePressureData, applyNachmessenUpdate, gearWearStatus, sumRiddenDistanceM, getChainWearDistanceM, computeChainWearReminder, applyChainWearReset, defaultChainWearData, loadAktivitaetenListCache, saveAktivitaetenListCache, decodePolyline, haversineKm, buildCumulativeDistances, estimateArrival, indexAtDistance, weightedLinearRegression, parseIsoDateUTC, toIsoDate, addDaysUTC, mondayOfUTC, computeTestDueSignal, TEST_DURATIONS_SEC, TEST_DURATION_CLASS, TEST_STALENESS_DAYS, xmlEscape, fitCrc, fitString, slugify, segmentjaegerIsDefaultEligible, segmentjaegerComputeDefaults, segmentjaegerFavorableWind, segmentjaegerGapSeconds, loadSegmentjaegerSelections, saveSegmentjaegerSelection, ensureSegmentjaegerSelection, toggleSegmentjaegerSelection, SEGMENTJAEGER_XOM_TOLERANCE, SEGMENTJAEGER_SELECTION_KEY, SEGMENTJAEGER_POTENTIAL_CEILING, segmentPotentialValue, loadLocalFavoriteSegments, saveLocalFavoriteSegments, isLocalFavorite, toggleLocalFavorite, migrateStarredSegmentsToLocalFavorites, mergeFavoritesFromStarred, LOCAL_FAVORITES_KEY, LOCAL_FAVORITES_MIGRATED_KEY, fetchStarredSegments, segmentjaegerComputeStarSyncPlan, syncSegmentjaegerStars, applySegmentStar, resetRouteSegments, computeSegmentStatChips, computeRideEffortStatChips, buildXomChip, segmentIsStarred, fmtDuration, parseDuration, evaluateWorkout, TRAINING_CONFIG, buildZwo, buildFit, buildCourseFit, downsampleRoutePoints, stepTargetValue, computeSyncMergePlan, SYNC_KEYS, smoothElevation, computeCurvature, detectIntersectionCandidates, analyzeRoute, placeIntervalsOnRoute, classPerformanceScores, computeTrainingPriorities, computeWeeklyBudgetTargets, weeklyClassProgress, reconcileWeeklyBudgets, computeTrainingDecisionState, pickIntendedTrainingClass, computeTrainingOpportunity, TRAINING_CLASSES };\n`;
 
   const ctx = vm.createContext(sandbox);
   const script = new vm.Script(exposedSrc, { filename: 'index.html-inline-script.js' });
