@@ -1096,6 +1096,13 @@ let state = {
   // could change the result actually changed (see there). See
   // ensureRecommendedRoutesLoaded()/recomputeRecommendedRoutes().
   recommendedRoutes: null,
+  // Cached result for the "Heute empfohlen" block on "Meine Segmente": up to
+  // 5 wind-favorable starred favorites (state.segments only -- no distance
+  // bucketing, see pickTopSegments()), ranked by wind favorability for
+  // state.startTime. Same {computedAtStartTime, poolKey, tiles} shape as
+  // recommendedRoutes above, for the same cache-invalidation reasons. See
+  // recomputeRecommendedSegments()/ensureRecommendedSegmentsLoaded().
+  recommendedSegments: null,
   routeInfoTab: "elevation", // "elevation" | "climbs" | "beststart"
   elevationProfile: null, // {distances:[km,...], elevations:[m,...]} for the current route, or null if not (yet) loaded
   climbIndex: 0, // which detected climb is shown in the Anstiege tab
@@ -4350,6 +4357,10 @@ function resetConnectionState(){
   // tiles referencing a now-invalidated token's routes/activities must not
   // survive a disconnect, same reasoning as routeWindCache below.
   state.recommendedRoutes = null;
+  // Same reasoning as recommendedRoutes above -- derived from state.segments
+  // (just wiped a few lines up), so a stale "Heute empfohlen" tile referencing
+  // a now-invalidated token's favorite must not survive a disconnect either.
+  state.recommendedSegments = null;
   state.elevationProfile = null;
   state.windFieldPoints = null;
   state.windFieldEnabled = false;
@@ -4506,6 +4517,16 @@ function render(){
     // any earlier.
     if(state.connected && state.routeSourceTab === "recommended"){
       ensureRecommendedRoutesLoaded();
+    }
+    // Same deferred-to-rAF reasoning as the block above, for the "Heute
+    // empfohlen" segments block on "Meine Segmente": it's shown as soon as
+    // the page renders (no tab click to hang a trigger off of), and
+    // ensureRecommendedSegmentsLoaded()'s own guards make repeat calls on
+    // every render cheap/no-op once computed. Skipped while a starred
+    // segment's detail view is showing (isShowingSegmentDetail()) since the
+    // block isn't even in the DOM there.
+    if(state.connected && state.activePage === "segments" && !isShowingSegmentDetail()){
+      ensureRecommendedSegmentsLoaded();
     }
     // Mac Safari (user-reported) can leave a persistent <select>/<input> that
     // was just detached+reattached by the app.innerHTML="" rebuild above in a
@@ -5132,6 +5153,157 @@ async function recomputeRecommendedRoutesIfNeeded(){
 async function ensureRecommendedRoutesLoaded(){
   await ensureStravaRoutesLoaded();
   await recomputeRecommendedRoutesIfNeeded();
+}
+
+// ---------- "Heute empfohlen" segments block (Meine Segmente) ----------
+// Same wind-ranking machinery as the route page's "Empfohlen" tab above,
+// applied to a much narrower pool: ONLY the user's starred favorites
+// (state.segments), never any other segment source. No separate geometry
+// fetch of its own -- loadSegmentsStep() already eagerly loads
+// segmentBucket("starred").details[seg.id].map.polyline for every favorite,
+// so this just reads what's already there (fail-open: a favorite whose
+// geometry hasn't loaded yet is skipped, not treated as an error).
+function buildRecommendedSegmentCandidatePool(){
+  const candidates = [];
+  const bucket = segmentBucket("starred");
+  state.segments.forEach(seg=>{
+    const detail = bucket.details[seg.id];
+    const poly = detail && detail.map && (detail.map.polyline || detail.map.summary_polyline);
+    if(!poly) return;
+    candidates.push({
+      // No selectionId here (unlike buildRecommendedCandidatePool()'s route/
+      // activity id-namespacing): this pool has exactly one source (starred
+      // favorites), the tile's selected-highlight check
+      // (renderRecommendedSegmentTile()) already compares tile.raw.id against
+      // state.selectedSegmentId directly, and a copy of seg.id under a second
+      // name that's never read would just be dead weight.
+      name: seg.name,
+      distanceKm: seg.distance / 1000,
+      averageGrade: seg.average_grade,
+      polyline: poly,
+      raw: seg
+    });
+  });
+  return candidates;
+}
+
+// Recomputes state.recommendedSegments from scratch -- identical technique
+// to recomputeRecommendedRoutes() (decode every candidate's polyline, batch
+// ALL of their first-decoded-point coords into ONE Open-Meteo call -- NOT
+// seg.start_latlng, for consistency with the leg bearings computed from the
+// same decoded coords below -- then score each candidate's own coarse
+// ~1km leg breakdown against its own returned forecast). Differs only in
+// its candidate pool (buildRecommendedSegmentCandidatePool() instead of
+// buildRecommendedCandidatePool()) and its selection step (pickTopSegments()
+// instead of pickRecommendedRoutes() -- a plain top-N, no distance
+// bucketing). Fails open (empty tiles, no crash) on any network/parsing
+// error, same philosophy as recomputeRecommendedRoutes().
+async function recomputeRecommendedSegments(poolKey){
+  state.loading.recommendedSegments = true; render();
+  let tiles = [];
+  try{
+    const candidates = buildRecommendedSegmentCandidatePool();
+    const decoded = candidates
+      .map(c => ({ ...c, coords: decodePolyline(c.polyline) }))
+      .filter(c => c.coords.length >= 2);
+    if(decoded.length){
+      const lats = decoded.map(c => c.coords[0][0].toFixed(3)).join(",");
+      const lons = decoded.map(c => c.coords[0][1].toFixed(3)).join(",");
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=wind_speed_10m,wind_direction_10m&forecast_days=7&timezone=auto`;
+      const res = await fetch(url);
+      if(!res.ok) throw new Error("Winddaten nicht verfügbar");
+      const data = await res.json();
+      const results = Array.isArray(data) ? data : [data];
+      const startDate = new Date(state.startTime);
+      const scored = decoded.map((c, i)=>{
+        const cumDist = buildCumulativeDistances(c.coords);
+        const points = pickRoutePoints(c.coords, cumDist, LIST_ITEM_WIND_STEP_KM);
+        const legs = [];
+        for(let j=0;j<points.length-1;j++){
+          const dist = points[j+1].distanceKm - points[j].distanceKm;
+          if(dist <= 0) continue;
+          const bearing = bearingBetween(c.coords[points[j].idx], c.coords[points[j+1].idx]);
+          legs.push({ bearing, distanceKm: dist });
+        }
+        const wind = scoreRouteWindForStartTime(legs, results[i] && results[i].hourly, startDate, state.avgSpeedKmh);
+        return {
+          name: c.name, distanceKm: c.distanceKm,
+          averageGrade: c.averageGrade, raw: c.raw,
+          // Built once here (not per render()) -- same reason as
+          // recomputeRecommendedRoutes()'s thumbSvg: c.polyline can be
+          // thousands of points, and this tile re-renders on every
+          // "Meine Segmente" page render() while the card is visible.
+          thumbSvg: buildRouteThumbnailSvg(c.polyline),
+          ...wind
+        };
+      });
+      tiles = pickTopSegments(scored);
+    }
+  }catch(e){
+    tiles = [];
+  }
+  state.recommendedSegments = { computedAtStartTime: state.startTime, poolKey, tiles };
+  state.loading.recommendedSegments = false;
+  render();
+}
+
+// Simpler sibling to pickRecommendedRoutes(): a plain top-N by windScore,
+// descending, no distance-bucket grouping. The route page's three-bucket
+// split exists to guarantee one short/mid/long option; here the user
+// explicitly asked for "3 to 5" as a rough headline count, not a fixed
+// per-bucket rule, so this deliberately does NOT pad or force a minimum --
+// fewer than `max` candidates (or fewer favorites than that to begin with)
+// just means fewer tiles, same "no placeholder" philosophy as
+// pickRecommendedRoutes()'s empty-bucket handling. Array#sort is stable in
+// every engine this app runs on (spec-guaranteed since ES2019), so equal
+// windScores keep their original relative order rather than reshuffling.
+function pickTopSegments(scoredCandidates, max){
+  max = max == null ? 5 : max;
+  return scoredCandidates
+    .slice()
+    .sort((a, b) => b.windScore - a.windScore)
+    .slice(0, max);
+}
+
+// Pure fingerprint of the starred-favorites pool for recomputeRecommendedSegmentsIfNeeded()'s
+// cache key. Deliberately NOT a length (unlike recomputeRecommendedRoutesIfNeeded()'s
+// stravaRoutes/activities poolKey, where length is a safe fingerprint because
+// those lists only ever grow via their own lazy/startup loaders, never shrink
+// mid-session) -- state.segments is the local heart-favorites list, and
+// toggleLocalFavorite() both adds AND removes from it (heart button, reachable
+// from the route AND segment-hunter pages, not just "Meine Segmente"). Swapping
+// one favorite for another leaves the length unchanged, so a length-only
+// fingerprint would miss it entirely: the card would keep showing a tile for a
+// segment that's no longer starred (whose click-through then finds nothing,
+// since bucket.list.find() no longer has it), while the newly starred one never
+// appears. Joining the actual ids makes any membership change visible.
+function computeSegmentPoolKey(segments){
+  return segments.map(s => s.id).join(",");
+}
+
+// Skips recomputing when nothing that could change the result has changed
+// since the cached computation -- same contract as
+// recomputeRecommendedRoutesIfNeeded(), just keyed off computeSegmentPoolKey()
+// (the starred-favorites pool's actual membership, not just its length -- see
+// that function's comment for why length alone isn't safe here) instead of
+// stravaRoutes/activities.
+async function recomputeRecommendedSegmentsIfNeeded(){
+  if(state.loading.recommendedSegments) return;
+  const poolKey = computeSegmentPoolKey(state.segments);
+  const cached = state.recommendedSegments;
+  if(cached && cached.computedAtStartTime === state.startTime && cached.poolKey === poolKey) return;
+  await recomputeRecommendedSegments(poolKey);
+}
+
+// Lazy trigger for the "Heute empfohlen" segments block -- unlike
+// ensureRecommendedRoutesLoaded(), this never fetches the underlying list
+// itself: state.segments loading is owned entirely by the existing
+// "Datenladen" mechanism (loadSegmentsStep()/autoLoadSegments), so this only
+// reacts to whatever is already loaded (or skips while a load is pending/
+// gated behind the manual-load prompt).
+async function ensureRecommendedSegmentsLoaded(){
+  if(state.loading.segments || state.needsManualLoad.segments) return;
+  await recomputeRecommendedSegmentsIfNeeded();
 }
 
 async function selectStravaRoute(route){
@@ -6311,6 +6483,11 @@ const startTimeInput = el("input", {
       // requestAnimationFrame block) is what kicks it off, same "compute
       // once when first opened" contract as the other tabs.
       if(state.recommendedRoutes) recomputeRecommendedRoutesIfNeeded();
+      // Same reuse of this one existing debounce for the "Heute empfohlen"
+      // segments block's wind ranking, which depends on state.startTime just
+      // as directly -- see the comment above for why a second parallel timer
+      // isn't needed.
+      if(state.recommendedSegments) recomputeRecommendedSegmentsIfNeeded();
     }, 600);
   }
 });
@@ -7499,6 +7676,60 @@ function syncSegmentSortXomOptions(){
   syncXomSortOptionsFor(segmentSortSelect, segmentSortKomOption, segmentSortQomOption, "segmentSortBy");
 }
 
+// One compact tile for the "Heute empfohlen" segments block -- same
+// .recommended-tile/.recommended-thumb/.tag.mini shape and dominant-wind-chip
+// logic as renderRecommendedTile() (route page's "Empfohlen" tab), just a
+// segment-flavored meta line (km + Ø-Steigung, same format as
+// renderSegmentRow()'s meta line) and a click-through to selectSegment()
+// with source always "starred" (this block only ever deals with starred
+// favorites, see buildRecommendedSegmentCandidatePool()).
+function renderRecommendedSegmentTile(tile){
+  const isSel = state.selectedSegmentId === tile.raw.id && state.selectedSegmentSource === "starred";
+  const km = tile.distanceKm.toFixed(1);
+  // Dominant wind type for the single chip shown here -- copied verbatim
+  // from renderRecommendedTile() for identical chip behavior.
+  let dominant = { type:"tail", pct:tile.tailPct, label:"Rückenwind" };
+  if(tile.crossPct > dominant.pct) dominant = { type:"cross", pct:tile.crossPct, label:"Seitenwind" };
+  if(tile.headPct > dominant.pct) dominant = { type:"head", pct:tile.headPct, label:"Gegenwind" };
+  return el("div", {class:"recommended-tile" + (isSel?" selected":""), onclick: ()=>selectSegment(tile.raw, "starred")}, [
+    el("div", {class:"recommended-thumb", html: tile.thumbSvg}),
+    el("div", {class:"name"}, [tile.name]),
+    el("div", {class:"meta"}, [`${km} km · ${tile.averageGrade}% Ø-Steigung`]),
+    el("div", {class:"tag mini " + dominant.type}, [`${dominant.label} ${dominant.pct}%`])
+  ]);
+}
+
+// New card on "Meine Segmente", rendered ABOVE the existing Favoriten list
+// (see renderSegmentsPage()) -- up to 5 starred favorites ranked by wind
+// favorability for state.startTime, no distance bucketing (see
+// pickTopSegments()). Only ever called when state.segments.length > 0:
+// renderSegmentsPage() itself already shows its own "noch keine Favoriten"
+// empty-state card otherwise (via renderSegmentsCard()), so there is
+// nothing to recommend from and this block should not appear at all.
+function renderRecommendedSegmentsCard(){
+  const card = el("div", {class:"card"});
+  card.appendChild(el("h2", {}, ["Heute empfohlen"]));
+  // Also checks state.loading.segments, not just state.loading.recommendedSegments:
+  // loadSegmentsStep() sets state.segments BEFORE awaiting loadSegmentExtras()
+  // (which loads each favorite's detail/weather/PR-watts and can take several
+  // seconds), so during that window state.loading.recommendedSegments is still
+  // false (recomputeRecommendedSegmentsIfNeeded() hasn't even been reached yet
+  // via ensureRecommendedSegmentsLoaded()'s own state.loading.segments guard) --
+  // without this check this card would misleadingly show "no recommendations"
+  // right next to renderSegmentsCard()'s correct "Lade Segmente & Wind…".
+  if(state.loading.recommendedSegments || state.loading.segments){
+    card.appendChild(el("div", {class:"loading"}, ["Berechne Empfehlungen…"]));
+    return card;
+  }
+  const tiles = (state.recommendedSegments && state.recommendedSegments.tiles) || [];
+  if(tiles.length){
+    card.appendChild(el("div", {class:"recommended-grid"}, tiles.map(renderRecommendedSegmentTile)));
+  } else {
+    card.appendChild(el("div", {class:"empty-state"}, ["Keine Segment-Empfehlungen verfügbar."]));
+  }
+  return card;
+}
+
 // The plain starred-segments list (sort dropdown + rows) — content/behavior
 // unchanged from before Task 2, just now rendered from renderSegmentsPage()
 // on the "Meine Segmente" nav page instead of inline below the route card.
@@ -7603,6 +7834,18 @@ function renderSegmentsPage(){
     }
   }
 
+  // "Heute empfohlen" sits above the plain Favoriten list, only when there's
+  // actually something in the starred pool to recommend from -- with zero
+  // favorites, renderSegmentsCard() itself already renders its own "noch
+  // keine Favoriten" empty-state card, and this block has nothing to add
+  // above that. Fragment pattern mirrors other multi-card pages in this app
+  // (e.g. renderEinstellungenPage()).
+  if(state.segments.length > 0){
+    const frag = document.createDocumentFragment();
+    frag.appendChild(renderRecommendedSegmentsCard());
+    frag.appendChild(renderSegmentsCard());
+    return frag;
+  }
   return renderSegmentsCard();
 }
 
