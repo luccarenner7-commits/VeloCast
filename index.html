@@ -2912,23 +2912,35 @@ function computeTargetPressureBar({ riderWeightKg, bikeWeightKg, tireWidthMm, tu
 // Loss-rate learning: sparse, manually-entered data (a rider measures maybe
 // once every few rides) doesn't support anything fancier than an EMA of
 // observed rates -- see task brief.
-function computeLossRateBarPerDay(priorBar, measuredBar, hoursElapsed){
-  if(!(hoursElapsed > 0)) return null; // guards hoursElapsed<=0 and NaN in one comparison
-  return (priorBar - measuredBar) / (hoursElapsed / 24);
+//
+// Physically, pressure loss through the tire wall is a diffusion process --
+// proportional to current pressure, i.e. exponential decay, not a constant
+// bar/day subtracted linearly (that overestimates loss over longer periods).
+// So the learned rate is a FRACTION lost per day, not an absolute bar/day,
+// and this derives it from ln(priorBar/measuredBar) rather than a plain
+// subtraction. Unclamped on purpose -- can come out negative if pressure was
+// topped up mid-measurement -- clamping happens only in
+// updateLearnedRateFractionPerDay(), exactly like the old
+// computeLossRateBarPerDay/updateLearnedRateBarPerDay pair.
+function computeLossRateFractionPerDay(priorBar, measuredBar, hoursElapsed){
+  if(!(hoursElapsed > 0) || !(priorBar > 0) || !(measuredBar > 0)) return null;
+  return Math.log(priorBar / measuredBar) / (hoursElapsed / 24);
 }
 // Sanity-clamp range for a single measured rate before it's allowed to move
 // the learned average: 0 is the floor (a "gain" reading is a bad/mistimed
-// measurement, not negative loss -- e.g. topping up mid-week); 3 bar/day is
-// already a blatant leak, so anything above that is almost certainly a
-// fat-fingered manual entry rather than a real data point, and letting it
-// through unclamped would let one typo dominate the EMA for a long time.
-function updateLearnedRateBarPerDay(oldRate, newMeasuredRate, alpha = 0.3){
-  const clamped = Math.min(3, Math.max(0, newMeasuredRate));
+// measurement, not negative loss -- e.g. topping up mid-week); 50%/day is
+// already far beyond any genuine slow leak, so anything above that is almost
+// certainly a flat or a fat-fingered manual entry rather than a real data
+// point, and letting it through unclamped would let one typo dominate the
+// EMA for a long time (same rationale as the old 3-bar/day clamp).
+const TIRE_PRESSURE_MAX_FRACTION_PER_DAY = 0.5;
+function updateLearnedRateFractionPerDay(oldRate, newRate, alpha = 0.3){
+  const clamped = Math.min(TIRE_PRESSURE_MAX_FRACTION_PER_DAY, Math.max(0, newRate));
   return alpha * clamped + (1 - alpha) * oldRate;
 }
-function estimateCurrentPressureBar(lastBaselineBar, lastBaselineAtMs, learnedRateBarPerDay, nowMs){
+function estimateCurrentPressureBar(lastBaselineBar, lastBaselineAtMs, learnedRateFractionPerDay, nowMs){
   const daysElapsed = (nowMs - lastBaselineAtMs) / 86400000;
-  return Math.max(0, lastBaselineBar - learnedRateBarPerDay * daysElapsed);
+  return Math.max(0, lastBaselineBar * Math.pow(1 - learnedRateFractionPerDay, daysElapsed));
 }
 function isPressureLow(estimatedBar, targetBar, thresholdPercent){
   return estimatedBar < targetBar * (thresholdPercent / 100);
@@ -2948,10 +2960,10 @@ function getWheelTargetBar(data, wheel){
 
 // Reasonable generic default for a clincher road tire, used only until the
 // wheel has at least one real "Nachmessen"-derived data point.
-const TIRE_PRESSURE_DEFAULT_RATE_BAR_PER_DAY = 0.15;
+const TIRE_PRESSURE_DEFAULT_RATE_FRACTION_PER_DAY = 0.03;
 const TIRE_PRESSURE_KEY = 'velocast_tire_pressure';
 function defaultTireWheelData(){
-  return { lastBaselineBar: null, lastBaselineAtMs: null, learnedRateBarPerDay: TIRE_PRESSURE_DEFAULT_RATE_BAR_PER_DAY, history: [], manualTargetBar: null };
+  return { lastBaselineBar: null, lastBaselineAtMs: null, learnedRateFractionPerDay: TIRE_PRESSURE_DEFAULT_RATE_FRACTION_PER_DAY, history: [], manualTargetBar: null };
 }
 function defaultTirePressureData(){
   return {
@@ -2975,6 +2987,16 @@ function loadTirePressureData(){
           if(parsed[wheel] && typeof parsed[wheel] === 'object'){
             out[wheel] = Object.assign(defaultTireWheelData(), parsed[wheel]);
             if(!Array.isArray(out[wheel].history)) out[wheel].history = [];
+            // Migration for existing users: pre-existing saved data may still carry the old
+            // linear-model field `learnedRateBarPerDay` from before the switch to the
+            // exponential/fractional model. We convert it once to an approximate fraction/day
+            // so users keep their learned rate (no reset, no loss of learning progress),
+            // then discard the stale field so it doesn't linger unused.
+            if(parsed[wheel].learnedRateFractionPerDay == null && typeof parsed[wheel].learnedRateBarPerDay === 'number' && out[wheel].lastBaselineBar > 0){
+              const converted = parsed[wheel].learnedRateBarPerDay / out[wheel].lastBaselineBar;
+              out[wheel].learnedRateFractionPerDay = Math.min(TIRE_PRESSURE_MAX_FRACTION_PER_DAY, Math.max(0, converted));
+            }
+            delete out[wheel].learnedRateBarPerDay;
           }
         });
         return out;
@@ -3010,7 +3032,7 @@ function computeTirePressureReminder(data){
     if(w.lastBaselineBar == null || w.lastBaselineAtMs == null) return;
     const target = getWheelTargetBar(data, wheel);
     if(target == null) return; // calculator off, rider hasn't entered a manual target yet
-    const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateBarPerDay, Date.now());
+    const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateFractionPerDay, Date.now());
     result[wheel] = isPressureLow(estimated, target, s.reminderThresholdPercent);
   });
   return result;
@@ -3031,10 +3053,10 @@ function applyNachmessenUpdate(w, measured, neu, now){
   if(!(isFinite(neu) && neu > 0)) return false;
   if(isFinite(measured)){
     const hoursElapsed = (now - w.lastBaselineAtMs) / 3600000;
-    const rate = computeLossRateBarPerDay(w.lastBaselineBar, measured, hoursElapsed);
+    const rate = computeLossRateFractionPerDay(w.lastBaselineBar, measured, hoursElapsed);
     if(rate != null){
-      w.learnedRateBarPerDay = updateLearnedRateBarPerDay(w.learnedRateBarPerDay, rate);
-      w.history.push({ measuredAtMs: now, priorBar: w.lastBaselineBar, measuredBar: measured, hoursElapsed, rateBarPerDay: rate });
+      w.learnedRateFractionPerDay = updateLearnedRateFractionPerDay(w.learnedRateFractionPerDay, rate);
+      w.history.push({ measuredAtMs: now, priorBar: w.lastBaselineBar, measuredBar: measured, hoursElapsed, rateFractionPerDay: rate });
     }
   }
   w.lastBaselineBar = Math.round(neu * 10) / 10;
@@ -14109,6 +14131,50 @@ function renderTirePressureSettingsCard(data){
   return card;
 }
 
+// Compact, minimalist forecast graph for buildTireWheelCard: the exponential
+// decay curve from the last baseline out to +14 days, a dashed line at the
+// reminder threshold pressure, and a marker at "today" (clamped to the right
+// edge if the baseline is already older than 14 days, so it never draws
+// off-chart). Same inline-SVG technique as buildRouteThumbnailSvg() --
+// cssVar() for theme colors, no chart framework/dependency (this project
+// deliberately ships zero dependencies, see package.json). No axis
+// labels/numbers and no interactivity by design -- this is a glance-only
+// trend indicator, not a data-exploration tool. The curve itself reuses
+// estimateCurrentPressureBar() sample-by-sample so the math can never drift
+// from what the "Geschätzt aktuell" chip above it shows.
+function buildTirePressureForecastSvg(lastBaselineBar, lastBaselineAtMs, learnedRateFractionPerDay, target, thresholdPercent){
+  const width = 600, height = 110, padX = 4, padY = 10;
+  const windowDays = 14, steps = 30;
+  const points = [];
+  for(let i = 0; i <= steps; i++){
+    const sampleMs = lastBaselineAtMs + (windowDays * 86400000 * i) / steps;
+    points.push(estimateCurrentPressureBar(lastBaselineBar, lastBaselineAtMs, learnedRateFractionPerDay, sampleMs));
+  }
+  const thresholdBar = target * thresholdPercent / 100;
+  const minVal = Math.min(...points, thresholdBar);
+  const maxVal = Math.max(...points, thresholdBar);
+  const span = Math.max(1e-6, maxVal - minVal); // guard a perfectly flat curve (0%/day learned rate)
+  const x = i => padX + (i / steps) * (width - padX * 2);
+  const y = v => padY + (1 - (v - minVal) / span) * (height - padY * 2);
+  let path = `M ${x(0).toFixed(1)} ${y(points[0]).toFixed(1)}`;
+  for(let i = 1; i <= steps; i++) path += ` L ${x(i).toFixed(1)} ${y(points[i]).toFixed(1)}`;
+  const thresholdY = y(thresholdBar).toFixed(1);
+  // "Today" marker: clamp into the window instead of omitting so a baseline
+  // that's already a bit stale still shows something -- only skip it in the
+  // (shouldn't-happen) case of a baseline timestamped in the future.
+  const daysSinceBaseline = (Date.now() - lastBaselineAtMs) / 86400000;
+  let marker = '';
+  if(daysSinceBaseline >= 0){
+    const markerX = x(Math.min(steps, (daysSinceBaseline / windowDays) * steps)).toFixed(1);
+    marker = `<line x1="${markerX}" y1="${padY}" x2="${markerX}" y2="${height - padY}" stroke="${cssVar('--line')}" stroke-width="1.5"/>`;
+  }
+  return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="width:100%; height:110px; display:block;">
+    <line x1="${padX}" y1="${thresholdY}" x2="${width - padX}" y2="${thresholdY}" stroke="${cssVar('--cross')}" stroke-width="1.5" stroke-dasharray="4,4"/>
+    ${marker}
+    <path d="${path}" fill="none" stroke="${cssVar('--route')}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+}
+
 // One wheel's card: target/baseline/estimate chips, the "Aufgepumpt"
 // baseline-log action, and (once a baseline exists) the combined
 // "Nachmessen & neu aufpumpen" form. Inputs are uncontrolled (read via
@@ -14160,7 +14226,7 @@ function buildTireWheelCard(data, wheel, label){
   }
   if(hasBaseline){
     const now = Date.now();
-    const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateBarPerDay, now);
+    const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateFractionPerDay, now);
     const ageDays = Math.round((now - w.lastBaselineAtMs) / 86400000);
     const ageText = ageDays <= 0 ? 'heute' : `vor ${ageDays} Tag${ageDays === 1 ? '' : 'en'}`;
     chips.appendChild(statChip(w.lastBaselineBar.toFixed(1) + ' bar', `Aufgepumpt (${ageText})`));
@@ -14168,6 +14234,19 @@ function buildTireWheelCard(data, wheel, label){
     chips.appendChild(statChip(estimated.toFixed(1) + ' bar', 'Geschätzt aktuell', low ? 'color:var(--cross); background:var(--cross-bg);' : null, 'tp-estimated-' + wheel));
   }
   card.appendChild(chips);
+
+  // Forecast graph: same gating as the "Geschätzt aktuell" chip just above
+  // (needs both a baseline to project from and a target to draw the
+  // threshold line against). Stable id so refreshTirePressureWheelsSection()
+  // can redraw it in place -- the graph's threshold line and Y-scaling both
+  // depend on `target`/reminderThresholdPercent, which can change via the
+  // Einstellungen-card number inputs (rider/bike weight, tire width,
+  // Warnschwelle) that deliberately skip a full render() (see
+  // tirePressureNumberRow()'s comment on why), so without this the graph
+  // would silently go stale until the next unrelated full render().
+  if(hasBaseline && target != null){
+    card.appendChild(el('div', {id: 'tp-forecast-' + wheel, style: 'margin-bottom:12px;', html: buildTirePressureForecastSvg(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateFractionPerDay, target, s.reminderThresholdPercent)}));
+  }
 
   // dataset.auto marks the field as still showing the auto-filled target --
   // refreshTirePressureWheelsSection() only overwrites it while that holds,
@@ -14302,10 +14381,15 @@ function refreshTirePressureWheelsSection(data){
     const w = data[wheel];
     if(w.lastBaselineBar == null || w.lastBaselineAtMs == null) return;
     const estimatedChip = document.getElementById('tp-estimated-' + wheel);
-    if(!estimatedChip) return;
-    const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateBarPerDay, Date.now());
-    const low = target != null && isPressureLow(estimated, target, s.reminderThresholdPercent);
-    estimatedChip.style.cssText = low ? 'color:var(--cross); background:var(--cross-bg);' : '';
+    if(estimatedChip){
+      const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateFractionPerDay, Date.now());
+      const low = target != null && isPressureLow(estimated, target, s.reminderThresholdPercent);
+      estimatedChip.style.cssText = low ? 'color:var(--cross); background:var(--cross-bg);' : '';
+    }
+    const forecastEl = document.getElementById('tp-forecast-' + wheel);
+    if(forecastEl && target != null){
+      forecastEl.innerHTML = buildTirePressureForecastSvg(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateFractionPerDay, target, s.reminderThresholdPercent);
+    }
   });
 }
 
@@ -14356,7 +14440,7 @@ function renderTirePressureBanner(){
     const w = data[wheel];
     const target = getWheelTargetBar(data, wheel);
     if(target == null) return; // calculator off, rider hasn't entered a manual target yet
-    const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateBarPerDay, now);
+    const estimated = estimateCurrentPressureBar(w.lastBaselineBar, w.lastBaselineAtMs, w.learnedRateFractionPerDay, now);
     parts.push(`${wheel === 'front' ? 'Vorderrad' : 'Hinterrad'}: ca. ${estimated.toFixed(1)} bar, Ziel ${target.toFixed(1)} bar`);
   });
   if(parts.length === 0) return null;
