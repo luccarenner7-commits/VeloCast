@@ -523,6 +523,13 @@
   .recommended-thumb{ width:100%; height:100px; background:var(--asphalt-3); border-radius:var(--r-sm); overflow:hidden; }
   .recommended-tile .name{ font-weight:600; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .recommended-tile .meta{ font-family:'IBM Plex Mono', monospace; font-size:11px; color:var(--chalk-dim); }
+  /* Segment-Empfehlungen ("Heute empfohlen"): horizontal scrollende Reihe statt
+     Grid (Nutzer-Feedback 09.09.2026) -- hält die Seite kurz statt in eine
+     zweite/dritte Zeile umzubrechen. .recommended-tile selbst bleibt
+     unverändert (weiterhin auch von der Strecken-Grid oben genutzt), bekommt
+     hier nur eine feste Breite statt der Grid-Spaltenbreite. */
+  .recommended-row{ display:flex; gap:var(--space-3); overflow-x:auto; margin-bottom:14px; padding-bottom:4px; -webkit-overflow-scrolling:touch; }
+  .recommended-row .recommended-tile{ width:140px; flex:0 0 auto; }
 
   /* Weather chip: temperature is the hero numeral (principle: oversized
      primary metric, muted secondary text underneath). */
@@ -6538,37 +6545,15 @@ let routeMapLayers = null; // L.layerGroup holding everything drawn on top of th
 let mountedRouteKey = null; // identifies which route/segment leafletMapInstance is currently showing
 let routeMarkerByIndex = {}; // routePoints index -> Leaflet marker (for weather-chip clicks)
 
-// The starred segments currently visible on "Meine Segmente" (respects
-// state.hideIrrelevantSegments via sortedVisibleSegments — the exact same
-// list the page's rows come from, see renderSegmentsCard()) that have
-// geometry already loaded — i.e. what the overview map
-// (mountSegmentsOverviewView()) can actually draw. Every starred segment's
-// detail (incl. geometry) is eagerly fetched by loadSegmentExtras() for the
-// whole bucket, so this never triggers a new fetch — it just filters down to
-// whichever details have already arrived, skipping any segment still loading
-// or genuinely lacking a polyline. Shared by currentRouteKey() (decides
-// whether the overview map view is even active) and
-// mountSegmentsOverviewView() (the actual polylines) and renderSegmentsCard()
-// (whether to show the map container at all) so all three can never disagree
-// about which segments are "on the map".
-function segmentsWithOverviewGeometry(){
-  const bucket = segmentBucket("starred");
-  return sortedVisibleSegments(bucket).filter(seg => {
-    const detail = bucket.details[seg.id];
-    return !!(detail && detail.map && (detail.map.polyline || detail.map.summary_polyline));
-  });
-}
-
 // Distinguishes "still the same route/segment, just re-rendering with new
 // data" (keep the map + tiles, only redraw the overlay layer) from
 // "switched to a different route" (full teardown + fresh mount needed).
 function currentRouteKey(){
   if(isShowingSegmentDetail()) return "segment-" + state.selectedSegmentSource + "-" + state.selectedSegmentId;
-  // "Meine Segmente" list page (Task 2): the shared overview key only while
-  // there's at least one starred segment with usable geometry — otherwise
-  // null, same as the route-page branch below when there's no route yet, so
-  // mountRouteMap() tears down/no-ops instead of showing a blank canvas.
-  if(state.activePage === "segments") return segmentsWithOverviewGeometry().length ? "segments-overview" : null;
+  // "Meine Segmente" list page: no shared map there anymore (removed per
+  // Nutzer-Feedback 09.09.2026 -- the map now only ever appears in the
+  // per-segment detail view above), so this page never claims a route key.
+  if(state.activePage === "segments") return null;
   // Segmentjäger: its own key namespace ("segmentjaeger-" prefix, not
   // "route-") so navigating here with the same activity already selected on
   // the Strecke page still gets a fresh mount instead of silently reusing
@@ -6615,8 +6600,6 @@ function mountRouteMap(){
 
   if(isShowingSegmentDetail()){
     mountSegmentView(leafletMapInstance, routeMapLayers, state.selectedSegmentId, isNewRoute);
-  } else if(state.activePage === "segments"){
-    mountSegmentsOverviewView(leafletMapInstance, routeMapLayers, isNewRoute);
   } else if(state.activePage === "segmentjaeger"){
     mountSegmentjaegerView(leafletMapInstance, routeMapLayers, isNewRoute);
   } else {
@@ -6695,52 +6678,16 @@ function mountSegmentView(map, layers, segId, isNewRoute){
   }
 }
 
-// "Meine Segmente" overview map (Task 2): every visible starred segment with
-// already-loaded geometry (see segmentsWithOverviewGeometry()), each as its
-// own static polyline in one consistent color — the same neutral --route
-// blue mountSegmentView() itself falls back to when there's no wind data for
-// a segment. This is a static overview, not a per-segment detail view, so
-// there's deliberately no wind coloring/popups/direction arrows/start-finish
-// markers and no click-to-select here, unlike mountSegmentView() above — just
-// the shapes, so the rider can see where all their starred segments are
-// relative to each other. On a fresh mount, fits the map to the combined
-// bounds of every polyline drawn (same [30,30] padding convention as
-// mountSegmentView()'s single-segment fitBounds above).
-function mountSegmentsOverviewView(map, layers, isNewRoute){
-  const bucket = segmentBucket("starred");
-  const drawnLines = [];
-  segmentsWithOverviewGeometry().forEach(seg => {
-    const detail = bucket.details[seg.id];
-    const poly = detail && detail.map && (detail.map.polyline || detail.map.summary_polyline);
-    if(!poly) return;
-    const coords = decodePolyline(poly);
-    const latlngs = coords.map(c => [c[0], c[1]]);
-    // A plain #82a2d1 line at weight 5 reads fine as the single highlighted
-    // route on mountSegmentView(), but with many overview lines at once it
-    // gets lost against OSM's own light road/water/forest tile colors. A
-    // dark casing underneath (same #333a47 neutral-dark already used as
-    // mountFullRouteView()'s uncovered-route base line) fixes contrast on
-    // any tile background without changing the route color itself.
-    L.polyline(latlngs, { color:"#333a47", weight:8, opacity:0.7, lineCap:"round", lineJoin:"round" }).addTo(layers);
-    const line = L.polyline(latlngs, { color:"#82a2d1", weight:4, opacity:1, lineCap:"round", lineJoin:"round" }).addTo(layers);
-    drawnLines.push(line);
-  });
-  if(isNewRoute && drawnLines.length){
-    map.fitBounds(L.featureGroup(drawnLines).getBounds(), { padding:[30,30] });
-  }
-}
-
 // Segmentjäger's own map view: the ridden activity's plain route line (same
 // neutral base-line treatment as mountFullRouteView()'s uncovered-route line
 // below — no wind coloring/Windfeld/reversed-direction handling here, this
 // page isn't about wind) plus an overlay for only the currently-SELECTED
-// segments (state.segmentjaegerSelection), drawn with the exact same dark-
-// casing + route-blue treatment mountSegmentsOverviewView() above already
-// uses for "Meine Segmente"'s multi-segment overview. Deselected segments
+// segments (state.segmentjaegerSelection), drawn with a dark-casing +
+// route-blue treatment (dark #333a47 casing underneath a #82a2d1 line, for
+// contrast against OSM's own light tile colors). Deselected segments
 // are omitted from the map entirely rather than dimmed — this is a static
-// overview, not an interactive picker (see the task brief: not clickable,
-// matches "Meine Segmente"'s static-map convention); the list below the map
-// is where selection actually happens.
+// overview, not an interactive picker (see the task brief: not clickable);
+// the list below the map is where selection actually happens.
 function mountSegmentjaegerView(map, layers, isNewRoute){
   if(!state.fullRouteCoords.length) return;
   const coords = activeRouteCoords();
@@ -7723,7 +7670,9 @@ function renderRecommendedSegmentsCard(){
   }
   const tiles = (state.recommendedSegments && state.recommendedSegments.tiles) || [];
   if(tiles.length){
-    card.appendChild(el("div", {class:"recommended-grid"}, tiles.map(renderRecommendedSegmentTile)));
+    // .recommended-row (not .recommended-grid like the Strecken-Seite) --
+    // horizontally scrollable single row, see its CSS comment for why.
+    card.appendChild(el("div", {class:"recommended-row"}, tiles.map(renderRecommendedSegmentTile)));
   } else {
     card.appendChild(el("div", {class:"empty-state"}, ["Keine Segment-Empfehlungen verfügbar."]));
   }
@@ -7771,17 +7720,6 @@ function renderSegmentsCard(){
     "Nicht relevante Segmente ausblenden",
     ()=>{ state.hideIrrelevantSegments = !state.hideIrrelevantSegments; saveSettings(); render(); }
   ));
-
-  // Overview map (Task 2): all starred segments with already-loaded geometry
-  // on one shared map, above the list, mirroring how the route page always
-  // shows its map. Only attached to the DOM when there's actually something
-  // to draw — mountRouteMap()/currentRouteKey() key this same check off
-  // segmentsWithOverviewGeometry() too, so omitting the container here (zero
-  // starred segments, or none with geometry loaded yet) never leaves a blank
-  // Leaflet canvas behind.
-  if(segmentsWithOverviewGeometry().length){
-    card.appendChild(routeMapContainer);
-  }
 
   const bucket = segmentBucket("starred");
   const grid = el("div", {class:"segment-grid"});
