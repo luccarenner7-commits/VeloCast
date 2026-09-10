@@ -1939,11 +1939,52 @@ function findBestStartTimes(){
   return scored.slice(0, 3);
 }
 
+// A past, completed activity's recorded GPS/altitude stream can never
+// change after the fact (unlike a saved Strava ROUTE, which the rider can
+// still edit in Strava's route builder under the same id) -- so unlike
+// every other cache in this app, this one needs no invalidation logic at
+// all, just a permanent id->profile store. Same load/save/trim pattern as
+// loadProfilActivityCache()/saveProfilActivityCache() above. A smaller cap
+// than that one's 400 -- a multi-hour ride's altitude array can run into
+// the thousands of points, so each entry here is much larger.
+const ACTIVITY_ELEVATION_CACHE_KEY = 'velocast_activity_elevation_cache';
+const ACTIVITY_ELEVATION_CACHE_MAX = 150;
+function loadActivityElevationCache(){
+  try{
+    const raw = localStorage.getItem(ACTIVITY_ELEVATION_CACHE_KEY);
+    if(!raw) return {};
+    const parsed = JSON.parse(raw);
+    if(!parsed || typeof parsed !== "object") return {};
+    return parsed;
+  }catch(e){ return {}; }
+}
+function saveActivityElevationCache(cacheObj){
+  const attempt = (cap) => {
+    const entries = Object.entries(cacheObj).sort((a,b) => (b[1].cachedAt||0) - (a[1].cachedAt||0)).slice(0, cap);
+    const trimmed = {};
+    entries.forEach(([id, row]) => { trimmed[id] = row; });
+    localStorage.setItem(ACTIVITY_ELEVATION_CACHE_KEY, JSON.stringify(trimmed));
+  };
+  try{ attempt(ACTIVITY_ELEVATION_CACHE_MAX); }
+  catch(e){ try{ attempt(30); }catch(e2){ /* cache is a speed optimization, not required */ } }
+}
+
 async function ensureElevationProfile(){
   if(state.elevationProfile !== null || state.loading.elevation) return;
   // GPX elevation comes straight from the parsed file (elevationProfile is
   // set immediately in loadGpxFile) - nothing to lazily fetch for those.
   if(!state.selectedActivity || state.selectedActivity.isGpx) return;
+  // Cache-hit path: a past activity we've already fetched the stream for
+  // once. Deliberately excludes isRoute (routes are never cached here, see
+  // the cache's own comment) -- always falls through to a real fetch below.
+  if(!state.selectedActivity.isRoute){
+    const cached = loadActivityElevationCache()[state.selectedActivity.id];
+    if(cached){
+      state.elevationProfile = { distances: cached.distances, elevations: cached.elevations };
+      render();
+      return;
+    }
+  }
   state.loading.elevation = true; render();
   try{
     let raw;
@@ -1958,6 +1999,15 @@ async function ensureElevationProfile(){
     state.elevationProfile = (streams.distance && streams.altitude)
       ? { distances: streams.distance.map(d => d / 1000), elevations: streams.altitude }
       : { distances: [], elevations: [] };
+    if(!state.selectedActivity.isRoute && state.elevationProfile.distances.length){
+      const cache = loadActivityElevationCache();
+      cache[state.selectedActivity.id] = {
+        distances: state.elevationProfile.distances,
+        elevations: state.elevationProfile.elevations,
+        cachedAt: Date.now()
+      };
+      saveActivityElevationCache(cache);
+    }
   }catch(e){
     state.elevationProfile = { distances: [], elevations: [] };
   }
@@ -4115,75 +4165,121 @@ const CHANGELOG_SEEN_KEY = 'velocast_changelog_seen';
 // A date with no items in a category simply omits that category's heading
 // rather than showing an empty section.
 const CHANGELOG = [
-  { date:'01.09.2026',
+  { date:'10.09.2026',
+    improvements:[
+      'Strecken-Wetter und Segment-Daten laden spürbar schneller — mehrere einzelne Anfragen wurden zu je einer gebündelten zusammengefasst.',
+    ]},
+  { date:'09.09.2026',
     features:[
-      'Kopfzeile mit dem Menü-Button bleibt jetzt beim Scrollen sichtbar oben stehen, statt mit der Seite mit hochzuscrollen.',
-      'Menüreihenfolge aufgeräumt: „Reifendruck" steht jetzt direkt vor „Änderungen", „Einstellungen" ist als eigener Eintrag unterhalb einer Trennlinie immer erreichbar — auch ohne Strava-Verbindung.',
-      'KOM/QOM-Anzeige lässt sich jetzt in den Einstellungen einzeln ein-/ausschalten — betrifft die Stat-Chips bei Segmenten (Meine Segmente & abgeschlossene Segmente) sowie die passenden Sortieroptionen.',
-      '„Meine Segmente" zeigt jetzt eine Übersichtskarte mit allen markierten Segmenten auf einen Blick, oberhalb der Liste.',
-      '„Meine Segmente": neue Sortierung „Bestes Potential zuerst".',
-      'KOM-/QOM-Sortierung ist jetzt auch bei „Meine Segmente" auswählbar (vorher nur bei „Abgeschlossene Segmente" verfügbar) und blendet sich dort passend zu den Einstellungen ein/aus.',
-      'Aktivitäten-Detailansicht zeigt jetzt „Zeit je Zone" für die einzelne Fahrt, sofern Trainingsdaten (Profil) geladen sind.',
-      'Reifendruck: Vorder- und Hinterrad stehen jetzt nebeneinander auf breiten Bildschirmen (Tablet/Desktop), die überflüssige separate Titel-Karte ist weg — insgesamt kompakter.',
-      'Neues Werkzeug „Kette" auf der Reifendruck-Seite: verfolgt anhand der eigenen gefahrenen Kilometer, wann die Kette neu gewachst werden sollte, mit einstellbarer Schwelle (Standard 250 km), „Gewachst"-Button und Hinweis-Banner, sobald die Schwelle erreicht ist.',
+      'Neuer Bereich „Heute empfohlen" auf „Meine Segmente": zeigt bis zu 5 deiner Favoriten, die windtechnisch am besten zur eingestellten Startzeit passen.',
+      'Neuer kleiner Verlaufsgraph zeigt die prognostizierte Reifendruck-Kurve.',
+    ],
+    fixes:[
+      'Reifendruck-Prognose ist jetzt realistischer — der Druckverlust flacht mit der Zeit ab, statt linear weiterzulaufen.',
     ],
     improvements:[
-      'Reifendruck: „Aufgepumpt auf" verschwindet, sobald schon ein Ausgangswert gemerkt ist — „Nachmessen & neu aufpumpen" reicht dann allein aus und funktioniert jetzt auch ohne Eingabe bei „Gemessen" (setzt dann einfach den neuen Ausgangswert, ohne die Verlustrate neu zu berechnen).',
+      'Empfohlene Segmente laufen jetzt als scrollbare Reihe statt als Raster.',
+      'Die Segment-Übersichtskarte auf „Meine Segmente" ist weg — die Karte erscheint jetzt nur noch beim Anklicken eines einzelnen Segments.',
+    ]},
+  { date:'08.09.2026',
+    features:[
+      'Neuer Tab „Empfohlen" auf der Strecke-Seite: schlägt bis zu 3 windgünstige Strecken für die eingestellte Startzeit vor.',
+      'Neue Einstellung „Nur gespeicherte Strecken berücksichtigen" für den Empfohlen-Tab.',
+    ]},
+  { date:'05.09.2026',
+    features:[
+      'Geräte-übergreifender Sync: Reifendruck, Kette, Einstellungen & mehr sind jetzt automatisch zwischen Laptop und Handy synchron.',
+      'Neuer 4. Ring „Frische" im Trainer-Tab, neben CTL/ATL/TSB.',
+    ]},
+  { date:'04.09.2026',
+    features:[
+      'Formkurve-Ringe (CTL/ATL/TSB) jetzt auch im Trainer-Tab.',
+      'Segmentjäger zeigt jetzt auch die Windrichtung pro Segment-Chip an.',
+    ],
+    fixes:[
+      '„Woche bisher" zeigte eine rollierende statt der echten Kalenderwoche — behoben.',
+      '„Genutztes Potential" bei Segmenten aus dem Segmentjäger zeigte manchmal den falschen Wert (diese Fahrt statt der echten Bestleistung) — behoben.',
+      '„Auswahl mit Strava-Stern abgleichen"-Button konnte sich festhängen — behoben.',
+    ],
+    improvements:[
+      'Segmentlisten zeigen jetzt mehrspaltig und kompakter an.',
+      'Favoriten („Meine Segmente") sind jetzt unabhängig vom Strava-Stern — eigenes Herz-Symbol.',
+    ]},
+  { date:'03.09.2026',
+    features:[
+      'Neue Seite „Segmentjäger": wählt automatisch passende Segmente für eine Fahrt aus.',
+    ],
+    improvements:[
+      'Formkurve zeigt CTL/ATL/TSB jetzt als Ringe statt als Chips.',
+      'App-Abstände auf dem Handy verdichtet, Desktop-Ansicht unverändert.',
+    ]},
+  { date:'01.09.2026',
+    features:[
+      'Kopfzeile mit dem Menü-Button bleibt jetzt beim Scrollen sichtbar oben stehen.',
+      '„Einstellungen" ist jetzt immer erreichbar, auch ohne Strava-Verbindung.',
+      'KOM/QOM-Anzeige lässt sich jetzt in den Einstellungen einzeln ein-/ausschalten.',
+      '„Meine Segmente": neue Sortierung „Bestes Potential zuerst", KOM-/QOM-Sortierung jetzt ebenfalls verfügbar.',
+      'Aktivitäten-Detailansicht zeigt jetzt „Zeit je Zone" für die einzelne Fahrt.',
+      'Reifendruck: Vorder- und Hinterrad stehen jetzt nebeneinander auf breiten Bildschirmen.',
+      'Neues Werkzeug „Kette": verfolgt anhand gefahrener Kilometer, wann sie gewachst werden sollte.',
+    ],
+    improvements:[
+      'Reifendruck: „Nachmessen & neu aufpumpen" funktioniert jetzt auch ohne Eingabe bei „Gemessen".',
     ]},
   { date:'29.08.2026',
     features:[
-      'Neue Seite „Reifendruck": berechnet einen empfohlenen Zieldruck getrennt für Vorder- und Hinterrad, merkt sich das letzte Aufpumpen und lernt aus „Nachmessen & neu aufpumpen"-Einträgen, wie schnell die Reifen Luft verlieren — inklusive Hinweis-Banner, wenn der geschätzte aktuelle Druck vermutlich unter der eingestellten Schwelle liegt.',
+      'Neue Seite „Reifendruck": berechnet einen Zieldruck getrennt für Vorder-/Hinterrad und lernt aus deinen Nachmessungen, wie schnell die Reifen Luft verlieren.',
     ],
     fixes:[
-      'Datum/Uhrzeit-Auswahl auf Desktop: Zahleneingabe sprang sofort ins nächste Feld, sodass sich z.B. „15" nicht als Stunde eintippen ließ (nur die „1" kam an) — jede Änderung löste sofort einen Seiten-Neuaufbau aus, der das Feld mitten in der Eingabe zurücksetzte. Die Auswertung wartet jetzt kurz, bis wirklich nichts mehr getippt wird.',
+      'Datum/Uhrzeit-Eingabe auf Desktop sprang sofort ins nächste Feld — behoben.',
     ]},
   { date:'28.08.2026',
     features:[
-      'Automatisches Laden beim Verbinden lässt sich jetzt einzeln für „Aktivitäten & Route", „Favoriten" und „Trainingsdaten" ein-/ausschalten (Einstellungen) — vorher ein einzelner Schalter für alles. Ist eine Kategorie deaktiviert, erscheint an ihrer Stelle ein eigener „laden"-Button.',
-      'Ladevorgang beim Start zeigt jetzt eine Fortschrittsanzeige statt flackernder Textwechsel.',
+      'Automatisches Laden beim Verbinden lässt sich jetzt einzeln für Aktivitäten, Favoriten und Trainingsdaten ein-/ausschalten.',
+      'Ladevorgang beim Start zeigt jetzt eine Fortschrittsanzeige.',
     ],
     fixes:[
-      'Datum/Uhrzeit-Auswahl: Kalender-Symbol war auf dem Desktop kaum sichtbar (dunkel auf dunklem Grund) — behoben.',
-      'Windrichtung (Gegenwind/Seitenwind/Rückenwind) wird jetzt stabiler berechnet — vorher konnte einzelnes GPS-Rauschen die Einordnung für ganze Streckenabschnitte kippen.',
-      'Automatisches Laden hat die Trainingsdaten nicht mit geladen — dadurch fehlte oft die „Genutztes Potential"-Kennzahl bei Segmenten, ohne dass ein Fehler sichtbar war. Jetzt behoben.',
+      'Kalender-Symbol bei Datum/Uhrzeit war auf Desktop kaum sichtbar — behoben.',
+      'Windrichtung wird jetzt stabiler berechnet, weniger anfällig für GPS-Rauschen.',
+      'Trainingsdaten fehlten manchmal beim automatischen Laden — behoben.',
     ],
     improvements:[
-      'App nutzt auf breiten Desktop-Bildschirmen die volle verfügbare Breite (vorher bei 1080px begrenzt).',
+      'App nutzt auf breiten Bildschirmen jetzt die volle verfügbare Breite.',
     ]},
   { date:'28.08.2026 (früher)',
     features:[
-      'Strecke-Seite: Wind-Aufteilung zeigt jetzt zusätzlich getrennt nach erster und zweiter Hälfte der Strecke.',
+      'Wind-Aufteilung zeigt jetzt zusätzlich erste vs. zweite Streckenhälfte.',
     ],
     fixes:[
-      'Kartenkacheln repariert — zeigten zuletzt einen „API KEY REQUIRED"-Fehler statt der Karte.',
+      'Kartenkacheln repariert — zeigten zuletzt einen Fehler statt der Karte.',
     ],
     improvements:[
-      '„Genutztes Potential" bei Segmenten ist jetzt sofort in der Liste sichtbar (vorher erst nach Antippen eines Segments), lädt schneller beim Start und vergleicht gegen einen längeren Zeitraum.',
+      '„Genutztes Potential" ist jetzt sofort in der Liste sichtbar und lädt schneller.',
     ]},
   { date:'27.08.2026',
     features:[
-      'Neue Kennzahl „Genutztes Potential" bei Segmenten: zeigt, wie nah die eigene Bestleistung an der persönlichen Höchstleistung für diese Dauer liegt.',
-      'Trainer: Höhenprofil färbt sich durchgehend nach Streckeneignung für die gewählte Trainingsklasse.',
+      'Neue Kennzahl „Genutztes Potential" bei Segmenten.',
+      'Trainer: Höhenprofil färbt sich nach Streckeneignung für die gewählte Trainingsklasse.',
     ],
     fixes:[
-      '„Meine Segmente" zeigt jetzt wirklich alle mit Stern markierten Segmente an (vorher war bei 12 Schluss).',
+      '„Meine Segmente" zeigte vorher maximal 12 Segmente — jetzt alle.',
     ],
     improvements:[
-      'Anstiegs-Erkennung erkennt jetzt auch bei mehreren kurzen Unterbrechungen hintereinander einen durchgehenden Anstieg.',
-      'Ablauf & Analyse: aufgeräumte Schritt-Liste mit fortlaufender Positionsangabe.',
-      'Größerer App-Container auf Desktop-Bildschirmen (Mobil unverändert).',
+      'Anstiegs-Erkennung erkennt jetzt auch mehrere kurze Unterbrechungen hintereinander als einen durchgehenden Anstieg.',
+      'Ablauf & Analyse: aufgeräumte Schritt-Liste.',
+      'Größerer App-Container auf Desktop.',
     ]},
   { date:'26.08.2026',
     features:[
-      'Neue „Top-Strecken"-Karte im Trainer-Tab: schlägt automatisch die am besten passenden gespeicherten und gefahrenen Strecken für die gewählte Trainingsklasse vor.',
-      'Neuer Umkehr-Schalter auf der Strecke-Seite, um eine Strecke in beide Richtungen zu vergleichen (z. B. für die Windrichtung).',
-      'Workout-Vorschau: Höhenprofil und einzelne Intervalle zeigen jetzt farblich, wie gut die Steigung zur Trainingsklasse passt.',
+      'Neue „Top-Strecken"-Karte im Trainer-Tab: schlägt passende Strecken für die gewählte Trainingsklasse vor.',
+      'Neuer Umkehr-Schalter, um eine Strecke in beide Richtungen zu vergleichen.',
+      'Workout-Vorschau zeigt jetzt farblich, wie gut die Steigung zur Trainingsklasse passt.',
       'Neue Trainingsklasse „Test" für gezielte Bestleistungstests.',
-      'Wochenzonen-Balken zeigen jetzt zusätzlich, welcher Anteil der Zeit in einer Zone als echtes Intervall fürs Wochenbudget zählt.',
+      'Wochenzonen-Balken zeigen jetzt auch den Intervall-Anteil fürs Wochenbudget.',
     ],
     improvements:[
-      'Schwächen-Erkennung: Bewertungen sind jetzt untereinander vergleichbar, inklusive Erwartungswert je Balken.',
-      'Toleranz für kurze Unterbrechungen (Ampel, Kurve) bei der Intervall-Erkennung großzügiger gestaltet.',
+      'Schwächen-Erkennung: Bewertungen sind jetzt besser vergleichbar.',
+      'Toleranz für kurze Unterbrechungen bei der Intervall-Erkennung großzügiger.',
     ]},
 ];
 const CHANGELOG_CATEGORIES = [
