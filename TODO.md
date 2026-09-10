@@ -4,28 +4,28 @@ Ideen und offene Punkte, die nicht sofort umgesetzt wurden, plus ein Verlauf des
 
 ## Offen
 
+Nach Priorität sortiert (Aufwand zuerst, aufsteigend) — Reihenfolge + Behalten/Verwerfen am 10.09.2026 gemeinsam mit Lucas durchgegangen.
+
 ### Tests, Qualität & Audits
-- [ ] **CI/Git-Hook: Tests automatisch vor jedem Push laufen lassen** — laut Nutzer sollen Tests "vor jeder neuen Version durchlaufen", aktuell gibt es dafür keine Automatisierung (kein CI im Repo). Müsste entweder ein manueller Schritt vor jedem Push bleiben oder ein Git-Hook werden (noch nicht eingerichtet, da das eine Änderung am Commit-Workflow ist, die erst abgesprochen werden sollte).
+- [ ] **1. CI/Git-Hook: Tests automatisch vor jedem Push laufen lassen** — laut Nutzer sollen Tests "vor jeder neuen Version durchlaufen", aktuell gibt es dafür keine Automatisierung (kein CI im Repo). Müsste entweder ein manueller Schritt vor jedem Push bleiben oder ein Git-Hook werden (noch nicht eingerichtet, da das eine Änderung am Commit-Workflow ist, die erst abgesprochen werden sollte). Geringster Aufwand der verbleibenden Liste — kein npm im Projekt (bewusst null Dependencies), also `core.hooksPath` auf ein im Repo mitversioniertes `.githooks/pre-push` statt eines Package-Managers wie Husky.
 
-### Routen & Streckengenerierung
-- [ ] **Parameter für Streckengenerierung anhand eines Beispiels festlegen** — statt Werte einzeln einzustellen, eine Beispielstrecke angeben und die Streckengenerierungs-Parameter daraus ableiten lassen. Erkenntnis aus der Analyse der Sweet-Spot-Aktivität vom 25.08.: das eigentliche Problem war meist nicht die Steigungs-Einstellung (idealMin/Max), sondern `minIntervalMin` vs. verfügbare zusammenhängende Anstiegslänge — kurze Anstiege (<2km) fallen bei Tempo/Sweet-Spot (minIntervalMin=8) grundsätzlich raus, unabhängig von den Steigungs-Grenzwerten. Eine "aus Beispiel ableiten"-Funktion müsste das mit einrechnen.
-
-### Trainer & Aktivitäten
-- [ ] **Top-3-Strecken-Anzeige fürs heutige Workout verbessern** — bestehende Top-Strecken-Karte im Trainer-Tab (renderTopRoutesCard) optisch/inhaltlich aufwerten.
+### Neue Ideen
+- [ ] **2. Verbesserungen zum Sparen von API-Tokens** — Idee (04.09.2026), Details noch offen. Bewusst auf Platz 2 trotz unklarem Aufwand — die Größe hängt komplett davon ab, was genau gemeint ist (z.B. aggressiveres Caching einzelner Open-Meteo-Calls vs. eine größere Umstellung der Fetch-Strategie); muss vor dem Start erst genauer abgesprochen werden.
+- [ ] **3. Segment-Sammlungen/Tags** — Idee (01.09.2026). Eigene Gruppen für markierte Segmente (z. B. "Feierabendrunde", "Bergtraining") zum Filtern der Favoriten-Liste — wird mit wachsender Zahl markierter Segmente relevanter. (Die frühere Übersichtskarte, gegen die ursprünglich auch gefiltert werden sollte, wurde am 09.09.2026 auf Nutzer-Wunsch entfernt — betrifft hier nur noch die Listenfilterung.)
+- [ ] **4. Jahres-Rückblick / Saison-Stats** — Idee (01.09.2026). Aggregierte Rückblicksseite (km, Höhenmeter, PRs, stärkste Segmente, genutztes Potential über die Saison) aus bereits vorhandenen Daten, ohne neue API-Aufrufe.
 
 ### Segmente
-- [ ] **Segment-Modus für Intervall-Platzierung** (Feature B des Segmentjäger-Brainstormings, 03.09.2026) — Slider auf der Trainer-Seite zum Umschalten zwischen "Steigungsfenster" (heutiges Verhalten) und "Strava-Segmente" für die Intervall-Platzierung. Im Segment-Modus werden für vorgeschlagene Intervalle passende, bereits gefahrene Segmente (Dauer + PR-Watt nah am Zielwert, absoluter Vergleich, Toleranz noch offen z.B. ±10%) als Validierung vorgeschlagen — kein exaktes Start/End-Alignment nötig, kein Treffer fällt zurück auf die Steigungsfenster-Logik. Nur bereits gefahrene Segmente kommen infrage (kein verlässliches Tempo-/Leistungsmodell für nie gefahrene Segmente vorhanden). Bewusst entkoppelt von der Segmentjäger-Seite (Feature A, wird zuerst umgesetzt) — keine Abhängigkeit von einer dort zuletzt gewählten Strecke; eigene Routenquelle für den Segment-Modus noch zu klären.
+- [ ] **5. Segment-Modus für Intervall-Platzierung** (Feature B des Segmentjäger-Brainstormings, 03.09.2026) — Slider auf der Trainer-Seite zum Umschalten zwischen "Steigungsfenster" (heutiges Verhalten) und "Strava-Segmente" für die Intervall-Platzierung. Im Segment-Modus werden für vorgeschlagene Intervalle passende, bereits gefahrene Segmente (Dauer + PR-Watt nah am Zielwert, absoluter Vergleich, Toleranz noch offen z.B. ±10%) als Validierung vorgeschlagen — kein exaktes Start/End-Alignment nötig, kein Treffer fällt zurück auf die Steigungsfenster-Logik. Nur bereits gefahrene Segmente kommen infrage (kein verlässliches Tempo-/Leistungsmodell für nie gefahrene Segmente vorhanden). Bewusst entkoppelt von der Segmentjäger-Seite (Feature A, bereits umgesetzt) — keine Abhängigkeit von einer dort zuletzt gewählten Strecke; eigene Routenquelle für den Segment-Modus noch zu klären. Größter Aufwand der verbleibenden Liste, plus die offene Routenquellen-Frage.
 
-### Geräte-Integration
-- [ ] **IGP Sport BSC200: Workout-Upload per Klick** — VeloCast soll generierte Workouts als Datei für den BSC200 bereitstellen. Keine offene API für Wireless-Push vorhanden; realistischer Weg ist eine generierte Workout-Datei für den `Workouts`-Ordner des Geräts (USB-Massenspeicher-Modus). Offen: exaktes Dateiformat, das iGPSPORT im `Workouts`-Ordner erwartet, muss noch verifiziert werden (offizielle Doku dünn, evtl. Reverse-Engineering einer Beispieldatei nötig).
-- [ ] **Workout-Export zu Head-Unit (Wahoo/Garmin)** — Idee (01.09.2026). Analog zum bestehenden Hammerhead-`.fit`-Upload-Proxy im Worker (`worker/src/index.js`) auf weitere Geräte-Ökosysteme erweitern.
+## Verworfen
 
-### Neue Ideen (noch nicht entschieden)
-- [ ] **Vorhersage-basierte Fahrplanung** — Idee (01.09.2026, aus Feature-Session, noch nicht abgesprochen). Für eine gespeicherte Strecke die kommenden Tage auf Wind-/Regen-Vorhersage prüfen (Open-Meteo-Anbindung existiert bereits für den aktuellen Tag) und den günstigsten Zeitpunkt vorschlagen.
-- [ ] **Jahres-Rückblick / Saison-Stats** — Idee (01.09.2026). Aggregierte Rückblicksseite (km, Höhenmeter, PRs, stärkste Segmente, genutztes Potential über die Saison) aus bereits vorhandenen Daten, ohne neue API-Aufrufe.
-- [ ] **Segment-Sammlungen/Tags** — Idee (01.09.2026). Eigene Gruppen für markierte Segmente (z. B. "Feierabendrunde", "Bergtraining") zum Filtern von Liste und der Übersichtskarte — wird mit wachsender Zahl markierter Segmente relevanter.
-- [ ] **Bikefitting-Modul** — Idee (03.09.2026), Details noch offen.
-- [ ] **Verbesserungen zum Sparen von API-Tokens** — Idee (04.09.2026), Details noch offen.
+Beim TODO-Review am 10.09.2026 gemeinsam mit Lucas aus der offenen Liste entfernt (kein Verlust der Beschreibung falls später doch wieder relevant — nur die Kurzfassung hier, die vollen ursprünglichen Notizen standen vorher unter "Offen"):
+- ~~Parameter für Streckengenerierung anhand eines Beispiels festlegen~~
+- ~~Top-3-Strecken-Anzeige fürs heutige Workout (Trainer-Tab) verbessern~~
+- ~~IGP Sport BSC200: Workout-Upload per Klick~~
+- ~~Workout-Export zu Head-Unit (Wahoo/Garmin)~~
+- ~~Vorhersage-basierte Fahrplanung~~ — deckt sich inhaltlich weitgehend mit den neuen "Empfohlen"-Features (Strecken/Segmente), die das Problem von der anderen Seite lösen (bester Kandidat für einen festen Zeitpunkt statt bester Zeitpunkt für einen festen Kandidaten)
+- ~~Bikefitting-Modul~~ — kann bei einer konkreten Idee jederzeit neu aufgenommen werden
 
 ## Erledigt
 
