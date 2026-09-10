@@ -16,78 +16,111 @@ function plain(x) {
   return JSON.parse(JSON.stringify(x));
 }
 
+// Testfälle nutzen echte SYNC_KEYS-Werte (statt frei erfundener Namen wie
+// "a"/"b"/"c") seit computeSyncMergePlan() unbekannte Key-Namen filtert --
+// ein synthetischer Name würde sonst schon am Allowlist-Filter scheitern,
+// bevor die eigentlich zu testende Zeitstempel-Logik überhaupt greift.
 test('computeSyncMergePlan', async (t) => {
   await t.test('remote key newer than local -> applied, local meta updated', () => {
     const { get } = loadApp();
     const plan = get('computeSyncMergePlan');
-    const result = plan({ a: 100 }, { a: { value: 'remote-value', updatedAt: 200 } });
-    assert.deepEqual(plain(result.toApplyLocally), { a: 'remote-value' });
-    assert.deepEqual(plain(result.newLocalMeta), { a: 200 });
+    const result = plan({ velocast_settings: 100 }, { velocast_settings: { value: 'remote-value', updatedAt: 200 } });
+    assert.deepEqual(plain(result.toApplyLocally), { velocast_settings: 'remote-value' });
+    assert.deepEqual(plain(result.newLocalMeta), { velocast_settings: 200 });
   });
 
   await t.test('remote key older than local -> ignored, local meta unchanged', () => {
     const { get } = loadApp();
     const plan = get('computeSyncMergePlan');
-    const result = plan({ a: 500 }, { a: { value: 'stale-remote', updatedAt: 200 } });
+    const result = plan({ velocast_settings: 500 }, { velocast_settings: { value: 'stale-remote', updatedAt: 200 } });
     assert.deepEqual(plain(result.toApplyLocally), {});
-    assert.deepEqual(plain(result.newLocalMeta), { a: 500 });
+    assert.deepEqual(plain(result.newLocalMeta), { velocast_settings: 500 });
   });
 
   await t.test('remote key exactly equal to local -> ignored (strictly newer required, not >=)', () => {
     const { get } = loadApp();
     const plan = get('computeSyncMergePlan');
-    const result = plan({ a: 200 }, { a: { value: 'remote-value', updatedAt: 200 } });
+    const result = plan({ velocast_settings: 200 }, { velocast_settings: { value: 'remote-value', updatedAt: 200 } });
     assert.deepEqual(plain(result.toApplyLocally), {});
-    assert.deepEqual(plain(result.newLocalMeta), { a: 200 });
+    assert.deepEqual(plain(result.newLocalMeta), { velocast_settings: 200 });
   });
 
   await t.test('key missing locally (never synced on this device before) -> treated as 0, remote applies', () => {
     const { get } = loadApp();
     const plan = get('computeSyncMergePlan');
-    const result = plan({}, { a: { value: 'first-time', updatedAt: 1 } });
-    assert.deepEqual(plain(result.toApplyLocally), { a: 'first-time' });
-    assert.deepEqual(plain(result.newLocalMeta), { a: 1 });
+    const result = plan({}, { velocast_settings: { value: 'first-time', updatedAt: 1 } });
+    assert.deepEqual(plain(result.toApplyLocally), { velocast_settings: 'first-time' });
+    assert.deepEqual(plain(result.newLocalMeta), { velocast_settings: 1 });
   });
 
   await t.test('empty remote keys -> no-op, local meta passed through unchanged', () => {
     const { get } = loadApp();
     const plan = get('computeSyncMergePlan');
-    const result = plan({ a: 100, b: 50 }, {});
+    const result = plan({ velocast_settings: 100, velocast_chain_wear: 50 }, {});
     assert.deepEqual(plain(result.toApplyLocally), {});
-    assert.deepEqual(plain(result.newLocalMeta), { a: 100, b: 50 });
+    assert.deepEqual(plain(result.newLocalMeta), { velocast_settings: 100, velocast_chain_wear: 50 });
   });
 
   await t.test('mixed keys: some newer, some older, some untouched -- each resolved independently', () => {
     const { get } = loadApp();
     const plan = get('computeSyncMergePlan');
     const result = plan(
-      { a: 100, b: 300, c: 50 },
+      { velocast_settings: 100, velocast_chain_wear: 300, velocast_tire_pressure: 50 },
       {
-        a: { value: 'a-wins-remote', updatedAt: 150 },
-        b: { value: 'b-stale-remote', updatedAt: 250 },
+        velocast_settings: { value: 'a-wins-remote', updatedAt: 150 },
+        velocast_chain_wear: { value: 'b-stale-remote', updatedAt: 250 },
       }
     );
-    assert.deepEqual(plain(result.toApplyLocally), { a: 'a-wins-remote' });
-    assert.deepEqual(plain(result.newLocalMeta), { a: 150, b: 300, c: 50 });
+    assert.deepEqual(plain(result.toApplyLocally), { velocast_settings: 'a-wins-remote' });
+    assert.deepEqual(plain(result.newLocalMeta), { velocast_settings: 150, velocast_chain_wear: 300, velocast_tire_pressure: 50 });
   });
 
   await t.test('malformed remote entry (no updatedAt, or not a number) -> skipped defensively, no crash', () => {
     const { get } = loadApp();
     const plan = get('computeSyncMergePlan');
     const result = plan(
-      { a: 10 },
-      { a: { value: 'no-timestamp' }, b: { value: 'bad-timestamp', updatedAt: 'not-a-number' }, c: null }
+      { velocast_settings: 10 },
+      {
+        velocast_settings: { value: 'no-timestamp' },
+        velocast_chain_wear: { value: 'bad-timestamp', updatedAt: 'not-a-number' },
+        velocast_tire_pressure: null,
+      }
     );
     assert.deepEqual(plain(result.toApplyLocally), {});
-    assert.deepEqual(plain(result.newLocalMeta), { a: 10 });
+    assert.deepEqual(plain(result.newLocalMeta), { velocast_settings: 10 });
   });
 
   await t.test('null/undefined localMeta (first-ever sync on a fresh device) -> treated as empty, no crash', () => {
     const { get } = loadApp();
     const plan = get('computeSyncMergePlan');
-    const result = plan(null, { a: { value: 'v', updatedAt: 5 } });
-    assert.deepEqual(plain(result.toApplyLocally), { a: 'v' });
-    assert.deepEqual(plain(result.newLocalMeta), { a: 5 });
+    const result = plan(null, { velocast_settings: { value: 'v', updatedAt: 5 } });
+    assert.deepEqual(plain(result.toApplyLocally), { velocast_settings: 'v' });
+    assert.deepEqual(plain(result.newLocalMeta), { velocast_settings: 5 });
+  });
+
+  await t.test('remote key not in SYNC_KEYS -> ignored entirely, even with a newer timestamp (client-side counterpart to the worker\'s SYNC_ALLOWED_KEYS check)', () => {
+    const { get } = loadApp();
+    const plan = get('computeSyncMergePlan');
+    const result = plan(
+      {},
+      { not_a_real_sync_key: { value: 'should-never-apply', updatedAt: 999999999999 } }
+    );
+    assert.deepEqual(plain(result.toApplyLocally), {});
+    assert.deepEqual(plain(result.newLocalMeta), {});
+  });
+
+  await t.test('one unknown key mixed with one real key -- only the real key is applied', () => {
+    const { get } = loadApp();
+    const plan = get('computeSyncMergePlan');
+    const result = plan(
+      {},
+      {
+        velocast_settings: { value: 'real-value', updatedAt: 100 },
+        strava_refresh_token: { value: 'must-never-sync', updatedAt: 999999999999 },
+      }
+    );
+    assert.deepEqual(plain(result.toApplyLocally), { velocast_settings: 'real-value' });
+    assert.deepEqual(plain(result.newLocalMeta), { velocast_settings: 100 });
   });
 });
 

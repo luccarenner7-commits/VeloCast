@@ -12348,11 +12348,15 @@ function saveSyncMeta(meta){
 // Key gewinnt der neuere Zeitstempel -- pro Key statt ein Zeitstempel fürs
 // ganze Bündel, damit zwei Geräte, die offline unterschiedliche Felder
 // ändern (z.B. Laptop = Reifendruck, Handy = Kette), sich beim nächsten
-// Sync nicht gegenseitig überschreiben.
+// Sync nicht gegenseitig überschreiben. Keys außerhalb von SYNC_KEYS werden
+// ignoriert (Gegenstück zur serverseitigen SYNC_ALLOWED_KEYS-Prüfung im
+// Worker) -- ohne diesen Filter würde ein Bug oder eine stale KV-Zeile
+// beliebige Keys blind in localStorage schreiben.
 function computeSyncMergePlan(localMeta, remoteKeys){
   const toApplyLocally = {};
   const newLocalMeta = { ...(localMeta || {}) };
   Object.keys(remoteKeys || {}).forEach(key => {
+    if(!SYNC_KEYS.includes(key)) return;
     const remote = remoteKeys[key];
     if(!remote || typeof remote.updatedAt !== 'number') return;
     const localUpdatedAt = (localMeta && localMeta[key]) || 0;

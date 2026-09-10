@@ -149,11 +149,30 @@ async function handleSyncGet(request, env) {
   return jsonResponse(stored, 200, env);
 }
 
+// Muss von Hand synchron zu SYNC_KEYS in index.html gehalten werden -- Worker
+// und index.html laufen in getrennten Realms ohne gemeinsames Modul (kein
+// Build-Schritt in diesem Projekt), können sich also keine Konstante teilen.
+// Ohne diese Liste würde handleSyncPut() jeden Key-Namen, den ein Client
+// schickt, ungeprüft in KV schreiben -- ein Bug oder eine künftige, nicht
+// mehr passende Client-Version könnte so beliebige Keys dauerhaft ablegen.
+const SYNC_ALLOWED_KEYS = [
+  "velocast_confirmed_tests", "velocast_settings", "velocast_gear_resets",
+  "velocast_chain_wear", "velocast_tire_pressure", "velocast_changelog_seen",
+  "velocast_segmentjaeger_selection", "velocast_local_favorite_segments",
+  "velocast_trainer_settings", "velocast_trainer_history", "velocast_trainer_routes",
+];
+// ~2MB pro Key -- TRAINER_ROUTES_KEY (hochgeladene GPX-Strecken) ist der mit
+// Abstand größte legitime Wert, alles darüber ist eher Missbrauch als eine
+// echte Strecke.
+const SYNC_MAX_VALUE_LENGTH = 2_000_000;
+
 // Read-Modify-Write-Merge: pro Key gewinnt der neuere `updatedAt`-Zeitstempel
 // -- eine zusätzliche, server-seitige Absicherung des gleichen Pro-Key-
 // Merges, den der Client schon lokal macht (computeSyncMergePlan() in
 // index.html), falls zwei Geräte kurz hintereinander unterschiedliche Keys
-// pushen.
+// pushen. Unbekannte Key-Namen und übergroße/falsch typisierte Werte werden
+// hier stillschweigend übersprungen (kein Fehler fürs ganze Request) statt
+// den Client-Keys blind zu vertrauen.
 async function handleSyncPut(request, env) {
   const athleteId = await verifyAthleteId(request, env);
   if (!athleteId) return jsonResponse({ error: "unauthorized" }, 401, env);
@@ -165,8 +184,11 @@ async function handleSyncPut(request, env) {
   const stored = raw ? JSON.parse(raw) : { keys: {} };
   if (!stored.keys) stored.keys = {};
   Object.keys(incoming).forEach((key) => {
+    if (!SYNC_ALLOWED_KEYS.includes(key)) return;
     const entry = incoming[key];
     if (!entry || typeof entry.updatedAt !== "number") return;
+    if (entry.value !== null && typeof entry.value !== "string") return;
+    if (typeof entry.value === "string" && entry.value.length > SYNC_MAX_VALUE_LENGTH) return;
     const existing = stored.keys[key];
     if (!existing || entry.updatedAt > existing.updatedAt) stored.keys[key] = entry;
   });
