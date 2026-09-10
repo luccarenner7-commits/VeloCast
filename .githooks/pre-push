@@ -1,0 +1,22 @@
+#!/bin/sh
+# Runs the full test suite before allowing a push (see TODO.md "CI/Git-Hook:
+# Tests automatisch vor jedem Push laufen lassen"). No CI service in this
+# repo, so this is the enforcement point instead. index.html's own syntax
+# validity is implicitly covered too -- test/support/loadApp.js loads the
+# inline <script> into a vm sandbox, so a syntax error there fails every
+# single test, not just a dedicated check.
+#
+# Not tracked by git under .git/hooks/ (that directory itself is never
+# committed) -- this lives in the repo under .githooks/ instead, activated
+# per clone/machine with:
+#   git config core.hooksPath .githooks
+# (see README note / TODO.md for the one-time setup step).
+
+echo "pre-push: running test suite..."
+npm test
+
+if [ $? -ne 0 ]; then
+  echo ""
+  echo "pre-push: tests failed -- push aborted. Fix the failures or, if you really need to push anyway, use 'git push --no-verify'."
+  exit 1
+fi
