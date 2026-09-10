@@ -1101,6 +1101,24 @@ let state = {
   // showKomChip/showQomChip above.
   recommendedOnlySavedRoutes: savedSettings.recommendedOnlySavedRoutes != null ? savedSettings.recommendedOnlySavedRoutes : false,
   stravaRoutes: [], // saved/planned Strava routes, fetched lazily when that tab opens
+  // True only after a real fetchStravaRoutes() call has resolved THIS
+  // session -- distinct from state.stravaRoutes.length, which can already be
+  // > 0 purely from the stale-while-revalidate cache-priming step in
+  // ensureStravaRoutesLoaded() before any real Strava round-trip happened.
+  // Guards that function's "already have it, don't fetch again" skip so a
+  // cache-primed list still gets verified against Strava exactly once per
+  // session (see STRAVA_ROUTES_CACHE_KEY's comment for why routes need this
+  // instead of the segment cache's activity-signal approach). Reset to false
+  // in resetConnectionState() on every disconnect.
+  stravaRoutesVerifiedThisSession: false,
+  // True when a background ensureStravaRoutesLoaded() verify attempt failed
+  // WHILE cached routes were already being shown (never set if there was
+  // nothing cached to show -- that case goes through state.error instead,
+  // see ensureStravaRoutesLoaded()). Surfaces a "couldn't verify, showing
+  // last known state" hint on the "Routen" tab instead of silently letting
+  // a possibly-stale cached list look fully up to date. Reset to false in
+  // resetConnectionState() on every disconnect.
+  routesVerifyFailed: false,
   // Cached result for the "Empfohlen" tab: up to 3 wind-favorable candidates
   // (one per distance bucket <50/50-75/>=75km), picked from exactly what's
   // already loaded for the "Routen"/"Fahrten" tabs (state.stravaRoutes/
@@ -4368,6 +4386,31 @@ function resetConnectionState(){
   state.routeSegmentsFetched = false;
   state.routeSegmentsError = null;
   state.stravaRoutes = [];
+  // Reset alongside stravaRoutes above -- otherwise a reconnect would find
+  // this still true from the previous session and ensureStravaRoutesLoaded()
+  // would skip verifying against Strava even once under the new token.
+  state.stravaRoutesVerifiedThisSession = false;
+  // Session-only UI hint tied to the verify attempt above -- must not
+  // survive into a fresh connection under a possibly different account.
+  state.routesVerifyFailed = false;
+  // Also reset the synchronous re-entrancy guard itself (see
+  // ensureStravaRoutesLoaded()) -- a disconnect mid-fetch must not leave a
+  // fresh reconnect permanently blocked from ever verifying routes again.
+  stravaRoutesFetchStarted = false;
+  // Both new performance caches (SEGMENT_DETAIL_CACHE_KEY/
+  // STRAVA_ROUTES_CACHE_KEY) are keyed by segment/route id, which is NOT
+  // scoped to an account -- without this, reconnecting under a DIFFERENT
+  // Strava account would still see the previous account's cached segment
+  // stats/routes (a real cross-account data leak), same reasoning that
+  // already applies to state.segmentDetails/state.stravaRoutes above, just
+  // for the on-disk copy instead of the in-memory one.
+  try{ localStorage.removeItem(SEGMENT_DETAIL_CACHE_KEY); }catch(e){}
+  try{ localStorage.removeItem(STRAVA_ROUTES_CACHE_KEY); }catch(e){}
+  // The shared in-memory segment-detail cache (see its own comment) must be
+  // dropped too, not just the on-disk copy -- otherwise it would keep
+  // serving the previous account's cached prStats/prWatts in memory even
+  // after the localStorage key above was cleared.
+  segmentDetailCacheInMemory = null;
   // Derived from stravaRoutes/activities above (both just wiped) -- stale
   // tiles referencing a now-invalidated token's routes/activities must not
   // survive a disconnect, same reasoning as routeWindCache below.
@@ -5019,16 +5062,84 @@ function selectRouteSourceTab(tab){
   else if(tab === "recommended") ensureRecommendedRoutesLoaded();
 }
 
-async function ensureStravaRoutesLoaded(){
-  if(state.stravaRoutes.length || state.loading.routes) return;
-  state.loading.routes = true; render();
+// Saved/planned routes come back in ONE call already (unlike segments,
+// there's no per-item loop), and there's no "new activity appeared" signal
+// that correlates with a route being added/edited/deleted directly in
+// Strava — so instead of the segment cache's skip-if-nothing-changed logic,
+// this uses stale-while-revalidate: show the cached list immediately (no
+// spinner, no waiting), then verify against Strava once per session in the
+// background and swap in the fresh result. Never more than 1 Strava call per
+// session either way, but the list now renders instantly on repeat visits
+// instead of blocking on that 1 call.
+// Deliberately NOT added to SYNC_KEYS — same "pure Strava-reloadable
+// performance cache" reasoning as SEGMENT_DETAIL_CACHE_KEY above.
+const STRAVA_ROUTES_CACHE_KEY = 'velocast_strava_routes_cache';
+function loadStravaRoutesCache(){
   try{
-    state.stravaRoutes = await fetchStravaRoutes(state.accessToken);
-  }catch(e){
-    state.error = e.message;
+    const raw = localStorage.getItem(STRAVA_ROUTES_CACHE_KEY);
+    if(!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  }catch(e){ return []; }
+}
+function saveStravaRoutesCache(routes){
+  try{ localStorage.setItem(STRAVA_ROUTES_CACHE_KEY, JSON.stringify(routes)); }
+  catch(e){ /* cache is a speed optimization, not required */ }
+}
+
+// Module-wide in-flight promise instead of relying on state.loading.routes
+// as the re-entrancy guard: the old guard was set to `false` as soon as the
+// cache had SOMETHING to show (see the `!state.stravaRoutes.length` line
+// below), which meant a second overlapping call arriving after the
+// cache-priming step but before the real fetch resolved saw loading.routes
+// already false AND stravaRoutesVerifiedThisSession still false — so it
+// slipped past both guards and fired its own real fetchStravaRoutes() call.
+// stravaRoutesFetchInFlight fixes THAT hole, but is itself not enough on its
+// own: it's only assigned once the async IIFE below is CALLED, and calling
+// an async function runs its body SYNCHRONOUSLY up to the first `await` —
+// so the render() calls in between still execute before the assignment
+// takes effect. Since ensureStravaRoutesLoaded() is itself called from
+// inside render() (renderTopRoutesCard() on the Trainer page, for any
+// non-exempt training class — i.e. most of the time), that render() call
+// can re-enter this function while stravaRoutesFetchInFlight is STILL null,
+// which re-enters render() again, unboundedly (verified: unbounded call
+// stack growth, a real crash, not hypothetical). Fixed with a genuinely
+// synchronous boolean flag set as the very first thing after the early
+// return, before ANY render() call below runs — a re-entrant call sees it
+// immediately, no window where it can slip through.
+let stravaRoutesFetchStarted = false;
+let stravaRoutesFetchInFlight = null;
+async function ensureStravaRoutesLoaded(){
+  // state.stravaRoutesVerifiedThisSession (not state.stravaRoutes.length,
+  // which the cache-priming step below can also set) is the real guard here
+  // -- see its declaration in `state` for why: it only becomes true after a
+  // genuine Strava round-trip has resolved this session, so a cache-primed
+  // list still gets verified against Strava exactly once.
+  if(state.stravaRoutesVerifiedThisSession) return;
+  if(stravaRoutesFetchStarted) return stravaRoutesFetchInFlight;
+  stravaRoutesFetchStarted = true;
+  if(!state.stravaRoutes.length){
+    const cached = loadStravaRoutesCache();
+    if(cached.length){ state.stravaRoutes = cached; render(); } // sofort anzeigen, kein Warten
   }
-  state.loading.routes = false;
+  state.loading.routes = !state.stravaRoutes.length; // Spinner nur, wenn wir NICHTS zum Zwischenanzeigen hatten
   render();
+  stravaRoutesFetchInFlight = (async () => {
+    try{
+      const fresh = await fetchStravaRoutes(state.accessToken);
+      state.stravaRoutes = fresh;
+      saveStravaRoutesCache(fresh);
+      state.stravaRoutesVerifiedThisSession = true;
+      state.routesVerifyFailed = false;
+    }catch(e){
+      if(!state.stravaRoutes.length) state.error = e.message; // nur fehlschlagen, wenn wir wirklich nichts zum Zeigen haben
+      else state.routesVerifyFailed = true; // hatten gecachte Routen, aber der Abgleich schlug fehl -- Hinweis im Routen-Tab
+    }
+    state.loading.routes = false;
+    render();
+  })();
+  try{ await stravaRoutesFetchInFlight; }
+  finally{ stravaRoutesFetchInFlight = null; stravaRoutesFetchStarted = false; }
 }
 
 // Candidate pool for the "Empfohlen" tab -- exactly what's already loaded
@@ -5413,40 +5524,197 @@ async function loadRouteWeather(){
   render();
 }
 
-// Fetches per-segment weather + Strava detail (PR, KOM/QOM, elevation,
-// effort count) + PR watts (for the "Potential"-Chip, see buildPotentialChip())
-// for a list of segments into the given bucket's weather/details/prWatts
-// maps. Shared by both segment sources (see segmentBucket()) — the
-// starred-segments flow calls this from loadActivitiesAndSegments(), the
-// ride-completed-segments flow from ensureRideSegments() below. For the
-// ride-completed bucket the `details` fetched here still matters even
-// though computeSegmentStatChips() prefers the richer per-ride effort data
-// for its stat chips — mountSegmentView() needs detail.map.polyline to draw
-// the segment's own path when it's clicked into the map detail view; its
-// `prWatts` is already filled in by ensureRideSegments() before this runs,
-// so fetchSegmentPrWatts() below is a no-op there (no extra fetch).
+// ---------- Segment-Detail-Cache ----------
+// A segment's Strava detail response (fetchSegmentDetail()) bundles geometry
+// (distance/average_grade/elevation/map.polyline), the rider's OWN PR stats
+// (athlete_segment_stats), but ALSO `xoms` (other athletes' KOM/QOM times)
+// and `starred` — data that can change for reasons that have nothing to do
+// with whether THIS rider did a new activity (another athlete resets the
+// KOM, the rider stars/unstars the segment from a different device). An
+// earlier version of this cache tried to skip the whole detail fetch using
+// state.activities[0].id as a "did anything change" signal, which only ever
+// covered the rider's own PR — it could silently serve a stale KOM/starred
+// status indefinitely. That violated the one hard rule for this app: never
+// show stale data while it's open. Fixed by no longer skipping the detail
+// fetch at all (see loadSegmentExtras() below) — this cache now exists
+// SOLELY to skip the one call that's provably safe to skip: the extra
+// activity fetch for PR watts (fetchSegmentPrWatts()), and only when the
+// freshly-fetched athlete_segment_stats is byte-for-byte identical to what
+// was cached (segmentStatsChanged(), unchanged, see its own comment).
+// Same load/save/trim pattern as loadProfilActivityCache()/
+// saveProfilActivityCache() (~line 2674): try/catch, empty-object fallback
+// on anything unparseable, trimmed to SEGMENT_DETAIL_CACHE_MAX rows sorted
+// by cachedAt descending, with the same double try/catch (smaller cap on a
+// quota error) fallback.
+// Global by segment id, NOT split by bucket ("starred" vs "route") — a
+// segment freshly fetched via one bucket is immediately valid for the other
+// too, see loadSegmentExtras()'s comment.
+// Deliberately NOT added to SYNC_KEYS (see that constant's own comment) —
+// like PROFIL_ACTIVITY_CACHE_KEY/HR_PROFILE_CACHE_KEY/TOP_ROUTES_CACHE_KEY,
+// this is a pure, freely-reloadable-from-Strava performance cache, not a
+// real user datum, and stays per-device on purpose.
+const SEGMENT_DETAIL_CACHE_KEY = 'velocast_segment_detail_cache';
+const SEGMENT_DETAIL_CACHE_MAX = 300;
+
+function loadSegmentDetailCache(){
+  try{
+    const raw = localStorage.getItem(SEGMENT_DETAIL_CACHE_KEY);
+    if(!raw) return {};
+    const parsed = JSON.parse(raw);
+    if(!parsed || typeof parsed !== 'object') return {};
+    return parsed;
+  }catch(e){ return {}; }
+}
+function saveSegmentDetailCache(cacheObj){
+  const attempt = (cap) => {
+    const entries = Object.entries(cacheObj).sort((a,b)=>(b[1].cachedAt||0)-(a[1].cachedAt||0)).slice(0, cap);
+    const trimmed = {};
+    entries.forEach(([id, row]) => { trimmed[id] = row; });
+    localStorage.setItem(SEGMENT_DETAIL_CACHE_KEY, JSON.stringify(trimmed));
+  };
+  try{ attempt(SEGMENT_DETAIL_CACHE_MAX); }
+  catch(e){ try{ attempt(150); }catch(e2){ /* cache is a speed optimization, not required */ } }
+}
+
+// Single shared in-memory object for the page's entire lifetime, lazily
+// hydrated from localStorage on first use. Both loadSegmentExtras() call
+// sites (the "starred" bucket and the "route"/ride-completed bucket) MUST go
+// through this instead of calling loadSegmentDetailCache() themselves —
+// otherwise two overlapping calls (e.g. one per bucket, both in flight at
+// once) would each load their own snapshot, mutate it independently, and the
+// second one to call saveSegmentDetailCache() would silently clobber
+// whatever the first one had already written. Sharing one object fixes this
+// by construction: JS is single-threaded, so `await`-interleaving between
+// the two calls still mutates the SAME object sequentially — no lost writes,
+// no snapshot to go stale. Reset to null in resetConnectionState() so a
+// reconnect under a different Strava account starts from a clean slate
+// instead of inheriting the previous account's in-memory cache.
+let segmentDetailCacheInMemory = null;
+function getSegmentDetailCache(){
+  if(!segmentDetailCacheInMemory) segmentDetailCacheInMemory = loadSegmentDetailCache();
+  return segmentDetailCacheInMemory;
+}
+
+// Reiner Vergleich, ob sich ein Segment-PR seit dem letzten Cache-Eintrag
+// geändert hat -- true bei jeder erkennbaren Abweichung (inkl. wenn vorher
+// noch nie eine Anstrengung existierte und jetzt eine existiert, oder
+// umgekehrt), false nur wenn beide Seiten exakt übereinstimmen.
+function segmentStatsChanged(prevStats, newStats){
+  const prevActivityId = prevStats && prevStats.pr_activity_id;
+  const prevElapsed = prevStats && prevStats.pr_elapsed_time;
+  const newActivityId = newStats && newStats.pr_activity_id;
+  const newElapsed = newStats && newStats.pr_elapsed_time;
+  return prevActivityId !== newActivityId || prevElapsed !== newElapsed;
+}
+
+// One bundled Open-Meteo call for every segment in `list` that has
+// start_latlng, instead of one call per segment — same comma-joined
+// lat/lon technique as ensureWindField()/findBestStartTimes()'s callers.
+// Weather is time-critical (forecasts, not geometry) so it's never cached
+// and always refetched, but batching it into a single request still cuts
+// its share of the API budget from O(segments) to O(1). Reproduces
+// fetchWeather()'s exact per-segment return shape ({temp, windSpeed,
+// windDir, windGust, precip, uvIndex, forecastTime, hourly, idx}) since many
+// existing call sites read bucket.weather[seg.id].windDir/.windSpeed etc.
+// directly. Fails open: a request error nulls out every segment's weather
+// (same "don't block the rest of the page on weather" behavior fetchWeather()
+// callers already have via their own .catch(()=>null)).
+async function fetchWeatherBatchForSegments(list, bucket){
+  // Strict length check (not just truthy) -- a segment with start_latlng: []
+  // passes a plain `seg.start_latlng` filter (empty array is truthy) but has
+  // no [0]/[1] to read, which used to throw OUTSIDE the try block below and
+  // crash this whole function (and therefore loadSegmentExtras() for every
+  // segment in the list, not just the malformed one).
+  const withCoords = list.filter(seg => seg.start_latlng && seg.start_latlng.length === 2);
+  if(!withCoords.length) return;
+  try{
+    const lats = withCoords.map(s => s.start_latlng[0].toFixed(4)).join(",");
+    const lons = withCoords.map(s => s.start_latlng[1].toFixed(4)).join(",");
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,precipitation_probability,uv_index&forecast_days=7&timezone=auto`;
+    const res = await fetch(url);
+    if(!res.ok) throw new Error("Wetterdaten nicht verfügbar");
+    const data = await res.json();
+    const results = Array.isArray(data) ? data : [data];
+    const targetDate = new Date(); // same "now" default fetchWeather() itself uses
+    withCoords.forEach((seg, i) => {
+      const hourly = results[i] && results[i].hourly;
+      if(!hourly){ bucket.weather[seg.id] = null; return; }
+      const hours = hourly.time;
+      let idx = 0, best = Infinity;
+      hours.forEach((t,hi)=>{ const diff = Math.abs(new Date(t) - targetDate); if(diff < best){ best = diff; idx = hi; } });
+      bucket.weather[seg.id] = {
+        temp: hourly.temperature_2m[idx], windSpeed: hourly.wind_speed_10m[idx],
+        windDir: hourly.wind_direction_10m[idx], windGust: hourly.wind_gusts_10m[idx],
+        precip: hourly.precipitation_probability[idx],
+        uvIndex: hourly.uv_index ? hourly.uv_index[idx] : null,
+        forecastTime: new Date(hours[idx]), hourly, idx
+      };
+    });
+  }catch(e){
+    withCoords.forEach(seg => { bucket.weather[seg.id] = null; }); // fail-open, same as everywhere else in this app
+  }
+}
+
+// Fetches per-segment weather (always fresh, see fetchWeatherBatchForSegments())
+// + Strava detail (PR, KOM/QOM, xoms, starred, elevation, effort count) + PR
+// watts (for the "Potential"-Chip, see buildPotentialChip()) for a list of
+// segments into the given bucket's weather/details/prWatts maps. Shared by
+// both segment sources (see segmentBucket()) — the starred-segments flow
+// calls this from loadActivitiesAndSegments(), the ride-completed-segments
+// flow from ensureRideSegments() below.
+//
+// fetchSegmentDetail() itself is fetched fresh EVERY call, for EVERY
+// segment — never skipped. That's deliberate: it's the only thing that
+// guarantees geometry, KOM/QOM, `starred` and the rider's own PR stats are
+// always current, with no signal to get wrong (see SEGMENT_DETAIL_CACHE_KEY's
+// comment for why the previous activity-id-based skip was unsound). The one
+// real saving left: the extra activity-detail call for PR watts
+// (fetchSegmentPrWatts()) is skipped when segmentStatsChanged() finds the
+// JUST-fetched athlete_segment_stats identical to the cached value — that's
+// safe because it compares two real, freshly-obtained values rather than
+// guessing from an unrelated signal.
 // `limit` caps how many of `list`'s segments get fetched, if given — both
 // call sites now pass Infinity (starred and ride-completed alike), since
 // capping here silently drops segments past the cap, which is exactly the
 // bug this parameter used to cause for "Meine Segmente" when a starred list
 // grew past 12.
-// Weather/detail are fetched in parallel per segment (prWatts needs detail's
-// pr_activity_id first, so it stays a third sequential step); render() is
-// called once after the whole list instead of once per segment — a
-// re-render per segment (up to 30 on a starred list, each rebuilding the
+// render() is called once after the whole list instead of once per segment
+// — a re-render per segment (up to 30 on a starred list, each rebuilding the
 // full DOM + remounting the route map) was the cause of visible jank right
 // after connecting.
 async function loadSegmentExtras(list, bucket, limit){
   if(limit === undefined) limit = Infinity;
-  for(const seg of list.slice(0, limit)){
-    const weatherPromise = seg.start_latlng
-      ? fetchWeather(seg.start_latlng[0].toFixed(4), seg.start_latlng[1].toFixed(4)).catch(()=>null)
-      : Promise.resolve(undefined);
-    const detailPromise = fetchSegmentDetail(seg.id, state.accessToken).catch(()=>null);
-    const [weather, detail] = await Promise.all([weatherPromise, detailPromise]);
-    if(seg.start_latlng) bucket.weather[seg.id] = weather;
-    bucket.details[seg.id] = detail;
-    await fetchSegmentPrWatts(seg, bucket);
+  const targets = list.slice(0, limit);
+  const cache = getSegmentDetailCache(); // shared in-memory object, see its own comment for why
+
+  await fetchWeatherBatchForSegments(targets, bucket);
+
+  for(const seg of targets){
+    const detail = await fetchSegmentDetail(seg.id, state.accessToken).catch(()=>null);
+    if(detail){
+      bucket.details[seg.id] = detail;
+      const cachedEntry = cache[seg.id];
+      const newStats = detail.athlete_segment_stats;
+      if(cachedEntry && !segmentStatsChanged(cachedEntry.prStats, newStats)){
+        bucket.prWatts[seg.id] = cachedEntry.prWatts; // PR unverändert -> teuren Aktivitäts-Detail-Call sparen
+      } else {
+        // WICHTIG: erst löschen, dann neu holen. fetchSegmentPrWatts()'s
+        // eigener `bucket.prWatts[seg.id] !== undefined`-Guard würde sonst
+        // einen echten PR-Wechsel stillschweigend ignorieren, wenn von einem
+        // vorherigen Aufruf in DERSELBEN Session schon irgendein (jetzt
+        // veralteter) Wert für dieses Segment gesetzt war.
+        delete bucket.prWatts[seg.id];
+        await fetchSegmentPrWatts(seg, bucket); // holt frisch, setzt bucket.prWatts[seg.id]
+      }
+      cache[seg.id] = { prStats: newStats || null, prWatts: bucket.prWatts[seg.id], cachedAt: Date.now() };
+      saveSegmentDetailCache(cache); // nach JEDEM Segment speichern, nicht erst am Ende der Schleife
+    } else {
+      // Fehlgeschlagener Fetch: NICHTS in den Cache schreiben (ein alter,
+      // evtl. noch gültiger Eintrag bleibt unangetastet), bucket.details
+      // bleibt für DIESE Session null -- kein stiller "gültiger" Cache-
+      // Eintrag, der beim nächsten Mal fälschlich als aktuell behandelt wird.
+      bucket.details[seg.id] = null;
+    }
   }
   render();
 }
@@ -6208,6 +6476,9 @@ function renderRouteSourceTabs(card){
         card.appendChild(list);
       } else {
         card.appendChild(el("div", {class:"empty-state"}, ["Keine gespeicherten Routen gefunden."]));
+      }
+      if(state.routesVerifyFailed){
+        card.appendChild(el("div", {class:"muted", style:"font-size:12px;"}, ["Konnte nicht mit Strava abgleichen — zeige zuletzt bekannten Stand."]));
       }
     } else if(state.routeSourceTab === "activities"){
       if(state.loading.activities){
