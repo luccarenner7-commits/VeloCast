@@ -12388,11 +12388,19 @@ async function pushSyncNow(){
     payload[key] = { value: localStorage.getItem(key), updatedAt: meta[key] || Date.now() };
   });
   try{
-    await fetch(SYNC_ENDPOINT, {
+    const res = await fetch(SYNC_ENDPOINT, {
       method: "PUT",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + state.accessToken },
       body: JSON.stringify({ keys: payload })
     });
+    if(!res.ok){
+      // z.B. abgelaufener Token (401) oder Server-Fehler (5xx): Keys bleiben
+      // dirty (NICHT aus syncDirtyKeys entfernen), sonst gilt die Änderung
+      // fälschlich als synct und geht verloren -- stattdessen in 30s erneut
+      // versuchen, gleiches Muster wie der catch-Zweig unten.
+      syncPushTimer = setTimeout(pushSyncNow, 30000);
+      return;
+    }
     keys.forEach(key => syncDirtyKeys.delete(key));
   }catch(e){
     // Offline/Worker nicht erreichbar: syncMeta ist schon geschrieben, kein
