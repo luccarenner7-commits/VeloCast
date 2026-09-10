@@ -2,6 +2,7 @@
   "name": "velocast",
   "private": true,
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "lint": "node scripts/check-duplicate-declarations.js"
   }
 }

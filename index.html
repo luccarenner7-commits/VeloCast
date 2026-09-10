@@ -810,6 +810,14 @@
 <div class="app" id="app"></div>
 
 <script>
+'use strict';
+// Real safety net for this file's actual risk profile: ~640 top-level
+// function/const/let declarations sharing ONE global scope (no modules, no
+// IIFE wrapper -- see project convention notes). Without strict mode, a typo
+// on the left side of an assignment (e.g. a misspelled loop variable)
+// silently creates a new global instead of throwing -- exactly the kind of
+// bug that's easy to introduce and hard to notice in a script this size.
+// Strict mode turns that into an immediate ReferenceError instead.
 const STRAVA_CLIENT_ID = "268232";
 // Token exchange happens server-side (Cloudflare Worker) so client secrets
 // never ship to the browser. Replace with your deployed worker URL, e.g.

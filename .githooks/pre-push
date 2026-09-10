@@ -20,3 +20,12 @@ if [ $? -ne 0 ]; then
   echo "pre-push: tests failed -- push aborted. Fix the failures or, if you really need to push anyway, use 'git push --no-verify'."
   exit 1
 fi
+
+echo "pre-push: checking for duplicate top-level declarations..."
+npm run lint --silent
+
+if [ $? -ne 0 ]; then
+  echo ""
+  echo "pre-push: duplicate declaration found -- push aborted. Fix it or, if you really need to push anyway, use 'git push --no-verify'."
+  exit 1
+fi
