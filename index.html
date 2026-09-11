@@ -9633,6 +9633,17 @@ function renderProfilRueckblickSection(frag){
   headCard.appendChild(el("div", {class:"muted", style:"font-size:11px; margin-bottom:6px;"}, ["Jahr"]));
   syncRecapYearSelectOptions(years);
   headCard.appendChild(recapYearSelect);
+  // Separate from "Rückblick laden" below (which only appears while data is
+  // missing, and skips pages already believed correct) -- this one is always
+  // visible and force-re-walks every already-cached page for the year too,
+  // for the case where the DATA CHANGED on Strava itself (e.g. edited gear on
+  // an old ride) rather than being missing. See backfillActivitiesForYear()'s
+  // `opts.force` comment for why the two need different pagination behavior.
+  headCard.appendChild(el("button", {
+    class:"btn secondary", style:"width:100%; margin-top:10px; font-size:12px; padding:8px 12px;",
+    disabled: pp.recapLoading ? "disabled" : null,
+    onclick: ()=>backfillActivitiesForYear(state.accessToken, year, {force:true})
+  }, [pp.recapLoading ? "Lädt…" : "Daten aktualisieren (falls du Fahrten auf Strava geändert hast)"]));
   if(!complete){
     headCard.appendChild(el("div", {style:"margin-top:12px;"}, [
       calloutBox('warn', "Daten unvollständig",
@@ -10021,7 +10032,18 @@ function didCacheEvict(mergedCountBeforeSave, persistedCountAfterSave){
 // OTHER branch (an activity found before the year boundary) doesn't need
 // this guard: it always re-reads whatever's currently actually persisted,
 // so it can't go stale the way a flag written once here could.
-async function backfillActivitiesForYear(token, year){
+// `opts.force` (used by the "Daten aktualisieren" button) skips the resume-
+// from-cachedCount shortcut below and always starts at page 1 instead --
+// needed because that shortcut is a deliberate optimization for BACKFILLING
+// missing older data, which assumes already-cached pages are still correct.
+// That assumption breaks the moment an activity gets edited on Strava itself
+// (e.g. a changed gear_id) after VeloCast already cached it: the resume
+// logic would skip straight past the page containing it, so the stale local
+// copy would never get refreshed. Forcing page 1 re-walks every page for the
+// year and overwrites each cached activity with Strava's current data
+// (merge-by-id in the loop below already does this "for free").
+async function backfillActivitiesForYear(token, year, opts){
+  opts = opts || {};
   const pp = state.profilPage;
   // Same re-entrancy guard as loadProfilData()'s own `if(pp.loading) return;`
   // -- the button's `disabled` attribute already prevents a normal double-
@@ -10033,7 +10055,7 @@ async function backfillActivitiesForYear(token, year){
   try{
     const cache = loadAktivitaetenListCache();
     const cachedCount = Object.keys(cache).length;
-    let page = Math.max(1, Math.floor(cachedCount / 100) + 1);
+    let page = opts.force ? 1 : Math.max(1, Math.floor(cachedCount / 100) + 1);
     const yearStartMs = Date.UTC(year, 0, 1);
     let reachedYearStart = false;
     let exhaustedAll = false;
