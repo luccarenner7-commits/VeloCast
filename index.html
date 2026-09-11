@@ -4024,11 +4024,10 @@ async function loadProfilData(token, opts){
         ...(athleteDetail.bikes||[]).map(g => ({ ref:g, kind:'Bike' })),
         ...(athleteDetail.shoes||[]).map(g => ({ ref:g, kind:'Shoe' }))
       ];
-      const gearDetails = [];
-      for(const { ref, kind } of gearRefs){
-        try{ gearDetails.push({ ...(await fetchGearDetail(ref.id, token)), kind }); }
-        catch(e){ gearDetails.push({ ...ref, kind }); }
-      }
+      const gearDetails = await Promise.all(gearRefs.map(async ({ ref, kind }) => {
+        try{ return { ...(await fetchGearDetail(ref.id, token)), kind }; }
+        catch(e){ return { ...ref, kind }; }
+      }));
       pp.gear = gearDetails;
     }
 
