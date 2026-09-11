@@ -993,8 +993,13 @@ function saveConfirmedTests(obj){
     const trimmed = {}; entries.forEach(t => { trimmed[`${t.rideId}:${t.durationSec}`] = t; });
     localStorage.setItem(CONFIRMED_TESTS_KEY, JSON.stringify(trimmed));
   };
-  try{ attempt(CONFIRMED_TESTS_MAX); }catch(e){ try{ attempt(50); }catch(e2){} }
-  pushSyncSoon(CONFIRMED_TESTS_KEY);
+  // pushSyncSoon() only runs when a write actually landed -- otherwise a
+  // full quota failure (both attempts throw) would still queue a push, and
+  // pushSyncNow() would then read back the OLD on-disk value but stamp it
+  // with a brand-new timestamp, overwriting a genuinely newer value on
+  // another device with stale data. Same reasoning for every save*() below.
+  try{ attempt(CONFIRMED_TESTS_MAX); pushSyncSoon(CONFIRMED_TESTS_KEY); }
+  catch(e){ try{ attempt(50); pushSyncSoon(CONFIRMED_TESTS_KEY); }catch(e2){} }
 }
 function saveConfirmedTest(entry){
   const all = loadConfirmedTests();
@@ -2046,7 +2051,36 @@ function findBestStartTimes(){
 // than that one's 400 -- a multi-hour ride's altitude array can run into
 // the thousands of points, so each entry here is much larger.
 const ACTIVITY_ELEVATION_CACHE_KEY = 'velocast_activity_elevation_cache';
-const ACTIVITY_ELEVATION_CACHE_MAX = 150;
+// Lowered from 150 (see slimElevationProfile()'s comment for why the old
+// combination of this cap with full-resolution streams risked blowing the
+// shared per-origin localStorage quota).
+const ACTIVITY_ELEVATION_CACHE_MAX = 100;
+// buildElevationChartSvg() renders into a fixed 600-unit-wide SVG -- a multi-
+// hour ride's raw 1Hz altitude/distance stream (up to ~20,000 points) is far
+// more precision than that can ever show, and storing it verbatim made each
+// cache entry up to ~230KB. At ACTIVITY_ELEVATION_CACHE_MAX entries that
+// could approach ~34MB against a typical ~5MB per-origin localStorage quota
+// -- and unlike this cache's own quota-exceeded fallback, hitting that limit
+// cascades into every OTHER localStorage write on the origin failing too
+// (including saveSettings(), which has no cap-and-retry of its own since a
+// settings object isn't a trimmable collection). Downsampling + rounding
+// before caching (never touches the just-fetched state.elevationProfile used
+// for the current render, only what gets persisted) cuts a worst-case entry
+// down to a few KB.
+function slimElevationProfile(distances, elevations){
+  const maxPoints = 1000;
+  const roundDist = d => Math.round(d*1000)/1000;
+  const roundEle = e => e==null ? null : Math.round(e*10)/10;
+  const stride = distances.length <= maxPoints ? 1 : Math.ceil(distances.length/maxPoints);
+  const outD = [], outE = [];
+  for(let i=0;i<distances.length;i+=stride){ outD.push(roundDist(distances[i])); outE.push(roundEle(elevations[i])); }
+  const lastIdx = distances.length-1;
+  const roundedLastDist = roundDist(distances[lastIdx]);
+  if(distances.length && outD[outD.length-1] !== roundedLastDist){
+    outD.push(roundedLastDist); outE.push(roundEle(elevations[lastIdx]));
+  }
+  return { distances: outD, elevations: outE };
+}
 function loadActivityElevationCache(){
   try{
     const raw = localStorage.getItem(ACTIVITY_ELEVATION_CACHE_KEY);
@@ -2098,10 +2132,14 @@ async function ensureElevationProfile(){
       ? { distances: streams.distance.map(d => d / 1000), elevations: streams.altitude }
       : { distances: [], elevations: [] };
     if(!state.selectedActivity.isRoute && state.elevationProfile.distances.length){
+      // Slimmed for STORAGE only -- state.elevationProfile itself (used for
+      // this render) keeps its full resolution, see slimElevationProfile()'s
+      // comment for why the cached copy doesn't need to.
+      const slim = slimElevationProfile(state.elevationProfile.distances, state.elevationProfile.elevations);
       const cache = loadActivityElevationCache();
       cache[state.selectedActivity.id] = {
-        distances: state.elevationProfile.distances,
-        elevations: state.elevationProfile.elevations,
+        distances: slim.distances,
+        elevations: slim.elevations,
         cachedAt: Date.now()
       };
       saveActivityElevationCache(cache);
@@ -2498,8 +2536,11 @@ function saveSettings(){
       equipmentMode: state.equipmentMode,
       recommendedOnlySavedRoutes: state.recommendedOnlySavedRoutes
     }));
+    // See saveConfirmedTests()'s comment -- only push when the write itself
+    // succeeded, otherwise a quota failure would push the stale on-disk
+    // value with a fresh timestamp and overwrite a newer remote value.
+    pushSyncSoon("velocast_settings");
   }catch(e){}
-  pushSyncSoon("velocast_settings");
 }
 
 // ---------- Strava API ----------
@@ -2921,7 +2962,7 @@ function loadGearResets(){
     return out;
   }catch(e){ return {}; }
 }
-function saveGearResets(resets){ try{ localStorage.setItem(PROFIL_GEAR_RESET_KEY, JSON.stringify(resets)); }catch(e){} pushSyncSoon(PROFIL_GEAR_RESET_KEY); }
+function saveGearResets(resets){ try{ localStorage.setItem(PROFIL_GEAR_RESET_KEY, JSON.stringify(resets)); pushSyncSoon(PROFIL_GEAR_RESET_KEY); }catch(e){} }
 function gearWearStatus(totalDistanceM, resetKm, intervalKm){
   const totalKm = (totalDistanceM||0)/1000;
   const sinceKm = Math.max(0, totalKm - (resetKm||0));
@@ -2969,8 +3010,7 @@ function loadChainWearData(){
   return defaultChainWearData();
 }
 function saveChainWearData(data){
-  try{ localStorage.setItem(CHAIN_WEAR_KEY, JSON.stringify(data)); }catch(e){}
-  pushSyncSoon(CHAIN_WEAR_KEY);
+  try{ localStorage.setItem(CHAIN_WEAR_KEY, JSON.stringify(data)); pushSyncSoon(CHAIN_WEAR_KEY); }catch(e){}
 }
 // VeloCast doesn't track odometer/gear-tagged distance independently of
 // Strava's gear objects -- this tool has no gear object to read from at all,
@@ -3200,8 +3240,8 @@ function saveTirePressureData(data){
   try{
     ['front', 'rear'].forEach(wheel => { data[wheel].history = data[wheel].history.slice(-50); });
     localStorage.setItem(TIRE_PRESSURE_KEY, JSON.stringify(data));
+    pushSyncSoon(TIRE_PRESSURE_KEY);
   }catch(e){}
-  pushSyncSoon(TIRE_PRESSURE_KEY);
 }
 // Startup check (see init()): {front, rear} booleans, both false if settings
 // aren't filled in yet or a wheel has no baseline yet -- computeTargetPressureBar
@@ -4419,8 +4459,7 @@ function hasUnseenChangelog(){
   return seen !== CHANGELOG[0].date;
 }
 function markChangelogSeen(){
-  try{ localStorage.setItem(CHANGELOG_SEEN_KEY, CHANGELOG[0].date); }catch(e){}
-  pushSyncSoon(CHANGELOG_SEEN_KEY);
+  try{ localStorage.setItem(CHANGELOG_SEEN_KEY, CHANGELOG[0].date); pushSyncSoon(CHANGELOG_SEEN_KEY); }catch(e){}
 }
 
 function hamburgerIconSvg(){
@@ -6407,8 +6446,7 @@ function loadSegmentjaegerSelections(){
 function saveSegmentjaegerSelection(activityId, selection){
   const all = loadSegmentjaegerSelections();
   all[String(activityId)] = selection;
-  try{ localStorage.setItem(SEGMENTJAEGER_SELECTION_KEY, JSON.stringify(all)); }catch(e){}
-  pushSyncSoon(SEGMENTJAEGER_SELECTION_KEY);
+  try{ localStorage.setItem(SEGMENTJAEGER_SELECTION_KEY, JSON.stringify(all)); pushSyncSoon(SEGMENTJAEGER_SELECTION_KEY); }catch(e){}
 }
 
 // Populates state.segmentjaegerSelection for the currently selected activity
@@ -7739,8 +7777,7 @@ function loadLocalFavoriteSegments(){
   return {};
 }
 function saveLocalFavoriteSegments(map){
-  try{ localStorage.setItem(LOCAL_FAVORITES_KEY, JSON.stringify(map)); }catch(e){}
-  pushSyncSoon(LOCAL_FAVORITES_KEY);
+  try{ localStorage.setItem(LOCAL_FAVORITES_KEY, JSON.stringify(map)); pushSyncSoon(LOCAL_FAVORITES_KEY); }catch(e){}
 }
 function isLocalFavorite(seg){
   return !!loadLocalFavoriteSegments()[seg.id];
@@ -10882,7 +10919,7 @@ function loadConfigOverrides(){
   try{ const raw = localStorage.getItem(TRAINER_SETTINGS_KEY); if(raw){ const p = JSON.parse(raw); if(p && typeof p==='object') return p; } }catch(e){}
   return {};
 }
-function saveConfigOverrides(obj){ try{ localStorage.setItem(TRAINER_SETTINGS_KEY, JSON.stringify(obj)); }catch(e){} pushSyncSoon(TRAINER_SETTINGS_KEY); }
+function saveConfigOverrides(obj){ try{ localStorage.setItem(TRAINER_SETTINGS_KEY, JSON.stringify(obj)); pushSyncSoon(TRAINER_SETTINGS_KEY); }catch(e){} }
 function deepMergeInto(target, source){
   Object.keys(source||{}).forEach(k => {
     const sv = source[k];
@@ -13088,8 +13125,7 @@ function loadTrainerRoutesByDate(){
   }catch(e){ return {}; }
 }
 function saveTrainerRoutesByDate(all){
-  try{ localStorage.setItem(TRAINER_ROUTES_KEY, JSON.stringify(all)); }catch(e){}
-  pushSyncSoon(TRAINER_ROUTES_KEY);
+  try{ localStorage.setItem(TRAINER_ROUTES_KEY, JSON.stringify(all)); pushSyncSoon(TRAINER_ROUTES_KEY); }catch(e){}
 }
 function saveTrainerRouteForDate(dateKey, fileName, pts){
   const all = loadTrainerRoutesByDate();
@@ -13375,7 +13411,7 @@ function loadTrainerHistory(){
 // goal (see its own .slice(-8) above). Raising it just lets more history
 // survive for the season recap's "Anzahl Workouts" count; the sync payload
 // (SYNC_KEYS below) stays tiny either way since these are small JSON objects.
-function saveTrainerHistory(list){ try{ localStorage.setItem(TRAINER_HISTORY_KEY, JSON.stringify(list.slice(-500))); }catch(e){} pushSyncSoon(TRAINER_HISTORY_KEY); }
+function saveTrainerHistory(list){ try{ localStorage.setItem(TRAINER_HISTORY_KEY, JSON.stringify(list.slice(-500))); pushSyncSoon(TRAINER_HISTORY_KEY); }catch(e){} }
 
 // ---------- device sync ----------
 // Reifendruck, Kettenverschleiß, Einstellungen usw. waren bislang rein
@@ -13425,9 +13461,19 @@ function saveSyncMeta(meta){
 // ignoriert (Gegenstück zur serverseitigen SYNC_ALLOWED_KEYS-Prüfung im
 // Worker) -- ohne diesen Filter würde ein Bug oder eine stale KV-Zeile
 // beliebige Keys blind in localStorage schreiben.
+//
+// toPushRemotely (Nachschärfung): syncDirtyKeys (siehe pushSyncSoon()) ist
+// eine reine Laufzeit-Variable, nie persistiert -- schließt der Nutzer den
+// Tab, während ein Push noch aussteht (oder wurde er offline gemacht, siehe
+// pushSyncNow()'s Kommentar), geht diese Warteschlange beim nächsten Start
+// verloren, OHNE dass die Änderung je ankommt. localMeta (velocast_sync_meta)
+// IST persistiert -- jeder Key, dessen lokaler Zeitstempel noch über dem
+// steht, was der Server zuletzt gesehen hat, gehört also erneut in die
+// Push-Warteschlange, unabhängig vom (ggf. schon verlorenen) Laufzeit-Set.
 function computeSyncMergePlan(localMeta, remoteKeys){
   const toApplyLocally = {};
   const newLocalMeta = { ...(localMeta || {}) };
+  const toPushRemotely = [];
   Object.keys(remoteKeys || {}).forEach(key => {
     if(!SYNC_KEYS.includes(key)) return;
     const remote = remoteKeys[key];
@@ -13438,7 +13484,13 @@ function computeSyncMergePlan(localMeta, remoteKeys){
       newLocalMeta[key] = remote.updatedAt;
     }
   });
-  return { toApplyLocally, newLocalMeta };
+  Object.keys(localMeta || {}).forEach(key => {
+    if(!SYNC_KEYS.includes(key) || typeof localMeta[key] !== 'number') return;
+    const remote = (remoteKeys || {})[key];
+    const remoteUpdatedAt = (remote && typeof remote.updatedAt === 'number') ? remote.updatedAt : 0;
+    if(localMeta[key] > remoteUpdatedAt) toPushRemotely.push(key);
+  });
+  return { toApplyLocally, newLocalMeta, toPushRemotely };
 }
 
 // Debounced Push: jede save*()-Funktion der 11 SYNC_KEYS ruft das hier mit
@@ -13457,12 +13509,27 @@ function pushSyncSoon(key){
   syncPushTimer = setTimeout(pushSyncNow, 2000);
 }
 async function pushSyncNow(){
+  // Kein Retry-Timer, wenn (noch) nicht verbunden -- Reifendruck/Kette
+  // funktionieren bewusst offline (siehe resetConnectionState()'s Kommentar),
+  // ein blindes 30s-Polling ohne jedes Verbindungssignal würde nur endlos
+  // weiterlaufen, ohne dass sich am fehlenden Token etwas ändert. Offline
+  // gemachte Änderungen gehen dabei NICHT verloren: pullSyncOnLoad()s
+  // toPushRemotely-Abgleich (siehe computeSyncMergePlan()) holt jeden Key,
+  // dessen lokaler Zeitstempel den Server noch nicht erreicht hat, beim
+  // nächsten echten Connect automatisch nach -- das deckt genau diesen Fall
+  // ab, ohne eine Dauerschleife zu brauchen.
   if(!state.accessToken || syncDirtyKeys.size === 0) return;
   const keys = Array.from(syncDirtyKeys);
   const meta = loadSyncMeta();
   const payload = {};
+  // Der zum Zeitpunkt DIESES Pushes tatsächlich gesendete Zeitstempel pro
+  // Key -- gebraucht unten, um zu erkennen, ob ein Key WÄHREND der Anfrage
+  // erneut geändert wurde (siehe Kommentar beim Löschen aus syncDirtyKeys).
+  const pushedAt = {};
   keys.forEach(key => {
-    payload[key] = { value: localStorage.getItem(key), updatedAt: meta[key] || Date.now() };
+    const ts = meta[key] || Date.now();
+    pushedAt[key] = ts;
+    payload[key] = { value: localStorage.getItem(key), updatedAt: ts };
   });
   try{
     const res = await fetch(SYNC_ENDPOINT, {
@@ -13478,7 +13545,17 @@ async function pushSyncNow(){
       syncPushTimer = setTimeout(pushSyncNow, 30000);
       return;
     }
-    keys.forEach(key => syncDirtyKeys.delete(key));
+    // Ein Key wird nur gelöscht, wenn ihn NICHTS während dieser Anfrage
+    // erneut geändert hat (aktueller Meta-Zeitstempel <= der gerade
+    // gesendete) -- sonst würde der Erfolg dieser Anfrage fälschlich auch
+    // die neuere, noch gar nicht gesendete Änderung als synct markieren und
+    // sie dauerhaft verlieren. Der neuere Wert bleibt stattdessen dirty; der
+    // pushSyncSoon()-Aufruf, der ihn geändert hat, hat bereits einen eigenen
+    // 2s-Timer dafür gestartet.
+    const currentMeta = loadSyncMeta();
+    keys.forEach(key => {
+      if((currentMeta[key] || 0) <= pushedAt[key]) syncDirtyKeys.delete(key);
+    });
   }catch(e){
     // Offline/Worker nicht erreichbar: syncMeta ist schon geschrieben, kein
     // Datenverlust -- einfach in 30s automatisch erneut versuchen, ohne auf
@@ -13503,7 +13580,16 @@ async function pullSyncOnLoad(){
     if(!res.ok) return;
     const data = await res.json();
     const localMeta = loadSyncMeta();
-    const { toApplyLocally, newLocalMeta } = computeSyncMergePlan(localMeta, (data && data.keys) || {});
+    const { toApplyLocally, newLocalMeta, toPushRemotely } = computeSyncMergePlan(localMeta, (data && data.keys) || {});
+    // Re-queue any key whose local change never actually made it to the
+    // server (see computeSyncMergePlan()'s toPushRemotely comment) -- runs
+    // on every app start, so it self-heals even after syncDirtyKeys was lost
+    // to a closed tab or an offline edit that never got a retry chance.
+    if(toPushRemotely.length){
+      toPushRemotely.forEach(key => syncDirtyKeys.add(key));
+      clearTimeout(syncPushTimer);
+      syncPushTimer = setTimeout(pushSyncNow, 2000);
+    }
     if(Object.keys(toApplyLocally).length === 0) return;
     Object.entries(toApplyLocally).forEach(([key, value]) => {
       try{ localStorage.setItem(key, value); }catch(e){}

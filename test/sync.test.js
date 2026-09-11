@@ -122,6 +122,65 @@ test('computeSyncMergePlan', async (t) => {
     assert.deepEqual(plain(result.toApplyLocally), { velocast_settings: 'real-value' });
     assert.deepEqual(plain(result.newLocalMeta), { velocast_settings: 100 });
   });
+
+  // toPushRemotely: Nachschärfung gegen einen verlorenen Push, wenn
+  // syncDirtyKeys (reine Laufzeit-Variable) durch einen geschlossenen Tab
+  // oder eine Offline-Änderung verloren geht, bevor der Push je ankam --
+  // localMeta (persistiert) bleibt die verlässliche Quelle, ob ein Key noch
+  // "aussteht".
+  await t.test('toPushRemotely: local key newer than what the server has -> re-queued for push', () => {
+    const { get } = loadApp();
+    const plan = get('computeSyncMergePlan');
+    const result = plan(
+      { velocast_settings: 500 },
+      { velocast_settings: { value: 'server-stale', updatedAt: 200 } }
+    );
+    assert.deepEqual(plain(result.toPushRemotely), ['velocast_settings']);
+  });
+
+  await t.test('toPushRemotely: local key the server has never seen at all (missing from remote) -> re-queued', () => {
+    const { get } = loadApp();
+    const plan = get('computeSyncMergePlan');
+    const result = plan({ velocast_chain_wear: 42 }, {});
+    assert.deepEqual(plain(result.toPushRemotely), ['velocast_chain_wear']);
+  });
+
+  await t.test('toPushRemotely: remote is newer or equal -> NOT re-queued (that key goes to toApplyLocally / is already in sync instead)', () => {
+    const { get } = loadApp();
+    const plan = get('computeSyncMergePlan');
+    const newer = plan({ velocast_settings: 100 }, { velocast_settings: { value: 'v', updatedAt: 200 } });
+    assert.deepEqual(plain(newer.toPushRemotely), []);
+    const equal = plan({ velocast_settings: 200 }, { velocast_settings: { value: 'v', updatedAt: 200 } });
+    assert.deepEqual(plain(equal.toPushRemotely), []);
+  });
+
+  await t.test('toPushRemotely: only genuinely pending keys are listed, mixed with up-to-date ones', () => {
+    const { get } = loadApp();
+    const plan = get('computeSyncMergePlan');
+    const result = plan(
+      { velocast_settings: 500, velocast_chain_wear: 100, velocast_tire_pressure: 50 },
+      {
+        velocast_settings: { value: 'server-stale', updatedAt: 200 }, // local newer -> pending
+        velocast_chain_wear: { value: 'v', updatedAt: 100 },          // equal -> not pending
+        // velocast_tire_pressure absent from remote entirely -> pending
+      }
+    );
+    assert.deepEqual(plain(result.toPushRemotely).sort(), ['velocast_settings', 'velocast_tire_pressure']);
+  });
+
+  await t.test('toPushRemotely: a key outside SYNC_KEYS in localMeta is never queued (defensive, matches the same allowlist as everywhere else)', () => {
+    const { get } = loadApp();
+    const plan = get('computeSyncMergePlan');
+    const result = plan({ not_a_real_sync_key: 999999999999 }, {});
+    assert.deepEqual(plain(result.toPushRemotely), []);
+  });
+
+  await t.test('toPushRemotely: empty localMeta -> nothing pending, no crash', () => {
+    const { get } = loadApp();
+    const plan = get('computeSyncMergePlan');
+    const result = plan({}, { velocast_settings: { value: 'v', updatedAt: 5 } });
+    assert.deepEqual(plain(result.toPushRemotely), []);
+  });
 });
 
 test('SYNC_KEYS', async (t) => {

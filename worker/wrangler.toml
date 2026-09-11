@@ -1,3 +1,16 @@
+# ==============================================================================
+# WARNUNG: Diese Datei ist NUR Dokumentation/Referenz -- NICHT in ihrem
+# aktuellen Zustand deploybar. Dieses Projekt wird über das Cloudflare-
+# Dashboard deployt (Worker -> Code bearbeiten -> Deploy), NICHT per
+# `wrangler deploy`. Würde trotzdem jemand `wrangler deploy` aus diesem
+# Verzeichnis ausführen, würde das mit den Werten unten GLEICHZEITIG:
+#   - den Hammerhead-Login deaktivieren (HAMMERHEAD_CLIENT_ID = Platzhalter)
+#   - den Origin-Schutz des Workers komplett abschalten (ALLOWED_ORIGIN = "*")
+#   - den gesamten Geräte-Sync zum Absturz bringen (SYNC_KV-Bindung weiter
+#     unten ist auskommentiert, env.SYNC_KV wäre dann undefined)
+# Vor einem echten `wrangler deploy` müssten ALLE drei Werte unten durch die
+# echten, im Cloudflare-Dashboard bereits gesetzten Werte ersetzt werden.
+# ==============================================================================
 name = "rueckenwind-oauth"
 main = "src/index.js"
 compatibility_date = "2026-08-04"
@@ -9,6 +22,13 @@ HAMMERHEAD_CLIENT_ID = "REPLACE_ME"
 # Restrict this to your GitHub Pages origin once deployed, e.g.
 # "https://<username>.github.io"
 ALLOWED_ORIGIN = "*"
+# Comma-separated Strava athlete ids allowed to use /sync (see
+# isAllowedAthlete() in src/index.js) -- without this, ANY Strava account
+# could read/write this Worker's /sync KV storage. Not secret (an athlete id
+# isn't a credential, same sensitivity as STRAVA_CLIENT_ID above), but must
+# actually be set -- the Worker fails closed (denies everyone) if this is
+# empty.
+ALLOWED_ATHLETE_IDS = "177534499"
 
 # STRAVA_CLIENT_SECRET / HAMMERHEAD_CLIENT_SECRET are NOT set here (this file
 # is safe to commit). Set them with:

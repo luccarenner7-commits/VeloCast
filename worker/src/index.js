@@ -21,7 +21,11 @@
 //                                den Token direkt bei Strava (GET /athlete)
 //                                und nutzt die zurückgegebene athlete.id als
 //                                KV-Key, statt einer vom Client mitgeschickten
-//                                ID zu vertrauen. Braucht ein KV-Binding
+//                                ID zu vertrauen. Zusätzlich auf die in
+//                                ALLOWED_ATHLETE_IDS gelisteten Athleten
+//                                beschränkt (siehe isAllowedAthlete()) --
+//                                sonst könnte jeder beliebige Strava-Account
+//                                diese Route nutzen. Braucht ein KV-Binding
 //                                namens SYNC_KV (siehe wrangler.toml).
 //
 // Deploy: set STRAVA_CLIENT_ID / HAMMERHEAD_CLIENT_ID (see wrangler.toml)
@@ -141,9 +145,27 @@ async function verifyAthleteId(request, env) {
   return athlete && athlete.id ? String(athlete.id) : null;
 }
 
+// Restricts /sync to this app's one real user. verifyAthleteId() alone only
+// proves "this is a real, currently-valid Strava access token" -- it does
+// NOT prove the token belongs to the person who owns this deployment. Any
+// Strava account (anyone can create one for free) could otherwise call
+// /sync and consume this Worker's KV write quota (1000 writes/day on the
+// free tier) or storage. ALLOWED_ATHLETE_IDS is a comma-separated list of
+// Strava athlete ids (as strings) permitted to use /sync -- set once in the
+// Cloudflare dashboard (Worker -> Settings -> Variables and Secrets) or in
+// wrangler.toml's [vars] (athlete ids aren't secret, same sensitivity as the
+// already-committed STRAVA_CLIENT_ID). Deliberately fails CLOSED if unset
+// (denies everyone) rather than open -- for a single-user app, an unset var
+// is far more likely to mean "not configured yet" than "intentionally
+// unrestricted".
+function isAllowedAthlete(athleteId, env) {
+  const allowed = (env.ALLOWED_ATHLETE_IDS || "").split(",").map((s) => s.trim()).filter(Boolean);
+  return allowed.includes(athleteId);
+}
+
 async function handleSyncGet(request, env) {
   const athleteId = await verifyAthleteId(request, env);
-  if (!athleteId) return jsonResponse({ error: "unauthorized" }, 401, env);
+  if (!athleteId || !isAllowedAthlete(athleteId, env)) return jsonResponse({ error: "unauthorized" }, 401, env);
   const raw = await env.SYNC_KV.get(`sync:${athleteId}`);
   const stored = raw ? JSON.parse(raw) : { keys: {} };
   return jsonResponse(stored, 200, env);
@@ -175,7 +197,7 @@ const SYNC_MAX_VALUE_LENGTH = 2_000_000;
 // den Client-Keys blind zu vertrauen.
 async function handleSyncPut(request, env) {
   const athleteId = await verifyAthleteId(request, env);
-  if (!athleteId) return jsonResponse({ error: "unauthorized" }, 401, env);
+  if (!athleteId || !isAllowedAthlete(athleteId, env)) return jsonResponse({ error: "unauthorized" }, 401, env);
   let body;
   try { body = await request.json(); } catch { return jsonResponse({ error: "invalid_json" }, 400, env); }
   const incoming = (body && body.keys) || {};
