@@ -387,6 +387,22 @@
   .source-tab:hover{ border-color:var(--route); }
   .source-tab.active{ background:var(--asphalt-3); border-color:var(--chalk); color:var(--chalk); }
 
+  /* Profil's tab bar (renderProfilTabBar()) is the only .source-tabs row with
+     4 tabs AND long German labels ("FTP-Verlauf", "Profil-Kern") -- at
+     <=620px that combination overflows a single flex:1 row and wraps
+     mid-word to an ugly 2-line 52px bar. Scoped to .profil-tabs specifically
+     (see renderProfilTabBar()'s own comment) so the other .source-tab rows
+     (route-info's 3 tabs, route-source's up to 4 short-label tabs, GPX/
+     Gespeicherte-Route's 2, the trainer test-duration picker's 4 short
+     labels) keep their existing single-line desktop AND mobile layout
+     untouched. Wraps cleanly into a 2x2 grid instead -- each tab keeps its
+     label on one line, and the row's overall height on top of that is still
+     modest. */
+  @media (max-width:620px){
+    .profil-tabs{ flex-wrap:wrap; }
+    .profil-tabs .source-tab{ flex:1 1 calc(50% - 3px); min-width:calc(50% - 3px); }
+  }
+
   /* Activity picker. Same rule: "selected" is a neutral UI state (uses the
      --route info accent, consistent with hover), never tail/head/cross. */
   .activity{
@@ -1238,7 +1254,7 @@ let state = {
   // nothing outside the Profil page reads, so keeping it grouped makes both
   // this initial shape and resetConnectionState()'s teardown easier to audit.
   profilPage: {
-    subTab: "ftp", // "ftp" | "form" | "kern" - which merged section is shown
+    subTab: "ftp", // "ftp" | "form" | "kern" | "rueckblick" - which merged section is shown
     loading: false,
     loaded: false, // true once a load has completed (success OR failure) - gates the manual "Trainingsdaten laden" button same as routeSegmentsFetched does
     error: null,
@@ -1256,7 +1272,21 @@ let state = {
     efficiency: null,
     climbing: null,
     durability: null,
-    weak: null
+    weak: null,
+    // ---- Rückblick sub-tab (season recap) -- deliberately its own small
+    // block of runtime-only fields, independent of the FTP-analysis fields
+    // above (loaded/results/etc.), since this tab's data doesn't come from
+    // that pipeline at all. See computeSeasonRecap()/isYearDataComplete()
+    // near the Aktivitäten-cache section for the actual logic. ----
+    recapYear: new Date().getFullYear(), // selected year in the Rückblick dropdown - runtime-only UI selection, same category as subTab above
+    recapLoading: false, // true while backfillActivitiesForYear() is in flight
+    recapError: null,
+    // Years already proven to have NO further history before them (see
+    // backfillActivitiesForYear()'s "fewer than 100 items back" signal) --
+    // in-memory only, same category as stravaRoutesVerifiedThisSession
+    // below, not persisted and reset on disconnect since it's a fact about
+    // the currently-connected account's history depth.
+    recapExhaustedYears: new Set()
   },
   // ---- Aktivitäten page (browsable activity list + per-ride detail) ----
   // Deliberately its own bucket too, same rationale as profilPage above —
@@ -3234,6 +3264,35 @@ function applyNachmessenUpdate(w, measured, neu, now){
 const RIDE_SPORT_TYPES = new Set([
   "Ride","VirtualRide","GravelRide","MountainBikeRide","EBikeRide","Velomobile","Handcycle"
 ]);
+
+// ---------- Jahresrückblick (season recap): flavor-comparison constants ----------
+// Used by computeSeasonRecap() (near the Aktivitäten-cache section below) to
+// turn the season's raw totals into lighthearted comparisons. All plain,
+// widely-known reference figures -- exact precision doesn't matter here,
+// this is a fun stat, not a scientific one.
+const EARTH_CIRCUMFERENCE_KM = 40075;
+const MOUNT_EVEREST_M = 8849;
+const MOVIE_LENGTH_HOURS = 2;
+const DAILY_BASAL_KCAL = 2000;
+const PIZZA_KCAL = 800;
+// Curated, deliberately short list of real (approximate) German city-pair
+// road distances for the "Ø Fahrtlänge" comparison via closestCommuteReference()
+// below -- no geocoding/distance-API lookup, that would be wildly overkill
+// for a flavor stat. Spans roughly 20-80 km so most riders' average ride
+// length lands somewhere recognizable in the middle of the list.
+const COMMUTE_DISTANCE_REFERENCES = [
+  { label: "Nürnberg – Erlangen", km: 20 },
+  { label: "Berlin – Potsdam", km: 27 },
+  { label: "Köln – Bonn", km: 30 },
+  { label: "Frankfurt – Wiesbaden", km: 40 },
+  { label: "Stuttgart – Heilbronn", km: 50 },
+  { label: "Regensburg – Amberg", km: 50 },
+  { label: "Hannover – Braunschweig", km: 65 },
+  { label: "München – Augsburg", km: 65 },
+  { label: "München – Rosenheim", km: 65 },
+  { label: "Frankfurt – Mannheim", km: 80 },
+];
+
 const MMP_DURATIONS_SEC = [5,15,30,60,120,180,300,480,600,900,1200,1800,2700,3600];
 const FTP_FACTORS = [
   { sec:1200, factor:0.95, confidence:"hoch" },
@@ -4611,6 +4670,14 @@ function resetConnectionState(){
   state.profilPage.climbing = null;
   state.profilPage.durability = null;
   state.profilPage.weak = null;
+  // recapYear (a UI preference, like subTab) deliberately survives a
+  // disconnect/reconnect -- but recapExhaustedYears is a fact about the
+  // now-invalidated account's Strava history depth, same reasoning as
+  // stravaRoutesVerifiedThisSession below, so it must not leak into a
+  // different account's session.
+  state.profilPage.recapLoading = false;
+  state.profilPage.recapError = null;
+  state.profilPage.recapExhaustedYears = new Set();
   // Same "tied to the now-invalidated token, not to the on-disk cache"
   // split as profilPage above — velocast_activity_list_cache is left alone,
   // only the in-memory view resets.
@@ -9180,14 +9247,17 @@ function renderProfilEmptyCard(){
   return card;
 }
 
+// Full sub-nav card for the ftp/form/kern happy path (pp.results already
+// populated): tab bar (renderProfilTabBar(), defined further below but
+// hoisted like every top-level `function` here) PLUS the "Fahrten
+// ausgewertet"/error/"Mehr laden"/"Aktualisieren" row, which only makes
+// sense once that pipeline actually has something to report on. Rückblick
+// never reaches this function -- see renderProfilPage(), which uses the
+// bare renderProfilTabBar() instead whenever pp.subTab is "rueckblick" or
+// the pipeline's own gates are still blocking real content.
 function renderProfilSubNav(){
   const pp = state.profilPage;
-  const card = el("div", {class:"card"});
-  const tabs = [ {id:"ftp", label:"FTP-Verlauf"}, {id:"form", label:"Formkurve"}, {id:"kern", label:"Profil-Kern"} ];
-  card.appendChild(el("div", {class:"source-tabs"}, tabs.map(t => el("div", {
-    class: "source-tab" + (pp.subTab===t.id ? " active" : ""),
-    onclick: ()=>{ pp.subTab = t.id; render(); }
-  }, [t.label]))));
+  const card = renderProfilTabBar();
   // Refresh/load-more can fail after a successful first load; pp.error stays set
   // but there's still data to show, so surface it here instead of the full-page error card.
   if(pp.error && pp.results.length) card.appendChild(el("div", {class:"error", style:"margin:10px 0;"}, [pp.error]));
@@ -9491,26 +9561,216 @@ function renderProfilKernGearCard(frag, pp){
   }
 }
 
+// German "X% des Mount Everest" / "X,X-mal den Mount Everest" wording for
+// computeSeasonRecap()'s raw everestRatio -- kept as a tiny UI-only helper
+// since the pure function deliberately returns just the ratio, not text (see
+// computeSeasonBasisNumbers()'s own comment on that field).
+function formatEverestComparison(ratio){
+  const pct = ratio * 100;
+  return pct <= 100 ? `${pct.toFixed(0)}% des Mount Everest` : `${ratio.toFixed(1)}-mal den Mount Everest`;
+}
+function recapDeDate(iso){
+  const d = new Date(iso);
+  return isFinite(d.getTime()) ? d.toLocaleDateString('de-DE', {day:'2-digit', month:'short', year:'numeric'}) : "";
+}
+function recapDeMonth(monthKey){
+  const d = new Date(monthKey + "-01");
+  return isFinite(d.getTime()) ? d.toLocaleDateString('de-DE', {month:'long', year:'numeric'}) : monthKey;
+}
+
+// Persistent node, same reason as segmentSortSelect above (its onchange
+// triggers render() directly, which would otherwise tear down and replace
+// this exact <select> instance out from under its own still-firing change
+// event) -- unlike segmentSortSelect's fixed option list though, the set of
+// selectable years genuinely changes (more Aktivitäten-cache history, a new
+// calendar year starting), so syncRecapYearSelectOptions() below rebuilds
+// its <option> children on demand instead of the list being static here.
+const recapYearSelect = el("select", {
+  style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:var(--r-sm); padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
+  onchange:(e)=>{ state.profilPage.recapYear = Number(e.target.value); render(); }
+}, []);
+let recapYearSelectOptionsKey = null;
+function syncRecapYearSelectOptions(years){
+  const key = years.join(",");
+  if(key !== recapYearSelectOptionsKey){
+    // innerHTML assignment (not a removeChild loop) so this stays safe even
+    // against a generic/permissive element stub that doesn't track real
+    // children (see test/support/loadApp.js) -- this function is never
+    // exercised by the pure-function test suite, but there's no reason to
+    // rely on that.
+    recapYearSelect.innerHTML = "";
+    years.forEach(y => recapYearSelect.appendChild(el("option", {value:String(y)}, [String(y)])));
+    recapYearSelectOptionsKey = key;
+  }
+  syncPersistentInputValue(recapYearSelect, String(state.profilPage.recapYear));
+}
+
+// Rückblick sub-tab: completely independent of the FTP-analysis pipeline
+// (pp.loading/pp.loaded/pp.results) that gates the other three Profil tabs —
+// only reads the Aktivitäten list cache, loadConfirmedTests(),
+// loadTrainerHistory() and whatever state.profilPage.gear already holds
+// (which may itself be empty if "Trainingsdaten laden" was never run — see
+// the Ausrüstung card below, which degrades gracefully for exactly that
+// case rather than triggering its own gear fetch, since this tab must never
+// make Strava API calls on its own just from being opened).
+//
+// UX choice for the incomplete-cache case (spec leaves this to
+// implementer's judgment): show the stats computed from whatever's already
+// cached RIGHT AWAY, with an honest "Daten unvollständig" callout and the
+// "Rückblick laden" button above them — instead of hiding all stats behind
+// the button. Immediate partial numbers (clearly flagged as partial) reads
+// as more useful/fun than a blank page demanding a click first.
+function renderProfilRueckblickSection(frag){
+  const pp = state.profilPage;
+  const cache = loadAktivitaetenListCache();
+  const currentYear = new Date().getFullYear();
+  const years = getRecapYearOptions(cache, currentYear);
+  if(!years.includes(pp.recapYear)) pp.recapYear = years[0];
+  const year = pp.recapYear;
+  const complete = isYearDataComplete(cache, year, pp.recapExhaustedYears);
+
+  const headCard = el("div", {class:"card"});
+  headCard.appendChild(h2WithInfo("Jahresrückblick", "Aggregierte Saison-Stats aus deinen Strava-Fahrten des gewählten Jahres — Kilometer, Höhenmeter, Bestleistungen, Trainingsfortschritt und Ausrüstung, jeweils mit einem launigen Vergleich."));
+  headCard.appendChild(el("div", {class:"muted", style:"font-size:11px; margin-bottom:6px;"}, ["Jahr"]));
+  syncRecapYearSelectOptions(years);
+  headCard.appendChild(recapYearSelect);
+  if(!complete){
+    headCard.appendChild(el("div", {style:"margin-top:12px;"}, [
+      calloutBox('warn', "Daten unvollständig",
+        `Für ${year} liegen noch nicht alle Fahrten im Cache — die Zahlen unten basieren nur auf dem, was bereits geladen ist. „Rückblick laden" holt gezielt den Rest von Strava nach (kann bei viel Historie etwas dauern).`)
+    ]));
+    if(pp.recapError) headCard.appendChild(el("div", {class:"error", style:"margin-top:10px;"}, [pp.recapError]));
+    headCard.appendChild(el("button", {
+      class:"btn", style:"width:100%; margin-top:12px;", disabled: pp.recapLoading ? "disabled" : null,
+      onclick: ()=>backfillActivitiesForYear(state.accessToken, year)
+    }, [pp.recapLoading ? "Lädt…" : "Rückblick laden"]));
+  }
+  frag.appendChild(headCard);
+
+  const recap = computeSeasonRecap(Object.values(cache), year, loadConfirmedTests(), loadTrainerHistory(), pp.gear);
+  const B = recap.basis, P = recap.prs, Pg = recap.progress;
+
+  const basisCard = el("div", {class:"card"});
+  basisCard.appendChild(h2WithInfo("Basis-Zahlen", `Für das Jahr ${year}, aus ${B.rideCount} Fahrt${B.rideCount===1?'':'en'}.`));
+  basisCard.appendChild(el("div", {class:"metric-grid"}, [
+    metricCard("Gesamt-Kilometer", `${B.totalKm.toFixed(0)} km`, `${B.earthCircumferencePct.toFixed(1)}% des Erdumfangs`),
+    metricCard("Gesamt-Höhenmeter", `${B.totalElevationM.toFixed(0)} Hm`, formatEverestComparison(B.everestRatio)),
+    metricCard("Anzahl Fahrten", String(B.rideCount), `${B.rideCountPctOfDays.toFixed(0)}% aller Tage in ${year}`),
+    metricCard("Gesamte Fahrzeit", `${B.totalHours.toFixed(0)} Std.`, `${B.timePctOfYear.toFixed(1)}% des Jahres · ${B.movieCount.toFixed(0)} Kinofilme`),
+    metricCard("Ø Fahrtlänge", `${B.avgRideKm.toFixed(1)} km`, B.avgRideKmCommuteRef ? `wie ${B.avgRideKmCommuteRef.label} (${B.avgRideKmCommuteRef.km} km)` : null),
+    B.kcalRideCount > 0
+      ? metricCard("Gesamt-Kalorien", `${Math.round(B.totalKcal)} kcal`, `${B.kcalPctOfBasalYear.toFixed(1)}% des Jahres-Grundumsatzes · ${B.pizzaCount.toFixed(1)} Pizzen`)
+      : metricCard("Gesamt-Kalorien", "–", "keine Fahrten mit Leistungsmesser")
+  ]));
+  frag.appendChild(basisCard);
+
+  const prsCard = el("div", {class:"card"});
+  prsCard.appendChild(h2WithInfo("Bestleistungen des Jahres", "Schnellster Ø-Speed zählt nur Fahrten ab 20 km, damit ein kurzer Sprint das Ergebnis nicht verzerrt. Woche = Montag bis Sonntag, wie überall sonst in der App."));
+  if(B.rideCount === 0){
+    prsCard.appendChild(el("div", {class:"empty-state"}, [`Noch keine Fahrten in ${year}.`]));
+  } else {
+    prsCard.appendChild(el("div", {class:"metric-grid"}, [
+      metricCard("Längste Einzelfahrt", `${P.longestRideKm.toFixed(1)} km`),
+      P.maxElevationDay ? metricCard("Meiste Höhenmeter an einem Tag", `${Math.round(P.maxElevationDay.elevationM)} Hm`, recapDeDate(P.maxElevationDay.dateIso)) : null,
+      P.fastestAvgSpeedKmh != null
+        ? metricCard("Schnellster Ø-Speed", `${P.fastestAvgSpeedKmh.toFixed(1)} km/h`, "ab 20 km Fahrtlänge gewertet")
+        : metricCard("Schnellster Ø-Speed", "–", "keine Fahrt ≥ 20 km"),
+      P.mostActiveWeek ? metricCard("Aktivste Woche", `${P.mostActiveWeek.km.toFixed(0)} km`, "Woche ab " + recapDeDate(P.mostActiveWeek.weekStartIso)) : null,
+      P.mostActiveMonth ? metricCard("Aktivster Monat", `${P.mostActiveMonth.km.toFixed(0)} km`, recapDeMonth(P.mostActiveMonth.month)) : null
+    ].filter(Boolean)));
+  }
+  frag.appendChild(prsCard);
+
+  const progressCard = el("div", {class:"card"});
+  progressCard.appendChild(h2WithInfo("Trainingsfortschritt", "FTP-Entwicklung vergleicht deinen ersten und letzten bestätigten 20-Minuten-Test des Jahres — erscheint erst ab 2 bestätigten Tests, ein einzelner Test wäre keine echte Entwicklung."));
+  const progressCards = [];
+  // Fewer than 2 confirmed 20-Min-Tests this year: absent by design (see
+  // computeSeasonProgress()'s own comment) -- literally nothing shown for
+  // this stat, not even a placeholder, rather than a misleading single point.
+  if(Pg.ftpProgress){
+    const fp = Pg.ftpProgress;
+    const sign = fp.deltaWatts > 0 ? "+" : "";
+    progressCards.push(metricCard(
+      "FTP-Entwicklung (20-Min-Test)",
+      `${sign}${fp.deltaWatts} W`,
+      `${fp.firstWatts} W (${recapDeDate(fp.firstDateIso)}) → ${fp.lastWatts} W (${recapDeDate(fp.lastDateIso)}) · ${fp.testCount} Tests`,
+      fp.deltaWatts > 0 ? "up" : (fp.deltaWatts < 0 ? "down" : null)
+    ));
+  }
+  progressCards.push(metricCard("Workouts / Intervall-Einheiten", String(Pg.workoutCount)));
+  progressCard.appendChild(el("div", {class:"metric-grid"}, progressCards));
+  frag.appendChild(progressCard);
+
+  const gearCard = el("div", {class:"card"});
+  gearCard.appendChild(h2WithInfo("Ausrüstung", 'Kilometer pro Rad, nur aus Fahrten dieses Jahres mit hinterlegter Rad-Zuordnung. Fahrten ohne oder mit unbekannter Zuordnung landen ehrlich unter „Unbekannt" statt zu verschwinden.'));
+  if(!recap.gear.length){
+    gearCard.appendChild(el("div", {class:"empty-state"}, ['Keine Ausrüstungsdaten für dieses Jahr — Rad-Zuordnung fehlt oder Ausrüstungsliste noch nicht geladen (siehe „Profil-Kern").']));
+  } else {
+    gearCard.appendChild(el("div", {class:"metric-grid"}, recap.gear.map(g => metricCard(g.label, `${g.km.toFixed(0)} km`))));
+  }
+  frag.appendChild(gearCard);
+}
+
+// Plain tab-switcher bar shared by every Profil sub-tab -- deliberately
+// separate from renderProfilSubNav()'s full card (tab bar + "Fahrten
+// ausgewertet"/error/"Mehr laden"/"Aktualisieren" row) below, because THAT
+// row only makes sense once the FTP-analysis pipeline actually has
+// pp.results to report on. renderProfilPage() uses this bare bar whenever
+// that pipeline's own loading/loaded/error/empty gates are blocking real
+// content (including for Rückblick, which never needs that pipeline at
+// all) -- see its own comment for why the tab bar must stay reachable in
+// those states while the gated content itself stays exactly as before.
+function renderProfilTabBar(){
+  const pp = state.profilPage;
+  const card = el("div", {class:"card"});
+  const tabs = [ {id:"ftp", label:"FTP-Verlauf"}, {id:"form", label:"Formkurve"}, {id:"kern", label:"Profil-Kern"}, {id:"rueckblick", label:"Rückblick"} ];
+  // "profil-tabs" scopes the <=620px 4-tab mobile fix below to just this bar
+  // -- .source-tabs/.source-tab is shared with several other 2-4-tab rows
+  // elsewhere (route-info, route-source, GPX/Gespeicherte-Route, the trainer
+  // test-duration picker) that already fit fine at mobile widths with their
+  // own (shorter) labels, so the fix must not touch them.
+  card.appendChild(el("div", {class:"source-tabs profil-tabs"}, tabs.map(t => el("div", {
+    class: "source-tab" + (pp.subTab===t.id ? " active" : ""),
+    onclick: ()=>{ pp.subTab = t.id; render(); }
+  }, [t.label]))));
+  return card;
+}
+
 function renderProfilPage(){
   const frag = document.createDocumentFragment();
   if(!state.connected){
-    frag.appendChild(renderStravaConnectCard("Profil", "Verbinde dich mit Strava, um FTP-Verlauf, Formkurve und dein Leistungsprofil aus deinen Fahrten zu sehen."));
+    frag.appendChild(renderStravaConnectCard("Profil", "Verbinde dich mit Strava, um FTP-Verlauf, Formkurve, dein Leistungsprofil und deinen Jahresrückblick aus deinen Fahrten zu sehen."));
     return frag;
   }
   const pp = state.profilPage;
+  // Rückblick is deliberately reachable without any of the FTP-analysis
+  // pipeline's own gates below (pp.loading/!pp.loaded/pp.error/!pp.results.length)
+  // -- its data (Aktivitäten-cache/confirmedTests/trainerHistory/gear) never
+  // comes from that pipeline, so making the user run "Trainingsdaten laden"
+  // first would be a pointless, unrelated gate. The other three tabs keep
+  // their exact original gating below, unchanged.
+  if(pp.subTab === "rueckblick"){
+    frag.appendChild(renderProfilTabBar());
+    renderProfilRueckblickSection(frag);
+    return frag;
+  }
   if(pp.loading){
+    frag.appendChild(renderProfilTabBar());
     frag.appendChild(renderProfilLoadingCard());
     return frag;
   }
   if(!pp.loaded){
+    frag.appendChild(renderProfilTabBar());
     frag.appendChild(renderProfilLoadPromptCard());
     return frag;
   }
   if(pp.error && !pp.results.length){
+    frag.appendChild(renderProfilTabBar());
     frag.appendChild(renderProfilErrorCard());
     return frag;
   }
   if(!pp.results.length){
+    frag.appendChild(renderProfilTabBar());
     frag.appendChild(renderProfilEmptyCard());
     return frag;
   }
@@ -9664,6 +9924,385 @@ function ensureAktivitaetenDetailStream(id, token){
   if(d.id === id) return; // already fetching/fetched/failed for this activity
   d.id = id; d.loading = true; d.error = null; d.notAvailable = false; d.stream = null; d.metrics = null;
   loadAktivitaetenDetailStream(id, token);
+}
+
+// ---------- Jahresrückblick (season recap) ----------
+// New 4th Profil sub-tab: aggregate season stats + lighthearted comparisons.
+// Deliberately independent of the Profil FTP-analysis pipeline (pp.results)
+// above -- it only reads the Aktivitäten list cache (AKTIVITAETEN_LIST_CACHE_KEY,
+// already populated by browsing the Aktivitäten tab), loadConfirmedTests(),
+// loadTrainerHistory() and state.profilPage.gear, none of which need the
+// "Trainingsdaten laden" pipeline's per-ride power-stream fetches. See
+// renderProfilPage()'s restructuring below for why this tab is reachable
+// without that gate.
+
+// The activity-list cache (see AKTIVITAETEN_LIST_CACHE_KEY above) is only
+// ever populated by the user manually paging through the Aktivitäten tab, so
+// for most riders it won't yet reach back to January 1st of a given year --
+// pagination simply hasn't gone that far back. isYearDataComplete() decides
+// whether the cache can already answer "give me every ride in `year`"
+// truthfully: either (a) some cached activity is dated before the year even
+// started (proof pagination already passed that boundary), or (b) `year` is
+// recorded in `exhaustedYears` -- the escape hatch for an athlete's very
+// first-ever year on Strava, where condition (a) can never be true no matter
+// how far back paging goes, because there IS nothing before it (see
+// backfillActivitiesForYear() below for how a year earns that flag).
+function isYearDataComplete(cachedActivities, year, exhaustedYears){
+  const list = Array.isArray(cachedActivities) ? cachedActivities : Object.values(cachedActivities || {});
+  const yearStartMs = Date.UTC(year, 0, 1);
+  const hasActivityBeforeYear = list.some(a => {
+    const raw = a && (a.start_date_local || a.start_date);
+    if(!raw) return false;
+    const t = new Date(raw).getTime();
+    return isFinite(t) && t < yearStartMs;
+  });
+  if(hasActivityBeforeYear) return true;
+  const exhausted = exhaustedYears instanceof Set ? exhaustedYears : new Set(exhaustedYears || []);
+  return exhausted.has(year);
+}
+
+// Selectable years for the recap dropdown: every distinct year already seen
+// in the cache, PLUS the current calendar year even when nothing's cached
+// for it yet -- a brand-new user should still see "this year" as an option,
+// which is what prompts the "Rückblick laden" backfill button in the first
+// place. Sorted newest-first (default selection).
+function getRecapYearOptions(cachedActivities, currentYear){
+  const list = Array.isArray(cachedActivities) ? cachedActivities : Object.values(cachedActivities || {});
+  const years = new Set();
+  list.forEach(a => {
+    const raw = a && (a.start_date_local || a.start_date);
+    if(!raw) return;
+    const t = new Date(raw);
+    if(isFinite(t.getTime())) years.add(t.getUTCFullYear());
+  });
+  years.add(currentYear);
+  return Array.from(years).sort((a,b)=>b-a);
+}
+
+// Pure helper for backfillActivitiesForYear() below: true when the cache
+// that came back from loadAktivitaetenListCache() right after a
+// saveAktivitaetenListCache() call is SMALLER than what was actually merged
+// in immediately before that save -- proof that AKTIVITAETEN_LIST_CACHE_MAX
+// (saveAktivitaetenListCache()'s slice(0, 600)) silently evicted real,
+// just-fetched activities rather than merely re-saving what was already
+// there. Extracted as its own pure function so it stays unit-testable (see
+// test/season-recap.test.js) even though the async orchestration around it
+// isn't (same fetch-orchestration convention as pushSyncNow()/
+// pullSyncOnLoad() elsewhere in this file -- see the comment atop
+// test/sync.test.js). persistedCountAfterSave larger than
+// mergedCountBeforeSave "shouldn't happen" (the persisted cache can only
+// ever be a trimmed subset of what was just merged and saved) but is
+// treated as "no eviction" rather than crashing.
+function didCacheEvict(mergedCountBeforeSave, persistedCountAfterSave){
+  return persistedCountAfterSave < mergedCountBeforeSave;
+}
+
+// Pages through fetchActivitiesPage() at Strava's max per_page (100 -- more
+// efficient for a one-shot bulk backfill than the Aktivitäten tab's own
+// perPage=30), merging every fetched page into the SAME
+// loadAktivitaetenListCache()/saveAktivitaetenListCache() cache so the
+// Aktivitäten tab benefits from this too. Resumes from state.aktivitaetenPage.page
+// (that field tracks the last Strava page actually fetched, in terms of the
+// Aktivitäten tab's own perPage=30 -- converting to an equivalent 100-sized
+// page via the item count, same `Math.floor(items/perPage)` idea
+// loadAktivitaetenList() already uses, keeps this from re-fetching pages
+// that tab already covers) rather than always restarting at page 1. Stops
+// when either (a) a fetched activity is dated before the year started (year
+// now provably complete), or (b) a page comes back with fewer than 100 items
+// (Strava's own signal that there's no more history at all) -- in case (b),
+// this year AND every earlier year with no cached activity of its own are
+// recorded into state.profilPage.recapExhaustedYears, since there's
+// genuinely nothing further back to page into for any of them either.
+//
+// EXCEPT: if the 600-entry cache cap (didCacheEvict(), above) ever discarded
+// data fetched during THIS run, recapExhaustedYears must NOT be trusted --
+// a page we already saw and merged in can be silently evicted before this
+// function ever gets to look at it again, so "no more history" would be a
+// lie born from data loss, not genuine exhaustion. isYearDataComplete()'s
+// OTHER branch (an activity found before the year boundary) doesn't need
+// this guard: it always re-reads whatever's currently actually persisted,
+// so it can't go stale the way a flag written once here could.
+async function backfillActivitiesForYear(token, year){
+  const pp = state.profilPage;
+  // Same re-entrancy guard as loadProfilData()'s own `if(pp.loading) return;`
+  // -- the button's `disabled` attribute already prevents a normal double-
+  // click, but this makes the guard correct regardless of caller.
+  if(pp.recapLoading) return;
+  pp.recapLoading = true;
+  pp.recapError = null;
+  render();
+  try{
+    const cache = loadAktivitaetenListCache();
+    const cachedCount = Object.keys(cache).length;
+    let page = Math.max(1, Math.floor(cachedCount / 100) + 1);
+    const yearStartMs = Date.UTC(year, 0, 1);
+    let reachedYearStart = false;
+    let exhaustedAll = false;
+    let evictionOccurred = false;
+    // A hard ceiling (30 pages of 100 = up to 3000 activities) so a
+    // pathological/looping response, or a multi-decade Strava history,
+    // can't turn one button click into an unbounded fetch loop -- generous
+    // enough that it should never actually bind for a single-year backfill
+    // in practice.
+    while(page <= 30){
+      const batch = await fetchActivitiesPage(token, page, 100);
+      if(!batch || !batch.length){ exhaustedAll = true; break; }
+      batch.forEach(a => { cache[String(a.id)] = a; });
+      const mergedCount = Object.keys(cache).length;
+      saveAktivitaetenListCache(cache);
+      const persistedCount = Object.keys(loadAktivitaetenListCache()).length;
+      if(didCacheEvict(mergedCount, persistedCount)) evictionOccurred = true;
+      const hasBeforeYear = batch.some(a => {
+        const raw = a.start_date_local || a.start_date;
+        const t = raw ? new Date(raw).getTime() : NaN;
+        return isFinite(t) && t < yearStartMs;
+      });
+      if(hasBeforeYear){ reachedYearStart = true; break; }
+      if(batch.length < 100){ exhaustedAll = true; break; }
+      page++;
+    }
+    if(evictionOccurred){
+      // The 600-cap discarded real, just-fetched data at some point during
+      // THIS run -- exhaustedAll (if set) is not trustworthy proof of
+      // completeness here, since the very pages that would prove it may
+      // have been the ones evicted. Deliberately do NOT touch
+      // recapExhaustedYears in this branch (neither adding `year` nor any
+      // earlier year) -- see isYearDataComplete()'s comment for why a false
+      // entry there is worse than just leaving the year "incomplete".
+      pp.recapError = "Cache-Limit erreicht — ältere Jahre könnten unvollständig bleiben.";
+    } else if(exhaustedAll){
+      // Nothing further back exists at all: this year is complete by
+      // definition (there's no "before" to prove), and so is every earlier
+      // year that has no cached activity of its own -- there's nothing to
+      // page into for those either.
+      const allDates = Object.values(cache).map(a => a.start_date_local || a.start_date).filter(Boolean);
+      const cachedYears = new Set(allDates.map(d => new Date(d).getUTCFullYear()).filter(y => isFinite(y)));
+      pp.recapExhaustedYears.add(year);
+      for(let y = year - 1; y >= year - 50 && !cachedYears.has(y); y--){
+        pp.recapExhaustedYears.add(y);
+      }
+    } else if(!reachedYearStart){
+      pp.recapError = "Rückblick konnte nicht vollständig geladen werden (Abbruch nach 30 Seiten).";
+    }
+  }catch(e){
+    pp.recapError = e.message || "Rückblick konnte nicht geladen werden.";
+  }
+  pp.recapLoading = false;
+  render();
+}
+
+// closestCommuteReference(km): picks the COMMUTE_DISTANCE_REFERENCES entry
+// whose km value is nearest to `km` -- used for the "Ø Fahrtlänge" comparison.
+// Always returns SOME entry (even for a km value far outside the list's own
+// range, it just returns whichever end is closest) rather than null/crashing.
+function closestCommuteReference(km){
+  let best = null, bestDiff = Infinity;
+  COMMUTE_DISTANCE_REFERENCES.forEach(ref => {
+    const diff = Math.abs(ref.km - km);
+    if(diff < bestDiff){ bestDiff = diff; best = ref; }
+  });
+  return best;
+}
+
+function isSeasonRecapLeapYear(year){
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+}
+
+// Filters the raw activity-list cache down to this season's qualifying
+// rides: RIDE_SPORT_TYPES (the same convention used everywhere else in this
+// file) AND a local calendar date inside `year`. `new Date(a.start_date_local
+// || a.start_date)`'s UTC fields already equal the LOCAL calendar
+// date/time here -- Strava's start_date_local encodes local wall-clock time
+// with a (misleading) trailing "Z", the same convention mondayOfUTC()/
+// toIsoDate() etc. already rely on elsewhere in this file (see the comment
+// above todayIsoKey()) -- so reading getUTCFullYear() here is already the
+// correct LOCAL year, not a UTC-shifted one.
+function filterSeasonRides(activities, year){
+  const list = Array.isArray(activities) ? activities : Object.values(activities || {});
+  return list.filter(a => {
+    if(!a) return false;
+    if(!RIDE_SPORT_TYPES.has(a.sport_type || a.type)) return false;
+    const raw = a.start_date_local || a.start_date;
+    if(!raw) return false;
+    const d = new Date(raw);
+    return isFinite(d.getTime()) && d.getUTCFullYear() === year;
+  });
+}
+
+// Gesamt-Kilometer/Höhenmeter/Fahrten/Fahrzeit/Ø-Fahrtlänge/Kalorien, each
+// with its raw comparison ratio -- the UI layer (renderProfilRueckblickSection())
+// turns these into actual German sentences, this function only computes numbers.
+function computeSeasonBasisNumbers(rides, daysInYear){
+  let totalKm = 0, totalElevationM = 0, totalMovingTimeSec = 0, totalKcal = 0, kcalRideCount = 0;
+  rides.forEach(a => {
+    totalKm += (a.distance||0) / 1000;
+    totalElevationM += (a.total_elevation_gain||0);
+    totalMovingTimeSec += (a.moving_time||0);
+    // Kalorien deliberately ONLY from rides with an actual power meter
+    // (device_watts===true) AND a recorded average_watts -- a ride without
+    // one contributes nothing here rather than falling back to a
+    // distance/weight-based estimate (a much cruder guess this feature
+    // deliberately doesn't make). kcal ≈ average_watts * moving_time_sec /
+    // 1000 -- the standard cycling rule-of-thumb that 1 kJ of mechanical
+    // work ≈ 1 kcal burned, since human gross efficiency (~24%) and the
+    // kJ→kcal conversion factor roughly cancel out. No extra efficiency
+    // division here -- that would double-count what the rule-of-thumb
+    // already folds in.
+    if(a.device_watts === true && a.average_watts != null){
+      totalKcal += a.average_watts * (a.moving_time||0) / 1000;
+      kcalRideCount++;
+    }
+  });
+  const rideCount = rides.length;
+  const avgRideKm = rideCount ? totalKm / rideCount : 0;
+  const totalHours = totalMovingTimeSec / 3600;
+  const yearHours = daysInYear * 24;
+  return {
+    totalKm, totalElevationM, rideCount, totalMovingTimeSec, totalHours, avgRideKm,
+    totalKcal, kcalRideCount,
+    earthCircumferencePct: (totalKm / EARTH_CIRCUMFERENCE_KM) * 100,
+    // Raw ratio, NOT a pre-baked percent/"-mal" string -- the UI picks the
+    // wording (percent under 100%, "X,X-mal den Mount Everest" over it).
+    everestRatio: totalElevationM / MOUNT_EVEREST_M,
+    rideCountPctOfDays: (rideCount / daysInYear) * 100,
+    timePctOfYear: (totalHours / yearHours) * 100,
+    movieCount: totalHours / MOVIE_LENGTH_HOURS,
+    avgRideKmCommuteRef: rideCount ? closestCommuteReference(avgRideKm) : null,
+    kcalPctOfBasalYear: (totalKcal / (DAILY_BASAL_KCAL * daysInYear)) * 100,
+    pizzaCount: totalKcal / PIZZA_KCAL
+  };
+}
+
+// Bestleistungen des Jahres: longest single ride, most elevation gained in a
+// single LOCAL calendar day, fastest qualifying (>=20km) average speed,
+// most active week (Monday-bucketed via the existing mondayOfUTC(), same
+// week-boundary convention weeklyClassProgress() etc. already use) and most
+// active calendar month.
+function computeSeasonPRs(rides){
+  if(!rides.length){
+    return { longestRideKm: null, maxElevationDay: null, fastestAvgSpeedKmh: null, mostActiveWeek: null, mostActiveMonth: null };
+  }
+  let longestRideKm = 0;
+  const byDay = {}, byWeek = {}, byMonth = {};
+  let fastestAvgSpeedKmh = null;
+  rides.forEach(a => {
+    const km = (a.distance||0) / 1000;
+    if(km > longestRideKm) longestRideKm = km;
+    if(km >= 20 && a.average_speed != null){
+      const kmh = a.average_speed * 3.6;
+      if(fastestAvgSpeedKmh == null || kmh > fastestAvgSpeedKmh) fastestAvgSpeedKmh = kmh;
+    }
+    const raw = a.start_date_local || a.start_date;
+    const d = raw ? new Date(raw) : null;
+    if(!d || !isFinite(d.getTime())) return;
+    const dayKey = toIsoDate(d);
+    byDay[dayKey] = (byDay[dayKey]||0) + (a.total_elevation_gain||0);
+    const weekKey = toIsoDate(mondayOfUTC(d));
+    byWeek[weekKey] = (byWeek[weekKey]||0) + km;
+    const monthKey = `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}`;
+    byMonth[monthKey] = (byMonth[monthKey]||0) + km;
+  });
+  let maxElevationDay = null;
+  Object.entries(byDay).forEach(([dateIso, elevationM]) => {
+    if(!maxElevationDay || elevationM > maxElevationDay.elevationM) maxElevationDay = { dateIso, elevationM };
+  });
+  let mostActiveWeek = null;
+  Object.entries(byWeek).forEach(([weekStartIso, km]) => {
+    if(!mostActiveWeek || km > mostActiveWeek.km) mostActiveWeek = { weekStartIso, km };
+  });
+  let mostActiveMonth = null;
+  Object.entries(byMonth).forEach(([month, km]) => {
+    if(!mostActiveMonth || km > mostActiveMonth.km) mostActiveMonth = { month, km };
+  });
+  return { longestRideKm, maxElevationDay, fastestAvgSpeedKmh, mostActiveWeek, mostActiveMonth };
+}
+
+// FTP-Entwicklung (from confirmedTests, loadConfirmedTests()'s shape) +
+// Workout-Anzahl (from trainerHistory, loadTrainerHistory()'s shape).
+// rideDateIso (not confirmedAtIso) is used as this entry's canonical date:
+// "FTP development over the season" is about when the test EFFORT actually
+// happened, not when the user got around to clicking "Das war der Test"
+// afterward -- someone batch-confirming several old tests in one sitting
+// would otherwise have all of them attributed to that one confirmation day
+// (and potentially the wrong year entirely). Both fields already exist on
+// every confirmed-test entry (see saveConfirmedTest()'s call site in
+// renderTrainerPage()); confirmedAtIso remains the authoritative field for
+// the unrelated "latest confirmed test"/staleness lookup near
+// computeTestDueSignal(), which is genuinely about confirmation recency.
+function computeSeasonProgress(confirmedTests, trainerHistory, year){
+  const tests = Object.values(confirmedTests || {})
+    .filter(t => t && t.durationSec === 1200 && t.rideDateIso)
+    .filter(t => {
+      const d = new Date(t.rideDateIso);
+      return isFinite(d.getTime()) && d.getUTCFullYear() === year;
+    })
+    .sort((a,b) => new Date(a.rideDateIso) - new Date(b.rideDateIso));
+
+  // Fewer than 2 confirmed 20-min tests this year -> no meaningful "first vs
+  // last" comparison exists, so this stat is simply absent (null) rather
+  // than showing a single misleading data point as if it were "progress".
+  let ftpProgress = null;
+  if(tests.length >= 2){
+    const first = tests[0], last = tests[tests.length-1];
+    if(first.achievedWatts != null && last.achievedWatts != null){
+      ftpProgress = {
+        firstWatts: first.achievedWatts,
+        lastWatts: last.achievedWatts,
+        deltaWatts: last.achievedWatts - first.achievedWatts,
+        deltaPct: first.achievedWatts ? ((last.achievedWatts - first.achievedWatts) / first.achievedWatts) * 100 : null,
+        firstDateIso: first.rideDateIso,
+        lastDateIso: last.rideDateIso,
+        testCount: tests.length
+      };
+    }
+  }
+
+  const workoutCount = (Array.isArray(trainerHistory) ? trainerHistory : []).filter(e => {
+    if(!e || !e.date) return false;
+    const d = new Date(e.date);
+    return isFinite(d.getTime()) && d.getUTCFullYear() === year;
+  }).length;
+
+  return { ftpProgress, workoutCount };
+}
+
+// Kilometer pro Rad: sums each qualifying ride's distance under its gear's
+// display name (same `g.name || (g.kind==='Bike'?"Rad":"Ausrüstung")`
+// fallback renderProfilKernGearCard() already uses for state.profilPage.gear
+// entries), with rides that have no gear_id or an unmatched one grouped
+// under an honest "Unbekannt" bucket instead of being dropped or crashing.
+function computeSeasonGearKm(rides, gearList){
+  const gear = Array.isArray(gearList) ? gearList : [];
+  const byGearId = {};
+  gear.forEach(g => { if(g && g.id != null) byGearId[String(g.id)] = g; });
+  const totals = {};
+  rides.forEach(a => {
+    const km = (a.distance||0) / 1000;
+    const gid = a.gear_id != null ? String(a.gear_id) : null;
+    const g = gid ? byGearId[gid] : null;
+    const key = g ? gid : "__unbekannt__";
+    const label = g ? (g.name || (g.kind === 'Bike' ? 'Rad' : 'Ausrüstung')) : 'Unbekannt';
+    if(!totals[key]) totals[key] = { label, km: 0 };
+    totals[key].km += km;
+  });
+  return Object.values(totals).sort((a,b)=>b.km-a.km);
+}
+
+// Single entry point the UI calls: filters `activities` to this season's
+// qualifying rides once, then hands them to each pure sub-computation above.
+// Never throws, never surfaces NaN -- every sub-function is defensive about
+// missing fields on its own.
+function computeSeasonRecap(activities, year, confirmedTests, trainerHistory, gearList){
+  const daysInYear = isSeasonRecapLeapYear(year) ? 366 : 365;
+  const rides = filterSeasonRides(activities, year);
+  return {
+    year,
+    daysInYear,
+    basis: computeSeasonBasisNumbers(rides, daysInYear),
+    prs: computeSeasonPRs(rides),
+    progress: computeSeasonProgress(confirmedTests, trainerHistory, year),
+    gear: computeSeasonGearKm(rides, gearList)
+  };
 }
 
 // ---------- Aktivitäten: chart ----------
@@ -12664,7 +13303,13 @@ function loadTrainerHistory(){
       typeof e.compliance === 'number' && isFinite(e.compliance) && typeof e.date === 'string');
   }catch(e){ return []; }
 }
-function saveTrainerHistory(list){ try{ localStorage.setItem(TRAINER_HISTORY_KEY, JSON.stringify(list.slice(-100))); }catch(e){} pushSyncSoon(TRAINER_HISTORY_KEY); }
+// Cap raised 100 -> 500 (Jahresrückblick, 2026-09): the 100 was an arbitrary
+// round number with no technical reason behind it -- the only consumer,
+// computeLearningFactors(), only ever reads the last 8 entries per training
+// goal (see its own .slice(-8) above). Raising it just lets more history
+// survive for the season recap's "Anzahl Workouts" count; the sync payload
+// (SYNC_KEYS below) stays tiny either way since these are small JSON objects.
+function saveTrainerHistory(list){ try{ localStorage.setItem(TRAINER_HISTORY_KEY, JSON.stringify(list.slice(-500))); }catch(e){} pushSyncSoon(TRAINER_HISTORY_KEY); }
 
 // ---------- device sync ----------
 // Reifendruck, Kettenverschleiß, Einstellungen usw. waren bislang rein
