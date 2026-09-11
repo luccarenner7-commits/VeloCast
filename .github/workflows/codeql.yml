@@ -1,0 +1,26 @@
+name: CodeQL
+
+# GitHub's own security scanner -- looks for XSS/injection-shaped bugs and
+# similar security anti-patterns. No npm dependency of any kind (runs its
+# own toolchain via the github/codeql-action steps below), so this doesn't
+# touch package.json or the project's zero-dependency convention at all.
+# Runs on every push/PR plus a weekly schedule, so it also catches newly
+# discovered vulnerability patterns in already-existing code, not just code
+# changed in a given push.
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 3 * * 1' # every Monday, arbitrary off-peak time
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+      - uses: github/codeql-action/analyze@v3
