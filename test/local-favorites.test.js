@@ -132,6 +132,64 @@ test('isLocalFavorite / toggleLocalFavorite', async (t) => {
     assert.equal(stored.name, 'Alpe Steil');
     assert.equal(stored.distance, 4200);
   });
+
+  // Regression: un-hearting then immediately re-hearting the SAME segment
+  // without navigating away -- a real flow on "Abgeschlossene Segmente"/
+  // Segmentjäger, whose rows (unlike "Meine Segmente") stay visible and
+  // clickable after un-hearting, since they're driven by state.routeSegments,
+  // not the favorites map -- used to silently wipe its tags, because the
+  // re-favorite call there always hands in a raw Strava segment object with
+  // no `tags` field of its own. See toggleLocalFavorite()'s comment.
+  await t.test('un-hearting then immediately re-hearting the same segment (a tags-less raw object, as Abgeschlossene Segmente/Segmentjäger pass) restores its tags', () => {
+    const { get } = loadApp();
+    const toggleLocalFavorite = get('toggleLocalFavorite');
+    const loadLocalFavoriteSegments = get('loadLocalFavoriteSegments');
+    const tagged = seg(3);
+    tagged.tags = ['Bergtraining', 'Feierabendrunde'];
+    toggleLocalFavorite(tagged); // favorite it, with tags
+    toggleLocalFavorite(tagged); // un-favorite (this is what a real un-heart click passes)
+    // Re-favorite from a page that never knew about tags in the first place
+    // (a fresh, tags-less raw Strava object, exactly what Abgeschlossene
+    // Segmente/Segmentjäger's renderFavoriteButton() hands in).
+    toggleLocalFavorite(seg(3));
+    assert.deepEqual(plain(loadLocalFavoriteSegments()[3].tags), ['Bergtraining', 'Feierabendrunde']);
+  });
+
+  await t.test('the tag-revival shadow is per-segment -- toggling an untagged segment does not leak another segment\'s recently-removed tags', () => {
+    const { get } = loadApp();
+    const toggleLocalFavorite = get('toggleLocalFavorite');
+    const loadLocalFavoriteSegments = get('loadLocalFavoriteSegments');
+    const tagged = seg(11);
+    tagged.tags = ['Bergtraining'];
+    toggleLocalFavorite(tagged);
+    toggleLocalFavorite(tagged); // un-favorite segment 11 (tags shadowed under id 11 only)
+    toggleLocalFavorite(seg(12)); // an unrelated segment, never had tags
+    assert.equal(loadLocalFavoriteSegments()[12].tags, undefined);
+  });
+
+  await t.test('a genuinely separate re-favorite (no matching un-favorite just before it in this session) starts fresh, no stale tags resurrected', () => {
+    const { get } = loadApp();
+    const toggleLocalFavorite = get('toggleLocalFavorite');
+    const loadLocalFavoriteSegments = get('loadLocalFavoriteSegments');
+    // Never favorited before at all -- straight toggle-on, no preceding
+    // un-favorite in this session to revive anything from.
+    toggleLocalFavorite(seg(4));
+    assert.equal(loadLocalFavoriteSegments()[4].tags, undefined);
+  });
+
+  await t.test('if the re-favoriting caller\'s own object already carries tags, those win over any shadowed ones', () => {
+    const { get } = loadApp();
+    const toggleLocalFavorite = get('toggleLocalFavorite');
+    const loadLocalFavoriteSegments = get('loadLocalFavoriteSegments');
+    const tagged = seg(6);
+    tagged.tags = ['Alt'];
+    toggleLocalFavorite(tagged);
+    toggleLocalFavorite(tagged); // un-favorite, shadows ['Alt']
+    const reFavoritedWithOwnTags = seg(6);
+    reFavoritedWithOwnTags.tags = ['Neu'];
+    toggleLocalFavorite(reFavoritedWithOwnTags);
+    assert.deepEqual(plain(loadLocalFavoriteSegments()[6].tags), ['Neu']);
+  });
 });
 
 // ---------------------------------------------------------------------

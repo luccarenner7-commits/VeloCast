@@ -7753,10 +7753,32 @@ function isLocalFavorite(seg){
 // looking at the Favoriten list would leave a stale row behind until the
 // next reload, since that page doesn't otherwise re-read localStorage on
 // every render().
+// In-memory-only (NOT persisted/synced) shadow of tags for a segment that
+// was JUST un-favorited, so quickly un-hearting and re-hearting the SAME
+// segment without navigating away doesn't silently wipe its tags. This
+// matters specifically on "Abgeschlossene Segmente"/Segmentjäger: unlike
+// "Meine Segmente" (whose row disappears the instant a segment is
+// un-favorited, since that page's list IS the favorites map), those two
+// pages' rows are driven by state.routeSegments, not the favorites map --
+// the heart button stays visible and clickable after un-hearting, so an
+// immediate re-click is a real, easy-to-hit flow there. The `seg` object
+// those pages pass on re-favorite is always a raw Strava segment summary
+// that never carries `tags` of its own, so without this, the round trip
+// would deterministically (not just occasionally) lose them. A genuinely
+// separate, later re-favorite (a new session, or after navigating through
+// other segments) is intentionally NOT covered by this and still starts
+// fresh -- same as the original accepted design for a real un-favorite.
+let recentlyUnfavoritedTags = {};
 function toggleLocalFavorite(seg){
   const map = loadLocalFavoriteSegments();
-  if(map[seg.id]) delete map[seg.id];
-  else map[seg.id] = seg;
+  if(map[seg.id]){
+    if(map[seg.id].tags && map[seg.id].tags.length) recentlyUnfavoritedTags[seg.id] = map[seg.id].tags;
+    delete map[seg.id];
+  } else {
+    const revivedTags = recentlyUnfavoritedTags[seg.id];
+    map[seg.id] = (revivedTags && !seg.tags) ? { ...seg, tags: revivedTags } : seg;
+    delete recentlyUnfavoritedTags[seg.id];
+  }
   saveLocalFavoriteSegments(map);
   state.segments = Object.values(map);
   render();
@@ -9164,7 +9186,14 @@ function mountProfilCharts(){
   Object.keys(PROFIL_CHART_IDS).forEach(tab => { if(tab !== pp.subTab) destroyProfilCharts(PROFIL_CHART_IDS[tab]); });
   if(pp.subTab === "form") buildFormCharts();
   else if(pp.subTab === "kern") buildProfilKernCharts();
-  else buildFtpChart();
+  else if(pp.subTab === "ftp") buildFtpChart();
+  // else: "rueckblick" -- no Chart.js canvas on that tab, nothing to build.
+  // Used to be an unconditional `else buildFtpChart()`, back when "ftp" was
+  // the only remaining option besides form/kern -- harmless today only
+  // because mountChart() itself bails out when it can't find the canvas, but
+  // it did real (wasted) chart-dataset work on every render while on
+  // Rückblick, and relied on exactly the "any other Profil tab implies FTP"
+  // assumption this feature was built to NOT depend on.
 }
 
 // ---------- Profil: page ----------
@@ -9586,7 +9615,15 @@ function recapDeMonth(monthKey){
 // its <option> children on demand instead of the list being static here.
 const recapYearSelect = el("select", {
   style:"width:100%; background:var(--asphalt); border:1px solid var(--line); border-radius:var(--r-sm); padding:11px 12px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;",
-  onchange:(e)=>{ state.profilPage.recapYear = Number(e.target.value); render(); }
+  onchange:(e)=>{
+    state.profilPage.recapYear = Number(e.target.value);
+    // A load/backfill error belongs to whichever year it happened for --
+    // without clearing it here, switching to a DIFFERENT (also incomplete)
+    // year could show a stale error message left over from the previous
+    // year's failed "Rückblick laden"/"Daten aktualisieren" attempt.
+    state.profilPage.recapError = null;
+    render();
+  }
 }, []);
 let recapYearSelectOptionsKey = null;
 function syncRecapYearSelectOptions(years){
@@ -10093,13 +10130,21 @@ async function backfillActivitiesForYear(token, year, opts){
       pp.recapError = "Cache-Limit erreicht — ältere Jahre könnten unvollständig bleiben.";
     } else if(exhaustedAll){
       // Nothing further back exists at all: this year is complete by
-      // definition (there's no "before" to prove), and so is every earlier
-      // year that has no cached activity of its own -- there's nothing to
-      // page into for those either.
-      const allDates = Object.values(cache).map(a => a.start_date_local || a.start_date).filter(Boolean);
-      const cachedYears = new Set(allDates.map(d => new Date(d).getUTCFullYear()).filter(y => isFinite(y)));
-      pp.recapExhaustedYears.add(year);
-      for(let y = year - 1; y >= year - 50 && !cachedYears.has(y); y--){
+      // definition (there's no "before" to prove), and so is EVERY earlier
+      // year -- we've just proven there's nothing to page into for any of
+      // them either, regardless of whether they themselves have any cached
+      // activity. (Previously this stopped marking years as soon as it hit
+      // one that already had cached data of its own, on the assumption that
+      // year would already be complete some other way -- but a year having
+      // its own activities doesn't prove the year(s) before THAT are covered
+      // too, e.g. a real multi-year gap before the athlete's very first
+      // ridden year: that first year still needs this escape hatch, since
+      // isYearDataComplete()'s other condition -- an activity dated before
+      // its own start -- can never be satisfied for it. The year-50 floor
+      // below is just a sanity bound, not a completeness boundary; marking
+      // years nobody can ever select (getRecapYearOptions() only offers
+      // years with real cached data, plus the current year) is harmless.)
+      for(let y = year; y >= year - 50; y--){
         pp.recapExhaustedYears.add(y);
       }
     } else if(!reachedYearStart){
