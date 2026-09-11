@@ -1,0 +1,21 @@
+name: Tests
+
+# Same two checks the local pre-push hook (.githooks/pre-push) already runs,
+# just also running on GitHub's own servers -- independent of whether any
+# given device has the local hook installed, and not skippable via
+# `git push --no-verify`. Zero npm dependencies in this project (see
+# package.json), so there's no install step needed beyond Node itself.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - run: npm test
+      - run: npm run lint
