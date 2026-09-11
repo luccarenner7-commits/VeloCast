@@ -505,6 +505,66 @@
   .tag.mini{ padding:3px 6px; font-size:10px; }
   .wind-mix-mini{ display:flex; gap:var(--space-1); flex-shrink:0; }
 
+  /* Segment-Tags: filter/manage chip row on the Favoriten list. No prior
+     "clickable filter chip" style existed in this file -- .tag above is a
+     non-interactive wind-direction badge, .stat-chip is for numeric stat
+     display -- so this is new, but deliberately built from the same neutral
+     selected/active vocabulary as .segment.selected/.source-tab.active
+     (chalk-on-asphalt-3) instead of introducing a new accent color. */
+  .tagchip-row{ display:flex; flex-wrap:wrap; gap:var(--space-2); margin-bottom:14px; }
+  .tagchip{
+    display:inline-flex; align-items:center; gap:2px;
+    padding:6px 6px 6px 12px; border-radius:var(--r-full); border:1px solid var(--line);
+    background:var(--asphalt); color:var(--chalk-dim);
+    font-family:'IBM Plex Mono', monospace; font-size:12px; font-weight:600;
+    cursor:pointer; -webkit-appearance:none; appearance:none;
+  }
+  /* The "Alle" chip is a plain <button> (no icons), so it doesn't need the
+     asymmetric icon-side padding the tag chips below use. */
+  button.tagchip{ font:inherit; padding:6px 12px; }
+  .tagchip:hover{ border-color:var(--route); }
+  .tagchip.active{ background:var(--asphalt-3); border-color:var(--chalk); color:var(--chalk); }
+  .tagchip.editing{ cursor:default; padding-left:8px; }
+  .tagchip.editing:hover{ border-color:var(--line); }
+  .tagchip-label{ white-space:nowrap; }
+  /* Pencil/delete (and confirm/cancel) icons: a real, if modest, tap target
+     -- not shrunk down to the visual glyph size, which would be unusable on
+     a touchscreen, but also not so large the chip row looks bulky. Grown a
+     little further under the mobile breakpoint below, where fingers (not a
+     mouse cursor) are doing the tapping. */
+  .tagchip-icon{
+    display:inline-flex; align-items:center; justify-content:center;
+    width:22px; height:22px; padding:0; border:none; border-radius:50%;
+    background:transparent; color:inherit; opacity:0.7; cursor:pointer;
+    font-size:12px; line-height:1; flex-shrink:0;
+  }
+  .tagchip-icon:hover{ opacity:1; background:var(--asphalt-2); }
+  .tagchip-input{
+    width:120px; max-width:36vw; background:var(--asphalt); border:1px solid var(--line);
+    border-radius:var(--r-xs); padding:4px 7px; color:var(--chalk);
+    font-family:'IBM Plex Mono', monospace; font-size:12px;
+  }
+  @media (max-width:620px){
+    .tagchip{ padding-top:7px; padding-bottom:7px; }
+    button.tagchip{ padding-top:7px; padding-bottom:7px; }
+    .tagchip-icon{ width:26px; height:26px; }
+  }
+
+  /* Segment-Tags: the per-segment tag checklist in the "Meine Segmente"
+     detail view (renderSegmentTagsSection()). Plain checkboxes, tinted and
+     spaced to look intentional rather than a raw unstyled native list --
+     a toggle-switch metaphor (like .tsettings-switch elsewhere) fits a
+     single on/off setting better than a "select any number of these" list,
+     so this stays a straightforward checkbox+label row instead. */
+  .tag-checkbox-list{ display:flex; flex-direction:column; gap:6px; margin:8px 0; }
+  .tag-checkbox-row{ display:flex; align-items:center; gap:9px; font-size:13px; cursor:pointer; }
+  .tag-checkbox-row input[type=checkbox]{ accent-color:var(--accent); width:16px; height:16px; cursor:pointer; flex-shrink:0; }
+  .tag-new-row{ display:flex; gap:8px; margin-top:6px; }
+  .tag-new-row input[type=text]{
+    flex:1; min-width:0; background:var(--asphalt); border:1px solid var(--line); border-radius:var(--r-sm);
+    padding:9px 10px; color:var(--chalk); font-family:'IBM Plex Mono', monospace; font-size:13px;
+  }
+
   /* "Empfohlen" tab tiles — deliberately NOT the full-width .activity rows
      the Routen/Fahrten tabs use (per product decision): compact, roughly-
      square cards side by side. "Roughly square" is carried by the fixed-
@@ -1017,6 +1077,14 @@ let state = {
   // to avoid burning an extra Strava API call per segment shown.
   segmentLeaderboards: {},
   segmentSortBy: "default",
+  // Segment-Tags: which tag (if any) the Favoriten list is currently
+  // filtered to, and which tag chip (if any) is mid-inline-rename. Both
+  // runtime-only UI state, like segmentSortBy above -- deliberately NOT
+  // persisted via savedSettings/saveSettings(), since a stale filter/edit
+  // surviving a reload would be more confusing than just resetting on
+  // reload. See renderSegmentsCard()/renderSegmentTagFilterRow().
+  segmentTagFilter: null,
+  editingTagName: null,
   selectedSegmentId: null, // when set, the map shows this segment instead of the full route
   selectedSegmentSource: null, // "starred" | "route" - which of the two segment buckets selectedSegmentId belongs to
   // "Abgeschlossene Segmente": segments the athlete actually rode and
@@ -7628,6 +7696,102 @@ function toggleLocalFavorite(seg){
   render();
 }
 
+// ---------- Segment-Tags (Sammlungen) ----------
+// Tags live directly on each favorited segment's stored object (an optional
+// `tags` array of strings), inside the SAME map/localStorage key as the
+// favorites themselves (LOCAL_FAVORITES_KEY) -- no new localStorage key, no
+// new SYNC_KEYS entry, no separate tag registry. Since LOCAL_FAVORITES_KEY
+// already syncs across devices (see saveLocalFavoriteSegments()'s
+// pushSyncSoon() call above), tags come along for free. The set of "tags
+// currently in use" is therefore never stored on its own either -- it's
+// always derived fresh from whatever's on the favorites right now (see
+// getAllUsedTags() below), so there's nothing to keep in sync or clean up
+// once a tag stops being used anywhere. Missing/undefined `tags` on a
+// segment means "no tags" everywhere this is read, never a crash.
+//
+// All three mutators below are pure (map in, new map out, input never
+// mutated) -- same convention as mergeFavoritesFromStarred() below.
+
+// Every distinct tag string currently used across any favorited segment,
+// deduped and alphabetically sorted. No tags anywhere -> [].
+function getAllUsedTags(map){
+  const seen = new Set();
+  Object.values(map || {}).forEach(seg => {
+    ((seg && seg.tags) || []).forEach(t => seen.add(t));
+  });
+  return [...seen].sort();
+}
+
+// Toggles `tagName` on/off for map[segId]. No-op (unchanged map) if segId
+// isn't favorited, or if the trimmed tag name is empty -- both defensive,
+// neither should happen from the UI (see renderSegmentTagsSection()) but a
+// stale click racing a removed favorite shouldn't crash. Case-insensitive
+// against tags already in use ANYWHERE in the map (via getAllUsedTags()):
+// this decides both whether THIS segment already has the tag (toggle-off
+// vs. toggle-on) and, when adding, which exact casing gets stored -- typing
+// "bergtraining" when "Bergtraining" already exists elsewhere reuses that
+// casing instead of fragmenting the tag list with a near-duplicate.
+function toggleSegmentTag(map, segId, tagName){
+  if(!map[segId]) return map;
+  const trimmed = (tagName || '').trim();
+  if(!trimmed) return map;
+  const lower = trimmed.toLowerCase();
+  const existingMatch = getAllUsedTags(map).find(t => t.toLowerCase() === lower);
+  const resolvedTag = existingMatch || trimmed;
+  const result = { ...map };
+  const currentTags = result[segId].tags || [];
+  const hasTag = currentTags.some(t => t.toLowerCase() === lower);
+  const newTags = hasTag
+    ? currentTags.filter(t => t.toLowerCase() !== lower)
+    : [...currentTags, resolvedTag];
+  result[segId] = { ...result[segId], tags: newTags };
+  return result;
+}
+
+// Renames every occurrence of `oldName` (exact match) to `newName` (trimmed)
+// across every segment's tags. No-op (unchanged map) if the trimmed newName
+// is empty -- never allow renaming a tag to blank. If the trimmed newName
+// case-insensitively collides with a DIFFERENT already-existing tag, merges
+// into that tag's exact stored casing instead of creating a second
+// near-duplicate, deduping within each segment's tags array afterward (a
+// segment that already had both oldName and the target tag ends up with
+// just the one).
+function renameTagEverywhere(map, oldName, newName){
+  const trimmed = (newName || '').trim();
+  if(!trimmed) return map;
+  const lower = trimmed.toLowerCase();
+  const collision = getAllUsedTags(map).find(t => t.toLowerCase() === lower && t !== oldName);
+  const resolvedName = collision || trimmed;
+  const result = {};
+  Object.keys(map).forEach(id => {
+    const seg = map[id];
+    const tags = seg && seg.tags;
+    if(!tags || !tags.includes(oldName)){
+      result[id] = seg;
+      return;
+    }
+    const renamed = tags.map(t => t === oldName ? resolvedName : t);
+    result[id] = { ...seg, tags: [...new Set(renamed)] };
+  });
+  return result;
+}
+
+// Removes `tagName` (exact match) from every segment's tags wherever
+// present. No-op wherever the tag simply isn't there.
+function deleteTagEverywhere(map, tagName){
+  const result = {};
+  Object.keys(map).forEach(id => {
+    const seg = map[id];
+    const tags = seg && seg.tags;
+    if(!tags || !tags.includes(tagName)){
+      result[id] = seg;
+      return;
+    }
+    result[id] = { ...seg, tags: tags.filter(t => t !== tagName) };
+  });
+  return result;
+}
+
 // One-time seed of the new local list from whatever's currently starred on
 // Strava, so switching to the local-favorites model doesn't silently lose
 // Lucas' existing "don't forget" list. Gated on a marker so it only ever
@@ -8148,14 +8312,212 @@ function renderSegmentsCard(){
     ()=>{ state.hideIrrelevantSegments = !state.hideIrrelevantSegments; saveSettings(); render(); }
   ));
 
+  // Segment-Tags filter row. allTags is computed once here and reused for
+  // both the stale-filter guard below and the row itself, rather than each
+  // recomputing loadLocalFavoriteSegments()/getAllUsedTags() separately.
+  const favMap = loadLocalFavoriteSegments();
+  const allTags = getAllUsedTags(favMap);
+  // Defensive guard: an active filter tag that no longer exists anywhere
+  // (renamed away, deleted, or wiped by a sync pull from another device)
+  // reverts to "Alle" for THIS render, rather than crashing or silently
+  // matching nothing forever. Runs unconditionally (even when allTags is
+  // now empty, i.e. the filter row below won't even be shown) so the grid
+  // filter a few lines down never applies a dangling filter value either.
+  if(state.segmentTagFilter && !allTags.includes(state.segmentTagFilter)){
+    state.segmentTagFilter = null;
+  }
+  if(allTags.length){
+    card.appendChild(renderSegmentTagFilterRow(allTags));
+  }
+
   const bucket = segmentBucket("starred");
+  const visible = sortedVisibleSegments(bucket)
+    .filter(seg => !state.segmentTagFilter || (favMap[seg.id]?.tags || []).includes(state.segmentTagFilter));
+  // Only worth an explicit hint when a TAG filter is the reason the grid is
+  // empty -- distinct from the "no favorites at all" empty-state above (line
+  // 8294). If hideIrrelevantSegments alone empties the grid with no tag
+  // filter active, that's pre-existing behavior this feature doesn't change
+  // (an empty grid, no message), so it's deliberately left untouched here.
+  if(!visible.length && state.segmentTagFilter){
+    card.appendChild(el("div", {class:"empty-state"}, [`Keine Favoriten mit dem Tag "${state.segmentTagFilter}".`]));
+    return card;
+  }
   const grid = el("div", {class:"segment-grid"});
-  sortedVisibleSegments(bucket).forEach(seg=>{
+  visible.forEach(seg=>{
     grid.appendChild(renderSegmentRow(seg, bucket));
   });
   card.appendChild(grid);
 
   return card;
+}
+
+// Segment-Tags filter/management chip row for the Favoriten list. Single-
+// select by design -- only one non-"Alle" chip is ever the active filter at
+// a time, clicking a second one replaces rather than adds to it. Not shown
+// at all when there are no tags yet (an empty row, or a lone useless "Alle"
+// chip, would just be clutter with nothing to filter). Rename/delete live on
+// these same chips rather than a separate management UI -- see
+// renderTagChip()/renderTagChipEditing() below.
+function renderSegmentTagFilterRow(allTags){
+  const row = el("div", {class:"tagchip-row"});
+  row.appendChild(el("button", {
+    class: "tagchip" + (state.segmentTagFilter === null ? " active" : ""),
+    onclick: () => { state.segmentTagFilter = null; render(); }
+  }, ["Alle"]));
+  allTags.forEach(tag => {
+    row.appendChild(state.editingTagName === tag ? renderTagChipEditing(tag) : renderTagChip(tag));
+  });
+  return row;
+}
+
+// One filter chip for an in-use tag: clicking the chip body toggles it as
+// the active filter (clicking the already-active chip clears back to "Alle",
+// same as clicking "Alle" itself); the pencil/× icons manage the tag itself
+// and stopPropagation() so they never also trigger the filter click.
+function renderTagChip(tag){
+  const active = state.segmentTagFilter === tag;
+  const chip = el("div", {
+    class: "tagchip" + (active ? " active" : ""),
+    onclick: () => { state.segmentTagFilter = active ? null : tag; render(); }
+  }, [
+    el("span", {class:"tagchip-label"}, [tag]),
+    el("button", {class:"tagchip-icon", title:"Umbenennen", onclick: (e) => {
+      e.stopPropagation();
+      state.editingTagName = tag;
+      render();
+    }}, ["✎"]),
+    el("button", {class:"tagchip-icon", title:"Löschen", onclick: (e) => {
+      e.stopPropagation();
+      // No confirmation dialog, matching this app's existing convention for
+      // destructive local-only actions (e.g. the "auf Standard zurücksetzen"
+      // buttons in the Trainer-Einstellungen) -- this app has no native
+      // confirm()/prompt() anywhere.
+      const newMap = deleteTagEverywhere(loadLocalFavoriteSegments(), tag);
+      saveLocalFavoriteSegments(newMap);
+      state.segments = Object.values(newMap);
+      if(state.segmentTagFilter === tag) state.segmentTagFilter = null;
+      render();
+    }}, ["×"])
+  ]);
+  return chip;
+}
+
+// Inline rename mode for one chip (toggled via its pencil icon above) --
+// pre-filled text input, confirmed with Enter or the ✓ button, canceled with
+// Escape or the × button, no confirmation dialog on confirm either (same
+// reasoning as the delete icon above; renaming is not destructive anyway).
+function renderTagChipEditing(tag){
+  const input = el("input", {type:"text", class:"tagchip-input", value: tag});
+  function confirmRename(){
+    state.editingTagName = null;
+    const trimmed = input.value.trim();
+    if(!trimmed){ render(); return; } // no-op: never allow renaming to blank
+    const newMap = renameTagEverywhere(loadLocalFavoriteSegments(), tag, trimmed);
+    saveLocalFavoriteSegments(newMap);
+    state.segments = Object.values(newMap);
+    if(state.segmentTagFilter === tag){
+      // renameTagEverywhere() may have merged into a differently-cased
+      // pre-existing tag rather than storing `trimmed` verbatim (see its
+      // comment) -- re-derive the actual stored casing from the resulting
+      // map instead of assuming, so an active filter never silently breaks.
+      const resolved = getAllUsedTags(newMap).find(t => t.toLowerCase() === trimmed.toLowerCase());
+      state.segmentTagFilter = resolved || trimmed;
+    }
+    render();
+  }
+  function cancelRename(){ state.editingTagName = null; render(); }
+  input.addEventListener("keydown", e => {
+    if(e.key === "Enter"){ e.preventDefault(); confirmRename(); }
+    else if(e.key === "Escape"){ e.preventDefault(); cancelRename(); }
+  });
+  // Auto-focus so renaming doesn't need a second tap/click on the input that
+  // just appeared -- runs after render() has attached this node to the real
+  // DOM, same rAF-after-render timing idiom as the back-button's
+  // scroll-into-view above (renderSegmentsPage()).
+  requestAnimationFrame(() => { input.focus(); input.select(); });
+  return el("div", {class:"tagchip editing"}, [
+    input,
+    el("button", {class:"tagchip-icon", title:"Speichern", onclick: confirmRename}, ["✓"]),
+    el("button", {class:"tagchip-icon", title:"Abbrechen", onclick: cancelRename}, ["×"])
+  ]);
+}
+
+// Segment-Tags: add/remove tags on ONE favorited segment. Lives ONLY in the
+// segment detail view (this branch of renderSegmentsPage(), the "Meine
+// Segmente" starred-segment detail) -- deliberately not on the list rows,
+// to keep the Favoriten list itself uncluttered, and deliberately not on
+// the analogous "Abgeschlossene Segmente" detail view in renderRouteCard()
+// either, since tags are a Favoriten-only feature.
+//
+// `seg` is whatever the caller's bucket.list.find() turned up, which can be
+// a render or two stale relative to localStorage (e.g. right after this
+// same section just toggled a tag) -- so the current tags are always
+// re-read fresh from loadLocalFavoriteSegments() here rather than trusted
+// off of `seg` itself. Only `seg.id` (stable regardless of staleness) is
+// used from the passed-in object.
+function renderSegmentTagsSection(seg){
+  const map = loadLocalFavoriteSegments();
+  const currentTags = (map[seg.id] && map[seg.id].tags) || [];
+  const allTags = getAllUsedTags(map);
+
+  // Shared commit path for both the checkboxes and the "new tag" input --
+  // same save + state.segments refresh + render() sequence toggleLocalFavorite()
+  // already uses, so the Favoriten list page never shows a stale row.
+  function commitTagChange(newMap){
+    saveLocalFavoriteSegments(newMap);
+    state.segments = Object.values(newMap);
+    render();
+  }
+
+  const section = el("div", {style:"margin-bottom:14px;"});
+  section.appendChild(el("label", {}, ["Tags"]));
+
+  if(allTags.length){
+    const list = el("div", {class:"tag-checkbox-list"});
+    allTags.forEach(tag => {
+      const checked = currentTags.some(t => t.toLowerCase() === tag.toLowerCase());
+      const cb = el("input", {type:"checkbox", onchange: () => {
+        commitTagChange(toggleSegmentTag(loadLocalFavoriteSegments(), seg.id, tag));
+      }});
+      if(checked) cb.checked = true;
+      list.appendChild(el("label", {class:"tag-checkbox-row"}, [cb, tag]));
+    });
+    section.appendChild(list);
+  } else {
+    section.appendChild(el("div", {class:"muted", style:"font-size:12px; margin:6px 0;"}, [
+      "Noch keine Tags angelegt -- unten einen neuen vergeben."
+    ]));
+  }
+
+  // New-tag input: Enter key and the "+" button both submit (see the task's
+  // "support both" requirement) -- onchange/onclick rather than oninput, so
+  // this never fires mid-keystroke (same reasoning as settingsFieldRow()'s
+  // onchange-not-oninput elsewhere in this file). The input itself is freshly
+  // created on every render() (this whole card is torn down and rebuilt --
+  // see render()), so a successful submit clearing it is automatic: there's
+  // simply a brand-new, empty input in the rebuilt tree.
+  const newTagInput = el("input", {type:"text", placeholder:"Neuer Tag…"});
+  function submitNewTag(){
+    const trimmed = newTagInput.value.trim();
+    if(!trimmed) return;
+    // This field only ever ADDS a tag -- toggleSegmentTag() on its own would
+    // silently REMOVE it instead if the segment already has a case-insensitive
+    // match (e.g. re-typing an existing tag by habit), which would be a
+    // surprising way to lose a tag from a field labelled "new". The checkbox
+    // list above is the intended way to remove one.
+    const already = currentTags.some(t => t.toLowerCase() === trimmed.toLowerCase());
+    if(already) return;
+    commitTagChange(toggleSegmentTag(loadLocalFavoriteSegments(), seg.id, trimmed));
+  }
+  newTagInput.addEventListener("keydown", e => {
+    if(e.key === "Enter"){ e.preventDefault(); submitNewTag(); }
+  });
+  section.appendChild(el("div", {class:"tag-new-row"}, [
+    newTagInput,
+    el("button", {class:"btn secondary", onclick: submitNewTag}, ["+"])
+  ]));
+
+  return section;
 }
 
 // "Meine Segmente" nav page (Task 2). Connect-prompt when not connected
@@ -8193,6 +8555,7 @@ function renderSegmentsPage(){
         });
       }));
       card.appendChild(renderSegmentRow(seg, bucket, {clickable:false}));
+      card.appendChild(renderSegmentTagsSection(seg));
       card.appendChild(renderSegmentLeaderboard(seg));
       card.appendChild(routeMapContainer);
       return card;
